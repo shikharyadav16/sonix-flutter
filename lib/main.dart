@@ -302,11 +302,14 @@ class _SonixHomeState extends State<SonixHome> {
   bool _fullScreen = false;
   bool _fullScreenLyrics = false;
   bool _lyricsOpen = false;
+  bool _isLoadingTrack = false;
+  int _playRequest = 0;
 
   Map<String, dynamic>? _lyrics;
   List<LyricLine> _parsedLyrics = [];
 
   StreamSubscription<bool>? _playingSub;
+  StreamSubscription<ProcessingState>? _processingSub;
   final Map<String, Future<List<Color>>> _paletteFutures = {};
 
   @override
@@ -315,6 +318,11 @@ class _SonixHomeState extends State<SonixHome> {
     _search.addListener(_onSearchChanged);
     _playingSub = _audio.playingStream.listen((_) {
       if (mounted) setState(() {});
+    });
+    _processingSub = _audio.processingStateStream.listen((state) {
+      if (state == ProcessingState.completed && mounted) {
+        _playNextSuggestion();
+      }
     });
   }
 
@@ -326,6 +334,7 @@ class _SonixHomeState extends State<SonixHome> {
   void dispose() {
     _search.removeListener(_onSearchChanged);
     _playingSub?.cancel();
+    _processingSub?.cancel();
     _audio.dispose();
     _search.dispose();
     super.dispose();
@@ -369,8 +378,9 @@ class _SonixHomeState extends State<SonixHome> {
   /* ------------------------------ PLAYBACK ------------------------------- */
 
   Future<void> _play(Song song) async {
+    final request = ++_playRequest;
     // Same track -> just toggle.
-    if (_current?.id == song.id) {
+    if (_current?.id == song.id && !_isLoadingTrack) {
       if (_audio.playing) {
         await _audio.pause();
       } else {
@@ -382,6 +392,7 @@ class _SonixHomeState extends State<SonixHome> {
 
     setState(() {
       _current = song;
+      _isLoadingTrack = true;
       _lyrics = null;
       _parsedLyrics = [];
       _lyricsOpen = false;
@@ -393,8 +404,11 @@ class _SonixHomeState extends State<SonixHome> {
     });
 
     try {
+      await _audio.stop();
+      if (!mounted || request != _playRequest) return;
+
       final details = await Api.details(song.id);
-      if (!mounted || _current?.id != song.id) return;
+      if (!mounted || request != _playRequest) return;
 
       final resolved = details == null ? song : Song.fromJson(details);
       final urls = resolved.downloadUrls;
@@ -409,27 +423,40 @@ class _SonixHomeState extends State<SonixHome> {
 
       if (stream != null) {
         await _audio.setUrl(stream);
-        // NOTE: play() only completes when playback stops — never await it here.
+        if (!mounted || request != _playRequest) return;
+        setState(() => _isLoadingTrack = false);
         unawaited(_audio.play());
+      } else if (mounted && request == _playRequest) {
+        setState(() => _isLoadingTrack = false);
       }
 
       final suggestion = await Api.suggestions(resolved.id);
-      if (!mounted || _current?.id != song.id) return;
+      if (!mounted || request != _playRequest) return;
       setState(() => _suggestions = [resolved, ...suggestion]);
 
       final lyricData = await Api.lyrics(resolved);
-      if (!mounted || _current?.id != song.id) return;
+      if (!mounted || request != _playRequest) return;
       setState(() {
         _lyrics = lyricData;
         _parsedLyrics = parseLyrics(lyricData?['syncedLyrics'] as String?);
       });
     } catch (_) {
-      if (mounted) {
+      if (mounted && request == _playRequest) {
+        setState(() => _isLoadingTrack = false);
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('This track could not be loaded.')),
         );
       }
     }
+  }
+
+  void _playNextSuggestion() {
+    if (_isLoadingTrack || _current == null || _suggestions.isEmpty) return;
+    final index = _suggestions.indexWhere(
+      (song) => song.id == _current!.id,
+    );
+    if (index < 0 || index + 1 >= _suggestions.length) return;
+    unawaited(_play(_suggestions[index + 1]));
   }
 
   void _next() {
@@ -1053,63 +1080,62 @@ class _SonixHomeState extends State<SonixHome> {
             color: _ink,
             border: Border(top: BorderSide(color: Color(0x30ffffff))),
           ),
-          child: Stack(
-            children: [
-              _ambientLayer(colors, strong: false),
-              Container(color: Colors.black.withValues(alpha: .06)),
-              Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  _progressBar(minHeight: 2),
-                  Padding(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 12,
-                      vertical: 9,
-                    ),
-                    child: Row(
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: _openFullScreen,
+            child: Stack(
+              children: [
+                _ambientLayer(colors, strong: false),
+                Container(color: Colors.black.withValues(alpha: .06)),
+                Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    _progressBar(minHeight: 2),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 9,
+                      ),
+                      child: Row(
                       children: [
                         Expanded(
-                          child: GestureDetector(
-                            onTap: _openFullScreen,
-                            child: Row(
-                              children: [
-                                ClipRRect(
-                                  borderRadius: BorderRadius.circular(6),
-                                  child: _art(
-                                    track.artwork,
-                                    width: 44,
-                                    height: 44,
-                                  ),
+                          child: Row(
+                            children: [
+                              ClipRRect(
+                                borderRadius: BorderRadius.circular(6),
+                                child: _art(
+                                  track.artwork,
+                                  width: 44,
+                                  height: 44,
                                 ),
-                                const SizedBox(width: 9),
-                                Expanded(
-                                  child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      Text(
-                                        track.title,
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: const TextStyle(
-                                          fontWeight: FontWeight.w600,
-                                          fontSize: 12,
-                                        ),
+                              ),
+                              const SizedBox(width: 9),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      track.title,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        fontWeight: FontWeight.w600,
+                                        fontSize: 12,
                                       ),
-                                      Text(
-                                        track.artist,
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: const TextStyle(
-                                          color: _muted,
-                                          fontSize: 10,
-                                        ),
+                                    ),
+                                    Text(
+                                      track.artist,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        color: _muted,
+                                        fontSize: 10,
                                       ),
-                                    ],
-                                  ),
+                                    ),
+                                  ],
                                 ),
-                              ],
-                            ),
+                              ),
+                            ],
                           ),
                         ),
                         IconButton(
@@ -1132,13 +1158,23 @@ class _SonixHomeState extends State<SonixHome> {
                         StreamBuilder<bool>(
                           stream: _audio.playingStream,
                           builder: (_, snapshot) => IconButton(
-                            onPressed: _togglePlayPause,
-                            icon: Icon(
-                              snapshot.data == true
-                                  ? PhosphorIconsRegular.pauseCircle
-                                  : PhosphorIconsRegular.playCircle,
-                              size: 34,
-                            ),
+                            onPressed: _isLoadingTrack
+                                ? null
+                                : _togglePlayPause,
+                            icon: _isLoadingTrack
+                                ? const SizedBox(
+                                    width: 24,
+                                    height: 24,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2.4,
+                                    ),
+                                  )
+                                : Icon(
+                                    snapshot.data == true
+                                        ? PhosphorIconsRegular.pauseCircle
+                                        : PhosphorIconsRegular.playCircle,
+                                    size: 34,
+                                  ),
                           ),
                         ),
                         IconButton(
@@ -1148,12 +1184,13 @@ class _SonixHomeState extends State<SonixHome> {
                             size: 20,
                           ),
                         ),
-                      ],
+                        ],
+                      ),
                     ),
-                  ),
-                ],
-              ),
-            ],
+                  ],
+                ),
+              ],
+            ),
           ),
         );
       },
@@ -1439,13 +1476,23 @@ class _SonixHomeState extends State<SonixHome> {
                         StreamBuilder<bool>(
                           stream: _audio.playingStream,
                           builder: (_, snapshot) => IconButton(
-                            onPressed: _togglePlayPause,
-                            icon: Icon(
-                              snapshot.data == true
-                                  ? PhosphorIconsRegular.pauseCircle
-                                  : PhosphorIconsRegular.playCircle,
-                              size: 64,
-                            ),
+                            onPressed: _isLoadingTrack
+                                ? null
+                                : _togglePlayPause,
+                            icon: _isLoadingTrack
+                                ? const SizedBox(
+                                    width: 52,
+                                    height: 52,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 3,
+                                    ),
+                                  )
+                                : Icon(
+                                    snapshot.data == true
+                                        ? PhosphorIconsRegular.pauseCircle
+                                        : PhosphorIconsRegular.playCircle,
+                                    size: 64,
+                                  ),
                           ),
                         ),
                         const SizedBox(width: 12),
