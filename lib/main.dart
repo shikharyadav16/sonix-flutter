@@ -316,22 +316,22 @@ List<LyricLine> parseLyrics(String? source) {
 /*                                 STATIC DATA                                */
 /* -------------------------------------------------------------------------- */
 
-final _homeSongs = <Song>[
+final _trendingSongs = <Song>[
   Song(
-    id: 'UWD1fvFV',
-    title: 'Love Me Not',
-    artist: 'Ravyn Lenae',
-    album: 'Love Me Not / Love Is Blind',
+    id: 'kd8JSDbB',
+    title: 'STAY',
+    artist: 'The Kid LAROI, Justin Bieber',
+    album: 'STAY',
     artwork:
-        'https://c.saavncdn.com/546/Love-Me-Not-Love-Is-Blind-English-2024-20240807224721-500x500.jpg',
+        'https://c.saavncdn.com/895/Stay-English-2021-20210706223809-500x500.jpg',
   ),
   Song(
-    id: 'VaNhRJHr',
-    title: 'Die With A Smile',
-    artist: 'Lady Gaga, Bruno Mars',
-    album: 'Die With A Smile',
+    id: 'W8wYUcCq',
+    title: 'Bad Habits',
+    artist: 'Ed Sheeran',
+    album: 'Bad Habits',
     artwork:
-        'https://c.saavncdn.com/060/Die-With-A-Smile-English-2024-20240816103634-500x500.jpg',
+        'https://c.saavncdn.com/316/Bad-Habits-English-2021-20211022044755-500x500.jpg',
   ),
   Song(
     id: 'BhKP6P-H',
@@ -342,20 +342,98 @@ final _homeSongs = <Song>[
         'https://c.saavncdn.com/111/Espresso-English-2024-20240412064803-500x500.jpg',
   ),
   Song(
-    id: 'TcDP-KUl',
-    title: 'Starboy',
-    artist: 'The Weeknd',
-    album: 'The Highlights',
+    id: 'ID-tpbGP',
+    title: 'People',
+    artist: 'Libianca',
+    album: 'People',
     artwork:
-        'https://c.saavncdn.com/396/The-Highlights-English-2021-20240207045714-500x500.jpg',
+        'https://c.saavncdn.com/607/People-English-2022-20221207081653-500x500.jpg',
   ),
   Song(
-    id: 'wwSCc15h',
-    title: 'Shape of You',
-    artist: 'Ed Sheeran',
-    album: '÷',
+    id: 'Plabk03R',
+    title: 'Unholy',
+    artist: 'Sam Smith, Kim Petras',
+    album: 'Gloria',
     artwork:
-        'https://c.saavncdn.com/286/WMG_190295851286-English-2017-500x500.jpg',
+        'https://c.saavncdn.com/041/Gloria-English-2023-20231116192310-500x500.jpg',
+  ),
+  Song(
+    id: 'pDKPIf7z',
+    title: 'Loser',
+    artist: 'Charlie Puth',
+    album: 'CHARLIE',
+    artwork:
+        'https://c.saavncdn.com/589/CHARLIE-English-2022-20221005173517-500x500.jpg',
+  ),
+];
+
+final _suggestedSongs = <Song>[
+  Song(
+    id: '1xqHQw3J',
+    title: 'Faded',
+    artist: 'Alan Walker',
+    album: 'Faded',
+    artwork:
+        'https://c.saavncdn.com/981/Faded-English-2015-20260508161540-500x500.jpg',
+  ),
+  Song(
+    id: '2YCl6FD8',
+    title: 'On The Floor',
+    artist: 'Jennifer Lopez, Pitbull',
+    album: 'LOVE?',
+    artwork:
+        'https://c.saavncdn.com/343/LOVE-English-2011-20260522055435-500x500.jpg',
+  ),
+  Song(
+    id: 'OPIPEsPe',
+    title: 'Bad Boy',
+    artist: 'Tungevaag, Raaban',
+    album: 'Bad Boy',
+    artwork:
+        'https://c.saavncdn.com/509/Bad-Boy-feat-Luana-Kiara--English-2018-20190607042030-500x500.jpg',
+  ),
+  Song(
+    id: '9LuvX9pB',
+    title: 'Love Me Like You Do',
+    artist: 'Ellie Goulding',
+    album: 'Fifty Shades Freed',
+    artwork:
+        'https://c.saavncdn.com/756/Fifty-Shades-Freed-English-2018-20180208000209-500x500.jpg',
+  ),
+  Song(
+    id: 'o1qyko3N',
+    title: 'Peaches',
+    artist: 'Justin Bieber',
+    album: 'Justice',
+    artwork:
+        'https://c.saavncdn.com/983/Justice-English-2021-20210325102906-500x500.jpg',
+  ),
+  Song(
+    id: 'Oc72uyuq',
+    title: 'Yummy',
+    artist: 'Justin Bieber',
+    album: 'Yummy',
+    artwork:
+        'https://c.saavncdn.com/522/Yummy-English-2020-20200103035142-500x500.jpg',
+  ),
+  Song(
+    id: 'p5TDxRD9',
+    title: 'Gangnam Style',
+    artist: 'PSY',
+    album: 'Gangnam Style (강남스타일)',
+    artwork:
+        'https://c.saavncdn.com/032/Gangnam-Style--English-2012-20200421073139-500x500.jpg',
+  ),
+];
+
+final _mostPlayedSongs = <Song>[
+  Song(
+    id: 'j8hvJDPs',
+    title: 'Let Me Love You',
+    artist: 'DJ Snake, Justin Bieber',
+    album: 'Encore',
+    artwork:
+        'https://c.saavncdn.com/273/Encore-English-2016-20190419221937-500x500.jpg',
   ),
   Song(
     id: 'pizXlfUB',
@@ -366,63 +444,148 @@ final _homeSongs = <Song>[
         'https://c.saavncdn.com/396/The-Highlights-English-2021-20240207045714-500x500.jpg',
   ),
   Song(
-    id: 'H0IRhlNT',
-    title: 'Baby',
-    artist: 'Justin Bieber',
-    album: 'My World 2.0',
+    id: '1xqHQw3J',
+    title: 'Faded',
+    artist: 'Alan Walker',
+    album: 'Faded',
     artwork:
-        'https://c.saavncdn.com/728/My-World-2-0-English-2010-20250315014144-500x500.jpg',
+        'https://c.saavncdn.com/981/Faded-English-2015-20260508161540-500x500.jpg',
   ),
   Song(
-    id: 'd9GD5TGF',
-    title: 'Eastside',
-    artist: 'Benny Blanco, Halsey, Khalid',
-    album: 'FRIENDS KEEP SECRETS 2',
+    id: 'xKlnh38y',
+    title: 'One Dance',
+    artist: 'Drake',
+    album: 'Views',
     artwork:
-        'https://c.saavncdn.com/070/FRIENDS-KEEP-SECRETS-2-English-2021-20210326053554-500x500.jpg',
+        'https://c.saavncdn.com/521/Views-English-2016-20240201113111-500x500.jpg',
+  ),
+  Song(
+    id: 'Hvma-gqd',
+    title: 'Safari',
+    artist: 'Serena',
+    album: 'Safari',
+    artwork:
+        'https://c.saavncdn.com/292/Safari-English-2017-20240919033905-500x500.jpg',
+  ),
+  Song(
+    id: 'NJ_W1AG6',
+    title: 'On My Way',
+    artist: 'Alan Walker, Sabrina Carpenter, Farruko',
+    album: 'On My Way',
+    artwork:
+        'https://c.saavncdn.com/866/On-My-Way-English-2019-20190308195918-500x500.jpg',
   ),
 ];
 
+final _topHitsSongs = <Song>[
+  Song(
+    id: 'vQ8QjgoY',
+    title: 'Intentions',
+    artist: 'Justin Bieber, Quavo',
+    album: 'Intentions',
+    artwork:
+        'https://c.saavncdn.com/294/Intentions-English-2020-20200207033302-500x500.jpg',
+  ),
+  Song(
+    id: 'Oc72uyuq',
+    title: 'Yummy',
+    artist: 'Justin Bieber',
+    album: 'Yummy',
+    artwork:
+        'https://c.saavncdn.com/522/Yummy-English-2020-20200103035142-500x500.jpg',
+  ),
+  Song(
+    id: 'Rl5YltJX',
+    title: 'Headlights',
+    artist: 'Alok, Alan Walker, KIDDO',
+    album: 'Headlights',
+    artwork:
+        'https://c.saavncdn.com/723/Headlights-feat-KIDDO--English-2022-20220215120150-500x500.jpg',
+  ),
+  Song(
+    id: 'C9_s3NUf',
+    title: 'Stuck with U',
+    artist: 'Ariana Grande, Justin Bieber',
+    album: 'Stuck with U',
+    artwork:
+        'https://c.saavncdn.com/307/Stuck-with-U-English-2020-20200508041707-500x500.jpg',
+  ),
+  Song(
+    id: 'DOldeDpy',
+    title: 'Dai Dai',
+    artist: 'Shakira, Burna Boy',
+    album: 'Dai Dai',
+    artwork:
+        'https://c.saavncdn.com/037/Dai-Dai-English-2026-20260807003044-500x500.jpg',
+  ),
+  Song(
+    id: 'iWt8op78',
+    title: 'Cheap Thrills',
+    artist: 'Sia',
+    album: 'This Is Acting',
+    artwork:
+        'https://c.saavncdn.com/203/This-Is-Acting-English-2016-500x500.jpg',
+  ),
+];
+
+final _homeSongs = {
+  for (final s in [
+    ..._trendingSongs,
+    ..._suggestedSongs,
+    ..._mostPlayedSongs,
+    ..._topHitsSongs,
+  ])
+    s.id: s,
+}.values.toList();
+
 final _featuredPlaylists = <Playlist>[
   Playlist(
-    id: '1214368402',
-    title: 'Badshah - Party Songs - Hindi',
-    description: 'Hindi party songs of Badshah.',
+    id: '90522027',
+    title: 'Alan Walker',
+    description: 'Electronic anthems and chart-topping hits.',
     artwork:
-        'https://c.saavncdn.com/editorial/BadshahPartySongsHindi_20240307110923.jpg?bch=1788764581',
-    songCount: 24,
-  ),
-  Playlist(
-    id: '47599074',
-    title: 'Now Trending - Hindi',
-    description: 'The hottest trending tracks right now.',
-    artwork:
-        'https://c.saavncdn.com/editorial/NowTrendingHindi_20240410072044.jpg',
+        'https://c.saavncdn.com/editorial/Let_sPlayAlanWalker_20241122142442_500x500.jpg',
     songCount: 30,
   ),
   Playlist(
-    id: '79653434',
-    title: 'Non-Stop Party',
-    description: 'High energy dance and party anthems.',
+    id: '84989841',
+    title: 'Ariana Grande',
+    description: 'Essential pop and R&B hits by Ariana Grande.',
     artwork:
-        'https://c.saavncdn.com/editorial/NonStopParty_20240214064512.jpg',
+        'https://c.saavncdn.com/editorial/Let_sPlayArianaGrande_20250312064753_500x500.jpg',
+    songCount: 30,
+  ),
+  Playlist(
+    id: '791714467',
+    title: 'Sabrina Carpenter',
+    description: 'Top tracks and viral pop sensations.',
+    artwork:
+        'https://c.saavncdn.com/editorial/Let_sPlaySabrinaCarpenter_20250312064201_500x500.jpg',
     songCount: 25,
   ),
   Playlist(
-    id: '1302033575',
-    title: 'Romantic Hits 2026',
-    description: 'Soulful melodies and timeless romantic hits.',
+    id: '81580124',
+    title: 'Ed Sheeran',
+    description: 'Acoustic favorites and global records.',
     artwork:
-        'https://c.saavncdn.com/editorial/RomanticHitsHindi_20240214064512.jpg',
-    songCount: 25,
+        'https://c.saavncdn.com/editorial/Let_sPlayEdSheeran_20250513105854_500x500.jpg',
+    songCount: 30,
   ),
   Playlist(
-    id: '1261305331',
-    title: 'Trending Songs India',
-    description: 'Viral songs topping the charts across India.',
+    id: '81134817',
+    title: 'Shakira',
+    description: 'Latin pop powerhouses and global anthems.',
     artwork:
-        'https://c.saavncdn.com/editorial/TrendingSongsIndia_20240307110923.jpg',
-    songCount: 28,
+        'https://c.saavncdn.com/editorial/Let_sPlayShakira_20260203052437_500x500.jpg',
+    songCount: 30,
+  ),
+  Playlist(
+    id: '52312344',
+    title: 'Justin Bieber',
+    description: 'Unforgettable pop and R&B classics.',
+    artwork:
+        'https://c.saavncdn.com/editorial/Let_sPlayJustinBieber_20241122142527_500x500.jpg',
+    songCount: 30,
   ),
 ];
 
@@ -1095,14 +1258,10 @@ class _SonixHomeState extends State<SonixHome>
     padding: const EdgeInsets.fromLTRB(14, 18, 14, 120),
     children: [
       if (_noticeVisible) _notice(),
-      _section('Trending', _homeSongs.take(5).toList(), horizontal: true),
-      _section('Suggested for You', _homeSongs.skip(2).take(6).toList()),
-      _section('Most Played', _homeSongs.skip(3).toList(), horizontal: true),
-      _section(
-        'Top Hits',
-        _homeSongs.reversed.take(6).toList(),
-        horizontal: true,
-      ),
+      _section('Trending', _trendingSongs, horizontal: true),
+      _section('Suggested for You', _suggestedSongs),
+      _section('Most Played', _mostPlayedSongs, horizontal: true),
+      _section('Top Hits', _topHitsSongs, horizontal: true),
       _featuredPlaylistsSection(),
       const SizedBox(height: 16),
       const Center(
