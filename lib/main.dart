@@ -14,7 +14,7 @@ import 'package:url_launcher/url_launcher.dart';
 
 const _apiRoot = 'https://music-api.albatross0071.workers.dev';
 const _fallbackArt =
-    'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=700&q=80';
+    'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcRKzFIZo0IV9H2PER0gKrlsPHoB0NIxu_U_JSJySOR_3A&s=10';
 const _ink = Color(0xff080808);
 const _surface = Color(0xff151518);
 const _muted = Color(0xff92929b);
@@ -53,16 +53,31 @@ class Song {
         ? (json['artists']['primary'] as List? ?? const [])
         : const [];
 
+    final primaryArtistsString = artists
+        .whereType<Map>()
+        .map((a) => a['name'])
+        .where((name) => name != null && '$name'.trim().isNotEmpty)
+        .join(', ');
+
     final artist =
         json['primaryArtists'] ??
         json['singers'] ??
         json['artist'] ??
-        (artists.isNotEmpty ? artists.first['name'] : 'Unknown artist');
+        (primaryArtistsString.isNotEmpty
+            ? primaryArtistsString
+            : (artists.isNotEmpty ? artists.first['name'] : 'Unknown artist'));
 
     final urls = (json['downloadUrl'] as List? ?? const [])
         .whereType<Map>()
         .map((item) => Map<String, dynamic>.from(item))
         .toList();
+
+    final highestAudio = urls.firstWhere(
+      (u) => u['quality'] == '320kbps',
+      orElse: () => urls.isNotEmpty ? urls.last : const {},
+    );
+    final audioUrl =
+        json['audioUrl'] as String? ?? highestAudio['url'] as String?;
 
     return Song(
       id: '${json['id'] ?? json['title']}',
@@ -73,7 +88,7 @@ class Song {
           : '${json['album'] ?? ''}',
       artwork: '${image['url'] ?? ''}',
       duration: int.tryParse('${json['duration'] ?? 0}') ?? 0,
-      streamUrl: json['audioUrl'] as String?,
+      streamUrl: audioUrl,
       downloadUrls: urls,
     );
   }
@@ -99,9 +114,84 @@ class LyricLine {
   final String text;
 }
 
+class Playlist {
+  Playlist({
+    required this.id,
+    required this.title,
+    this.description = '',
+    this.artwork = '',
+    this.url = '',
+    this.language = '',
+    this.songCount = 0,
+    this.songs = const [],
+  });
+
+  final String id;
+  final String title;
+  final String description;
+  final String artwork;
+  final String url;
+  final String language;
+  final int songCount;
+  final List<Song> songs;
+
+  Playlist copyWith({
+    String? id,
+    String? title,
+    String? description,
+    String? artwork,
+    String? url,
+    String? language,
+    int? songCount,
+    List<Song>? songs,
+  }) => Playlist(
+    id: id ?? this.id,
+    title: title ?? this.title,
+    description: description ?? this.description,
+    artwork: artwork ?? this.artwork,
+    url: url ?? this.url,
+    language: language ?? this.language,
+    songCount: songCount ?? this.songCount,
+    songs: songs ?? this.songs,
+  );
+
+  factory Playlist.fromJson(Map<String, dynamic> json) {
+    final images = (json['image'] as List? ?? const []).whereType<Map>().toList();
+    final image = images.firstWhere(
+      (item) => item['quality'] == '500x500',
+      orElse: () => images.isEmpty ? const {} : images.last,
+    );
+
+    final songsRaw = json['songs'];
+    final songsList = (songsRaw is List ? songsRaw : const [])
+        .whereType<Map>()
+        .map((item) => Song.fromJson(Map<String, dynamic>.from(item)))
+        .toList();
+
+    return Playlist(
+      id: '${json['id'] ?? ''}',
+      title: '${json['name'] ?? json['title'] ?? 'Playlist'}',
+      description: '${json['description'] ?? ''}',
+      artwork: '${image['url'] ?? ''}',
+      url: '${json['url'] ?? ''}',
+      language: '${json['language'] ?? ''}',
+      songCount: int.tryParse('${json['songCount'] ?? songsList.length}') ??
+          songsList.length,
+      songs: songsList,
+    );
+  }
+}
+
 /* -------------------------------------------------------------------------- */
 /*                                    API                                     */
 /* -------------------------------------------------------------------------- */
+
+const _apiHeaders = {
+  'origin': 'https://listenfree.in',
+  'referer': 'https://listenfree.in/',
+  'user-agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36',
+};
 
 class Api {
   static Future<Map<String, dynamic>> search(String query) async {
@@ -109,6 +199,7 @@ class Api {
       Uri.parse(
         '$_apiRoot/api/search?query=${Uri.encodeQueryComponent(query)}',
       ),
+      headers: _apiHeaders,
     );
     if (response.statusCode >= 400) throw Exception('Search failed');
     return jsonDecode(response.body) as Map<String, dynamic>;
@@ -117,6 +208,7 @@ class Api {
   static Future<Map<String, dynamic>?> details(String id) async {
     final response = await http.get(
       Uri.parse('$_apiRoot/api/songs/${Uri.encodeComponent(id)}'),
+      headers: _apiHeaders,
     );
     if (response.statusCode >= 400) return null;
     final data = jsonDecode(response.body)['data'];
@@ -131,6 +223,7 @@ class Api {
         '$_apiRoot/api/songs/${Uri.encodeComponent(id)}/suggestions'
         '?id=${Uri.encodeComponent(id)}&limit=$limit',
       ),
+      headers: _apiHeaders,
     );
     if (response.statusCode >= 400) return [];
     final data = jsonDecode(response.body)['data'];
@@ -140,6 +233,23 @@ class Api {
               .map((item) => Song.fromJson(Map<String, dynamic>.from(item)))
               .toList()
         : [];
+  }
+
+  static Future<Playlist?> playlist(String id, {int limit = 50}) async {
+    try {
+      final response = await http.get(
+        Uri.parse(
+          '$_apiRoot/api/playlists?id=${Uri.encodeComponent(id)}&limit=$limit',
+        ),
+        headers: _apiHeaders,
+      );
+      if (response.statusCode >= 400) return null;
+      final json = jsonDecode(response.body);
+      if (json is Map && json['success'] == true && json['data'] is Map) {
+        return Playlist.fromJson(Map<String, dynamic>.from(json['data']));
+      }
+    } catch (_) {}
+    return null;
   }
 
   static Future<Map<String, dynamic>?> lyrics(Song song) async {
@@ -255,6 +365,49 @@ final _homeSongs = <Song>[
   ),
 ];
 
+final _featuredPlaylists = <Playlist>[
+  Playlist(
+    id: '1214368402',
+    title: 'Badshah - Party Songs - Hindi',
+    description: 'Hindi party songs of Badshah.',
+    artwork:
+        'https://c.saavncdn.com/editorial/BadshahPartySongsHindi_20240307110923.jpg?bch=1788764581',
+    songCount: 24,
+  ),
+  Playlist(
+    id: '47599074',
+    title: 'Now Trending - Hindi',
+    description: 'The hottest trending tracks right now.',
+    artwork:
+        'https://c.saavncdn.com/editorial/NowTrendingHindi_20240410072044.jpg',
+    songCount: 30,
+  ),
+  Playlist(
+    id: '79653434',
+    title: 'Non-Stop Party',
+    description: 'High energy dance and party anthems.',
+    artwork:
+        'https://c.saavncdn.com/editorial/NonStopParty_20240214064512.jpg',
+    songCount: 25,
+  ),
+  Playlist(
+    id: '1302033575',
+    title: 'Romantic Hits 2026',
+    description: 'Soulful melodies and timeless romantic hits.',
+    artwork:
+        'https://c.saavncdn.com/editorial/RomanticHitsHindi_20240214064512.jpg',
+    songCount: 25,
+  ),
+  Playlist(
+    id: '1261305331',
+    title: 'Trending Songs India',
+    description: 'Viral songs topping the charts across India.',
+    artwork:
+        'https://c.saavncdn.com/editorial/TrendingSongsIndia_20240307110923.jpg',
+    songCount: 28,
+  ),
+];
+
 void main() => runApp(const SonixApp());
 
 class SonixApp extends StatelessWidget {
@@ -298,10 +451,14 @@ class _SonixHomeState extends State<SonixHome>
   late final AnimationController _gradientAnim;
 
   List<Song> _results = [];
+  List<Playlist> _playlistResults = [];
   List<Song> _queue = [..._homeSongs];
   List<Song> _history = [];
   List<Song> _suggestions = [];
   bool _isFetchingMoreSuggestions = false;
+
+  Playlist? _openedPlaylist;
+  bool _loadingPlaylist = false;
 
   Song? _current;
   bool _searching = false;
@@ -358,12 +515,16 @@ class _SonixHomeState extends State<SonixHome>
   Future<void> _runSearch(String value) async {
     final query = value.trim();
     if (query.isEmpty) {
-      setState(() => _homeMode = true);
+      setState(() {
+        _homeMode = true;
+        _playlistResults = [];
+      });
       return;
     }
     setState(() {
       _searching = true;
       _homeMode = false;
+      _openedPlaylist = null;
     });
     try {
       final data = await Api.search(query);
@@ -372,9 +533,14 @@ class _SonixHomeState extends State<SonixHome>
           .whereType<Map>()
           .map((item) => Song.fromJson(Map<String, dynamic>.from(item)))
           .toList();
+      final playlists = (groups['playlists']?['results'] as List? ?? const [])
+          .whereType<Map>()
+          .map((item) => Playlist.fromJson(Map<String, dynamic>.from(item)))
+          .toList();
       if (!mounted) return;
       setState(() {
         _results = songs;
+        _playlistResults = playlists;
         _queue = songs;
       });
     } catch (_) {
@@ -385,6 +551,27 @@ class _SonixHomeState extends State<SonixHome>
       }
     } finally {
       if (mounted) setState(() => _searching = false);
+    }
+  }
+
+  Future<void> _openPlaylist(Playlist playlist) async {
+    setState(() {
+      _openedPlaylist = playlist;
+      _loadingPlaylist = playlist.songs.isEmpty;
+    });
+
+    if (playlist.songs.isEmpty) {
+      try {
+        final full = await Api.playlist(playlist.id);
+        if (full != null && mounted && _openedPlaylist?.id == playlist.id) {
+          setState(() {
+            _openedPlaylist = full;
+            _loadingPlaylist = false;
+          });
+        }
+      } catch (_) {
+        if (mounted) setState(() => _loadingPlaylist = false);
+      }
     }
   }
 
@@ -557,7 +744,7 @@ class _SonixHomeState extends State<SonixHome>
   /* ------------------------------- PALETTE ------------------------------- */
 
   Future<List<Color>> _paletteFor(Song song) {
-    final key = song.artwork.isEmpty ? _fallbackArt : song.artwork;
+    final key = song.artwork.trim().isEmpty ? _fallbackArt : song.artwork.trim();
     return _paletteFutures.putIfAbsent(key, () async {
       try {
         final palette = await PaletteGenerator.fromImageProvider(
@@ -605,106 +792,20 @@ class _SonixHomeState extends State<SonixHome>
     return math.sqrt(red * red + green * green + blue * blue);
   }
 
-  Widget _ambientLayer(List<Color> colors, {required bool strong}) {
-    final primary = colors[0];
-    final secondary = colors.length > 1 ? colors[1] : primary;
-    final tertiary = colors.length > 2 ? colors[2] : secondary;
-    final opacity = strong ? 1.0 : .82;
-    final blur = strong ? 100.0 : 64.0;
-
-    return Positioned.fill(
-      child: IgnorePointer(
-        child: AnimatedBuilder(
-          animation: _gradientAnim,
-          builder: (context, child) {
-            final ease = Curves.easeInOutCubic.transform(_gradientAnim.value);
-            final breath = math.sin(ease * math.pi);
-            final shift = ease * 2.0 - 1.0;
-            final dx1 = shift * (strong ? 28.0 : 15.0);
-            final dy1 = breath * (strong ? 22.0 : 12.0);
-            final dx2 = -breath * (strong ? 26.0 : 14.0);
-            final dy2 = shift * (strong ? 24.0 : 13.0);
-            final dx3 = shift * (strong ? 22.0 : 12.0);
-            final dy3 = -breath * (strong ? 25.0 : 13.0);
-
-            return ImageFiltered(
-              imageFilter: ui.ImageFilter.blur(sigmaX: blur, sigmaY: blur),
-              child: Stack(
-                children: [
-                  Positioned(
-                    left: (strong ? -110.0 : -80.0) + dx1,
-                    top: (strong ? -150.0 : -90.0) + dy1,
-                    width: strong ? 500.0 : 300.0,
-                    height: strong ? 500.0 : 300.0,
-                    child: Container(
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        gradient: RadialGradient(
-                          colors: [
-                            primary.withValues(alpha: opacity),
-                            primary.withValues(alpha: opacity * .3),
-                            Colors.transparent,
-                          ],
-                          stops: const [0.0, 0.5, 1.0],
-                        ),
-                      ),
-                    ),
-                  ),
-                  Positioned(
-                    right: (strong ? -130.0 : -80.0) + dx2,
-                    top: (strong ? 20.0 : -35.0) + dy2,
-                    width: strong ? 480.0 : 280.0,
-                    height: strong ? 480.0 : 280.0,
-                    child: Container(
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        gradient: RadialGradient(
-                          colors: [
-                            secondary.withValues(alpha: opacity * .85),
-                            secondary.withValues(alpha: opacity * .25),
-                            Colors.transparent,
-                          ],
-                          stops: const [0.0, 0.45, 1.0],
-                        ),
-                      ),
-                    ),
-                  ),
-                  Positioned(
-                    left: (strong ? 40.0 : 20.0) + dx3,
-                    bottom: (strong ? -230.0 : -90.0) + dy3,
-                    width: strong ? 640.0 : 350.0,
-                    height: strong ? 440.0 : 260.0,
-                    child: Container(
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        gradient: RadialGradient(
-                          colors: [
-                            tertiary.withValues(alpha: opacity * .78),
-                            tertiary.withValues(alpha: opacity * .2),
-                            Colors.transparent,
-                          ],
-                          stops: const [0.0, 0.5, 1.0],
-                        ),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            );
-          },
-        ),
-      ),
-    );
-  }
-
   /* -------------------------------- BUILD -------------------------------- */
 
   @override
   Widget build(BuildContext context) {
     return PopScope(
-      canPop: !_fullScreen,
+      canPop: !_fullScreen && _openedPlaylist == null,
       onPopInvokedWithResult: (didPop, _) {
-        if (!didPop && _fullScreen) setState(() => _fullScreen = false);
+        if (!didPop) {
+          if (_fullScreen) {
+            setState(() => _fullScreen = false);
+          } else if (_openedPlaylist != null) {
+            setState(() => _openedPlaylist = null);
+          }
+        }
       },
       child: Scaffold(
         body: Stack(
@@ -712,8 +813,15 @@ class _SonixHomeState extends State<SonixHome>
             SafeArea(
               child: Column(
                 children: [
-                  _header(),
-                  Expanded(child: _homeMode ? _home() : _searchResults()),
+                  if (_openedPlaylist != null)
+                    _playlistHeader()
+                  else
+                    _header(),
+                  Expanded(
+                    child: _openedPlaylist != null
+                        ? _playlistView()
+                        : (_homeMode ? _home() : _searchResults()),
+                  ),
                   if (_current != null) _playerBar(),
                 ],
               ),
@@ -761,7 +869,11 @@ class _SonixHomeState extends State<SonixHome>
         GestureDetector(
           onTap: () {
             _search.clear();
-            setState(() => _homeMode = true);
+            setState(() {
+              _homeMode = true;
+              _openedPlaylist = null;
+              _playlistResults = [];
+            });
           },
           child: Row(
             children: [
@@ -820,7 +932,11 @@ class _SonixHomeState extends State<SonixHome>
                     icon: const Icon(PhosphorIconsRegular.x, size: 17),
                     onPressed: () {
                       _search.clear();
-                      setState(() => _homeMode = true);
+                      setState(() {
+                        _homeMode = true;
+                        _openedPlaylist = null;
+                        _playlistResults = [];
+                      });
                     },
                   ),
             filled: true,
@@ -850,6 +966,7 @@ class _SonixHomeState extends State<SonixHome>
         _homeSongs.reversed.take(6).toList(),
         horizontal: true,
       ),
+      _featuredPlaylistsSection(),
       const SizedBox(height: 16),
       const Center(
         child: Text(
@@ -922,7 +1039,7 @@ class _SonixHomeState extends State<SonixHome>
               child: ListView.separated(
                 scrollDirection: Axis.horizontal,
                 itemCount: songs.length,
-                separatorBuilder: (_, __) => const SizedBox(width: 14),
+                separatorBuilder: (_, _) => const SizedBox(width: 14),
                 itemBuilder: (_, i) => _card(songs[i]),
               ),
             )
@@ -989,6 +1106,107 @@ class _SonixHomeState extends State<SonixHome>
     );
   }
 
+  Widget _featuredPlaylistsSection() => Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      const Padding(
+        padding: EdgeInsets.only(bottom: 12),
+        child: Row(
+          children: [
+            Icon(PhosphorIconsRegular.playlist, size: 22, color: Colors.white),
+            SizedBox(width: 8),
+            Text(
+              'Featured Playlists',
+              style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
+            ),
+          ],
+        ),
+      ),
+      SizedBox(
+        height: 240,
+        child: ListView.separated(
+          scrollDirection: Axis.horizontal,
+          itemCount: _featuredPlaylists.length,
+          separatorBuilder: (_, _) => const SizedBox(width: 14),
+          itemBuilder: (_, i) => _playlistCard(_featuredPlaylists[i]),
+        ),
+      ),
+      const SizedBox(height: 26),
+    ],
+  );
+
+  Widget _playlistCard(Playlist playlist) => GestureDetector(
+    onTap: () => _openPlaylist(playlist),
+    child: SizedBox(
+      width: 155,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Stack(
+            children: [
+              ClipRRect(
+                borderRadius: BorderRadius.circular(10),
+                child: _art(playlist.artwork, width: 155, height: 155),
+              ),
+              Positioned(
+                bottom: 8,
+                left: 8,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: .75),
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(color: Colors.white12),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(PhosphorIconsRegular.musicNotes, size: 11, color: Colors.white70),
+                      const SizedBox(width: 4),
+                      Text(
+                        '${playlist.songCount > 0 ? playlist.songCount : 20} songs',
+                        style: const TextStyle(fontSize: 10, fontWeight: FontWeight.w600, color: Colors.white70),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              Positioned(
+                right: 8,
+                bottom: 8,
+                child: CircleAvatar(
+                  radius: 17,
+                  backgroundColor: Colors.white,
+                  child: const Icon(
+                    PhosphorIconsRegular.play,
+                    color: Colors.black,
+                    size: 18,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 9),
+          Text(
+            playlist.title,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w700, height: 1.25),
+          ),
+          if (playlist.description.isNotEmpty) ...[
+            const SizedBox(height: 3),
+            Text(
+              playlist.description,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(color: _muted, fontSize: 11, fontWeight: FontWeight.w500),
+            ),
+          ],
+        ],
+      ),
+    ),
+  );
+
   Widget _row(Song song) {
     final isCurrent = _current?.id == song.id;
     return InkWell(
@@ -1042,19 +1260,28 @@ class _SonixHomeState extends State<SonixHome>
     );
   }
 
-  Widget _art(String url, {required double width, required double height}) =>
-      Image.network(
-        url.isEmpty ? _fallbackArt : url,
+  Widget _art(String url, {required double width, required double height}) {
+    final cleanUrl = url.trim();
+    final effectiveUrl = cleanUrl.isEmpty ? _fallbackArt : cleanUrl;
+    return Image.network(
+      effectiveUrl,
+      width: width,
+      height: height,
+      fit: BoxFit.cover,
+      errorBuilder: (_, _, _) => Image.network(
+        _fallbackArt,
         width: width,
         height: height,
         fit: BoxFit.cover,
-        errorBuilder: (_, __, ___) => Image.network(
-          _fallbackArt,
+        errorBuilder: (_, _, _) => Container(
           width: width,
           height: height,
-          fit: BoxFit.cover,
+          color: _surface,
+          child: const Icon(PhosphorIconsRegular.musicNote, color: _muted),
         ),
-      );
+      ),
+    );
+  }
 
   /* ----------------------------- SEARCH RESULT ---------------------------- */
 
@@ -1071,10 +1298,10 @@ class _SonixHomeState extends State<SonixHome>
         ),
       );
     }
-    if (_results.isEmpty) {
+    if (_results.isEmpty && _playlistResults.isEmpty) {
       return const Center(
         child: Text(
-          'Discover any song, artist, or album',
+          'Discover any song, artist, album, or playlist',
           style: TextStyle(color: _muted),
         ),
       );
@@ -1082,15 +1309,302 @@ class _SonixHomeState extends State<SonixHome>
     return ListView(
       padding: const EdgeInsets.fromLTRB(14, 22, 14, 120),
       children: [
-        const Text(
-          'Songs',
-          style: TextStyle(fontSize: 21, fontWeight: FontWeight.w800),
+        if (_playlistResults.isNotEmpty) ...[
+          Padding(
+            padding: const EdgeInsets.only(bottom: 12),
+            child: Row(
+              children: [
+                const Icon(PhosphorIconsRegular.playlist, size: 20, color: Colors.white),
+                const SizedBox(width: 8),
+                Text(
+                  'Playlists (${_playlistResults.length})',
+                  style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
+                ),
+              ],
+            ),
+          ),
+          SizedBox(
+            height: 235,
+            child: ListView.separated(
+              scrollDirection: Axis.horizontal,
+              itemCount: _playlistResults.length,
+              separatorBuilder: (_, _) => const SizedBox(width: 14),
+              itemBuilder: (_, i) => _playlistCard(_playlistResults[i]),
+            ),
+          ),
+          const SizedBox(height: 24),
+        ],
+        if (_results.isNotEmpty) ...[
+          const Text(
+            'Songs',
+            style: TextStyle(fontSize: 21, fontWeight: FontWeight.w800),
+          ),
+          const SizedBox(height: 12),
+          ..._results.asMap().entries.map(
+            (entry) => _searchRow(entry.key, entry.value),
+          ),
+        ],
+      ],
+    );
+  }
+
+  /* ------------------------------ PLAYLIST VIEW --------------------------- */
+
+  Widget _playlistHeader() => Container(
+    padding: const EdgeInsets.fromLTRB(10, 10, 16, 10),
+    decoration: const BoxDecoration(
+      color: Color(0xee080808),
+      border: Border(bottom: BorderSide(color: Color(0x18ffffff))),
+    ),
+    child: Row(
+      children: [
+        IconButton(
+          icon: const Icon(PhosphorIconsRegular.arrowLeft, size: 22),
+          onPressed: () => setState(() => _openedPlaylist = null),
         ),
-        const SizedBox(height: 12),
-        ..._results.asMap().entries.map(
-          (entry) => _searchRow(entry.key, entry.value),
+        const SizedBox(width: 4),
+        Expanded(
+          child: Text(
+            _openedPlaylist?.title ?? 'Playlist',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+          ),
         ),
       ],
+    ),
+  );
+
+  Widget _playlistView() {
+    final playlist = _openedPlaylist!;
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 16, 16, 120),
+      children: [
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            ClipRRect(
+              borderRadius: BorderRadius.circular(12),
+              child: _art(playlist.artwork, width: 130, height: 130),
+            ),
+            const SizedBox(width: 16),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: .12),
+                      borderRadius: BorderRadius.circular(5),
+                    ),
+                    child: const Text(
+                      'PLAYLIST',
+                      style: TextStyle(
+                        fontSize: 9,
+                        letterSpacing: 1.1,
+                        fontWeight: FontWeight.w700,
+                        color: Colors.white,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    playlist.title,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.w800,
+                      height: 1.2,
+                    ),
+                  ),
+                  if (playlist.description.isNotEmpty) ...[
+                    const SizedBox(height: 6),
+                    Text(
+                      playlist.description,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(color: _muted, fontSize: 11),
+                    ),
+                  ],
+                  const SizedBox(height: 8),
+                  Text(
+                    '${playlist.songs.isNotEmpty ? playlist.songs.length : (playlist.songCount > 0 ? playlist.songCount : 0)} Songs',
+                    style: const TextStyle(color: _muted, fontSize: 12, fontWeight: FontWeight.w600),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 20),
+        Row(
+          children: [
+            Expanded(
+              child: ElevatedButton.icon(
+                onPressed: playlist.songs.isEmpty
+                    ? null
+                    : () {
+                        setState(() {
+                          _queue = [...playlist.songs];
+                        });
+                        _play(playlist.songs.first);
+                      },
+                icon: const Icon(PhosphorIconsFill.play, size: 18, color: Colors.black),
+                label: const Text(
+                  'Play All',
+                  style: TextStyle(color: Colors.black, fontWeight: FontWeight.w800, fontSize: 14),
+                ),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 13),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
+                  elevation: 0,
+                ),
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: OutlinedButton.icon(
+                onPressed: playlist.songs.isEmpty
+                    ? null
+                    : () {
+                        final shuffled = [...playlist.songs]..shuffle();
+                        setState(() {
+                          _queue = shuffled;
+                        });
+                        _play(shuffled.first);
+                      },
+                icon: const Icon(PhosphorIconsRegular.shuffle, size: 18, color: Colors.white),
+                label: const Text(
+                  'Shuffle',
+                  style: TextStyle(color: Colors.white, fontWeight: FontWeight.w700, fontSize: 14),
+                ),
+                style: OutlinedButton.styleFrom(
+                  side: const BorderSide(color: Colors.white24),
+                  padding: const EdgeInsets.symmetric(vertical: 13),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
+                ),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 24),
+        if (_loadingPlaylist) ...[
+          const SizedBox(height: 40),
+          const Center(
+            child: Column(
+              children: [
+                CircularProgressIndicator(),
+                SizedBox(height: 16),
+                Text('Loading playlist songs...', style: TextStyle(color: _muted)),
+              ],
+            ),
+          ),
+        ] else if (playlist.songs.isEmpty) ...[
+          const SizedBox(height: 40),
+          const Center(
+            child: Text(
+              'No songs available in this playlist',
+              style: TextStyle(color: _muted),
+            ),
+          ),
+        ] else ...[
+          Text(
+            'Tracks (${playlist.songs.length})',
+            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
+          ),
+          const SizedBox(height: 10),
+          ...playlist.songs.asMap().entries.map(
+            (entry) => _playlistSongRow(entry.key, entry.value, playlist),
+          ),
+        ],
+      ],
+    );
+  }
+
+  Widget _playlistSongRow(int index, Song song, Playlist playlist) {
+    final isCurrent = _current?.id == song.id;
+    return InkWell(
+      onTap: () {
+        if (_queue != playlist.songs) {
+          setState(() => _queue = [...playlist.songs]);
+        }
+        _play(song);
+      },
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 7),
+        child: Row(
+          children: [
+            SizedBox(
+              width: 28,
+              child: Text(
+                isCurrent && _audio.playing ? '▶' : '${index + 1}',
+                style: TextStyle(
+                  color: isCurrent ? Colors.white : _muted,
+                  fontWeight: isCurrent ? FontWeight.bold : FontWeight.normal,
+                ),
+              ),
+            ),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(6),
+              child: _art(song.artwork, width: 48, height: 48),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    song.title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontWeight: FontWeight.w700,
+                      fontSize: 14,
+                      color: isCurrent ? Colors.white : Colors.white.withValues(alpha: .9),
+                    ),
+                  ),
+                  const SizedBox(height: 3),
+                  Text(
+                    song.artist,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(color: _muted, fontSize: 12, fontWeight: FontWeight.w500),
+                  ),
+                ],
+              ),
+            ),
+            if (song.duration > 0)
+              Padding(
+                padding: const EdgeInsets.only(right: 6),
+                child: Text(
+                  _time(Duration(seconds: song.duration)),
+                  style: const TextStyle(color: _muted, fontSize: 11),
+                ),
+              ),
+            IconButton(
+              onPressed: () {
+                if (_queue != playlist.songs) {
+                  setState(() => _queue = [...playlist.songs]);
+                }
+                _play(song);
+              },
+              icon: Icon(
+                isCurrent && _audio.playing
+                    ? PhosphorIconsRegular.pause
+                    : PhosphorIconsRegular.play,
+                size: 20,
+              ),
+            ),
+            IconButton(
+              onPressed: () => _download(song),
+              icon: const Icon(PhosphorIconsRegular.downloadSimple, size: 18),
+            ),
+          ],
+        ),
+      ),
     );
   }
 
