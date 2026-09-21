@@ -526,6 +526,8 @@ class _SonixHomeState extends State<SonixHome>
   Map<String, Song> _likedSongs = {};
   bool _viewingLikedSongs = false;
   String _songQuality = '320kbps';
+  Timer? _sleepTimer;
+  DateTime? _sleepTimerEndTime;
 
   Playlist? _openedPlaylist;
   bool _loadingPlaylist = false;
@@ -581,6 +583,7 @@ class _SonixHomeState extends State<SonixHome>
 
   @override
   void dispose() {
+    _sleepTimer?.cancel();
     _gradientAnim.dispose();
     _search.removeListener(_onSearchChanged);
     _playingSub?.cancel();
@@ -2521,10 +2524,65 @@ class _SonixHomeState extends State<SonixHome>
   );
 }
 
+  Duration? get _sleepTimerRemaining {
+    if (_sleepTimerEndTime == null) return null;
+    final diff = _sleepTimerEndTime!.difference(DateTime.now());
+    return diff.isNegative ? Duration.zero : diff;
+  }
+
+  void _setSleepTimer(Duration duration) {
+    _sleepTimer?.cancel();
+    if (duration <= Duration.zero) {
+      setState(() {
+        _sleepTimer = null;
+        _sleepTimerEndTime = null;
+      });
+      return;
+    }
+    setState(() {
+      _sleepTimerEndTime = DateTime.now().add(duration);
+    });
+    _sleepTimer = Timer(duration, () async {
+      await _audio.pause();
+      if (mounted) {
+        setState(() {
+          _sleepTimer = null;
+          _sleepTimerEndTime = null;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Row(
+              children: [
+                Icon(PhosphorIconsRegular.moonStars, color: Colors.white, size: 20),
+                SizedBox(width: 10),
+                Text('Sleep timer reached. Music paused.', style: TextStyle(fontWeight: FontWeight.w600)),
+              ],
+            ),
+            backgroundColor: const Color(0xee1c1c22),
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+            duration: const Duration(seconds: 4),
+          ),
+        );
+      }
+    });
+  }
+
+  void _cancelSleepTimer() {
+    _sleepTimer?.cancel();
+    setState(() {
+      _sleepTimer = null;
+      _sleepTimerEndTime = null;
+    });
+  }
+
   void _openSettings() {
     final nameCtrl = TextEditingController(text: _userProfile?.name ?? '');
     final ageCtrl = TextEditingController(text: _userProfile?.age != null ? '${_userProfile!.age}' : '');
+    final hoursCtrl = TextEditingController(text: '0');
+    final minutesCtrl = TextEditingController(text: '30');
     String selectedQuality = _songQuality;
+    Timer? liveTicker;
 
     final qualityOptions = [
       {
@@ -2554,11 +2612,17 @@ class _SonixHomeState extends State<SonixHome>
       backgroundColor: Colors.transparent,
       isScrollControlled: true,
       builder: (ctx) => StatefulBuilder(
-        builder: (_, setModalState) => SafeArea(
-          top: false,
-          child: Padding(
-            padding: EdgeInsets.only(bottom: MediaQuery.of(ctx).viewInsets.bottom),
-            child: Container(
+        builder: (_, setModalState) {
+          liveTicker ??= Timer.periodic(const Duration(seconds: 1), (_) {
+            if (_sleepTimerEndTime != null && ctx.mounted) {
+              setModalState(() {});
+            }
+          });
+          return SafeArea(
+            top: false,
+            child: Padding(
+              padding: EdgeInsets.only(bottom: MediaQuery.of(ctx).viewInsets.bottom),
+              child: Container(
               constraints: BoxConstraints(
                 maxHeight: MediaQuery.of(ctx).size.height * 0.85,
               ),
@@ -2665,6 +2729,289 @@ class _SonixHomeState extends State<SonixHome>
                   const SizedBox(height: 20),
                   const Divider(color: Colors.white12, height: 1),
                   const SizedBox(height: 18),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Row(
+                        children: [
+                          Icon(PhosphorIconsRegular.moonStars, color: Colors.white, size: 18),
+                          SizedBox(width: 8),
+                          Text(
+                            'Sleep Timer',
+                            style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: _muted, letterSpacing: 0.5),
+                          ),
+                        ],
+                      ),
+                      if (_sleepTimerEndTime != null)
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+                          decoration: BoxDecoration(
+                            color: Colors.indigoAccent.withValues(alpha: .2),
+                            borderRadius: BorderRadius.circular(10),
+                            border: Border.all(color: Colors.indigoAccent.withValues(alpha: .4)),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Container(
+                                width: 6,
+                                height: 6,
+                                decoration: const BoxDecoration(
+                                  color: Colors.indigoAccent,
+                                  shape: BoxShape.circle,
+                                ),
+                              ),
+                              const SizedBox(width: 6),
+                              Text(
+                                () {
+                                  final rem = _sleepTimerRemaining ?? Duration.zero;
+                                  final h = rem.inHours;
+                                  final m = rem.inMinutes % 60;
+                                  final s = rem.inSeconds % 60;
+                                  if (h > 0) return '${h}h ${m}m ${s}s left';
+                                  return '${m}m ${s}s left';
+                                }(),
+                                style: const TextStyle(
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w700,
+                                  color: Colors.white,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  if (_sleepTimerEndTime != null) ...[
+                    Container(
+                      padding: const EdgeInsets.all(14),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withValues(alpha: .04),
+                        borderRadius: BorderRadius.circular(14),
+                        border: Border.all(color: Colors.white12),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Container(
+                                padding: const EdgeInsets.all(8),
+                                decoration: BoxDecoration(
+                                  color: Colors.indigoAccent.withValues(alpha: .2),
+                                  borderRadius: BorderRadius.circular(8),
+                                ),
+                                child: const Icon(
+                                  PhosphorIconsRegular.clockCountdown,
+                                  color: Colors.indigoAccent,
+                                  size: 20,
+                                ),
+                              ),
+                              const SizedBox(width: 12),
+                              const Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      'Sleep Timer is Active',
+                                      style: TextStyle(
+                                        fontSize: 14,
+                                        fontWeight: FontWeight.w700,
+                                        color: Colors.white,
+                                      ),
+                                    ),
+                                    SizedBox(height: 2),
+                                    Text(
+                                      'Playback will stop automatically',
+                                      style: TextStyle(fontSize: 12, color: _muted),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 12),
+                          SizedBox(
+                            width: double.infinity,
+                            height: 40,
+                            child: OutlinedButton.icon(
+                              onPressed: () {
+                                _cancelSleepTimer();
+                                setModalState(() {});
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  SnackBar(
+                                    content: const Text('Sleep timer turned off'),
+                                    behavior: SnackBarBehavior.floating,
+                                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                                    duration: const Duration(seconds: 2),
+                                  ),
+                                );
+                              },
+                              icon: const Icon(PhosphorIconsRegular.xCircle, size: 18, color: Colors.redAccent),
+                              label: const Text(
+                                'Turn Off Sleep Timer',
+                                style: TextStyle(color: Colors.redAccent, fontWeight: FontWeight.w700, fontSize: 13),
+                              ),
+                              style: OutlinedButton.styleFrom(
+                                side: BorderSide(color: Colors.redAccent.withValues(alpha: .5)),
+                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ] else ...[
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Text(
+                                'Hours',
+                                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: _muted),
+                              ),
+                              const SizedBox(height: 6),
+                              TextField(
+                                controller: hoursCtrl,
+                                keyboardType: TextInputType.number,
+                                style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w700),
+                                textAlign: TextAlign.center,
+                                decoration: InputDecoration(
+                                  hintText: '0',
+                                  hintStyle: const TextStyle(color: _muted),
+                                  filled: true,
+                                  fillColor: Colors.white.withValues(alpha: .06),
+                                  contentPadding: const EdgeInsets.symmetric(vertical: 12),
+                                  border: OutlineInputBorder(
+                                    borderRadius: BorderRadius.circular(12),
+                                    borderSide: BorderSide.none,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(width: 14),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Text(
+                                'Minutes',
+                                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: _muted),
+                              ),
+                              const SizedBox(height: 6),
+                              TextField(
+                                controller: minutesCtrl,
+                                keyboardType: TextInputType.number,
+                                style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w700),
+                                textAlign: TextAlign.center,
+                                decoration: InputDecoration(
+                                  hintText: '30',
+                                  hintStyle: const TextStyle(color: _muted),
+                                  filled: true,
+                                  fillColor: Colors.white.withValues(alpha: .06),
+                                  contentPadding: const EdgeInsets.symmetric(vertical: 12),
+                                  border: OutlineInputBorder(
+                                    borderRadius: BorderRadius.circular(12),
+                                    borderSide: BorderSide.none,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        for (final preset in [
+                          {'label': '15 min', 'h': '0', 'm': '15'},
+                          {'label': '30 min', 'h': '0', 'm': '30'},
+                          {'label': '45 min', 'h': '0', 'm': '45'},
+                          {'label': '1 hr', 'h': '1', 'm': '0'},
+                          {'label': '2 hrs', 'h': '2', 'm': '0'},
+                        ])
+                          GestureDetector(
+                            onTap: () {
+                              setModalState(() {
+                                hoursCtrl.text = preset['h']!;
+                                minutesCtrl.text = preset['m']!;
+                              });
+                            },
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 5),
+                              decoration: BoxDecoration(
+                                color: Colors.white.withValues(alpha: .07),
+                                borderRadius: BorderRadius.circular(20),
+                                border: Border.all(color: Colors.white12),
+                              ),
+                              child: Text(
+                                preset['label']!,
+                                style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Colors.white),
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 14),
+                    SizedBox(
+                      width: double.infinity,
+                      height: 42,
+                      child: ElevatedButton.icon(
+                        onPressed: () {
+                          final h = int.tryParse(hoursCtrl.text.trim()) ?? 0;
+                          final m = int.tryParse(minutesCtrl.text.trim()) ?? 0;
+                          final totalSeconds = (h * 3600) + (m * 60);
+                          if (totalSeconds <= 0) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: const Text('Please enter a duration greater than 0 minutes'),
+                                behavior: SnackBarBehavior.floating,
+                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                                duration: const Duration(seconds: 2),
+                              ),
+                            );
+                            return;
+                          }
+                          _setSleepTimer(Duration(seconds: totalSeconds));
+                          setModalState(() {});
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text(
+                                h > 0
+                                    ? 'Sleep timer set for $h hour${h > 1 ? 's' : ''} $m minute${m != 1 ? 's' : ''}'
+                                    : 'Sleep timer set for $m minute${m != 1 ? 's' : ''}',
+                              ),
+                              behavior: SnackBarBehavior.floating,
+                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                              duration: const Duration(seconds: 2),
+                            ),
+                          );
+                        },
+                        icon: const Icon(PhosphorIconsRegular.timer, size: 18),
+                        label: const Text(
+                          'Start Sleep Timer',
+                          style: TextStyle(fontWeight: FontWeight.w700, fontSize: 14),
+                        ),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.white.withValues(alpha: .15),
+                          foregroundColor: Colors.white,
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                          elevation: 0,
+                        ),
+                      ),
+                    ),
+                  ],
+                  const SizedBox(height: 20),
+                  const Divider(color: Colors.white12, height: 1),
+                  const SizedBox(height: 18),
                   const Text(
                     'Edit Profile',
                     style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: _muted, letterSpacing: 0.5),
@@ -2743,16 +3090,17 @@ class _SonixHomeState extends State<SonixHome>
                       ),
                     ),
                   ),
-                  SizedBox(height: math.max(MediaQuery.paddingOf(ctx).bottom, 24.0) + 16.0),
-                ],
+                    SizedBox(height: math.max(MediaQuery.paddingOf(ctx).bottom, 24.0) + 16.0),
+                  ],
                 ),
               ),
             ),
           ),
-        ),
-      ),
-    );
-  }
+        );
+      },
+    ),
+  ).whenComplete(() => liveTicker?.cancel());
+}
 
   void _showSongOptions(Song song, [List<Song>? contextQueue]) {
     final isLiked = _likedSongs.containsKey(song.id);
