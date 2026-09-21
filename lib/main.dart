@@ -12,6 +12,9 @@ import 'package:palette_generator/palette_generator.dart';
 import 'package:phosphor_icons/phosphor_icons.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import 'onboarding_screen.dart';
+import 'user_storage.dart';
+
 const _apiRoot = 'https://music-api.albatross0071.workers.dev';
 const _fallbackArt =
     'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcRKzFIZo0IV9H2PER0gKrlsPHoB0NIxu_U_JSJySOR_3A&s=10';
@@ -106,6 +109,21 @@ class Song {
     streamUrl: streamUrl ?? this.streamUrl,
     downloadUrls: downloadUrls ?? this.downloadUrls,
   );
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'title': title,
+    'artist': artist,
+    'album': album,
+    'artwork': artwork,
+    'image': [
+      {'quality': '500x500', 'url': artwork}
+    ],
+    'duration': duration,
+    'streamUrl': streamUrl,
+    'audioUrl': streamUrl,
+    'downloadUrl': downloadUrls,
+  };
 }
 
 class LyricLine {
@@ -410,8 +428,45 @@ final _featuredPlaylists = <Playlist>[
 
 void main() => runApp(const SonixApp());
 
-class SonixApp extends StatelessWidget {
+class SonixApp extends StatefulWidget {
   const SonixApp({super.key});
+
+  @override
+  State<SonixApp> createState() => _SonixAppState();
+}
+
+class _SonixAppState extends State<SonixApp> {
+  bool _checkedOnboarding = false;
+  bool _isOnboarded = false;
+  UserProfile? _userProfile;
+
+  @override
+  void initState() {
+    super.initState();
+    _checkOnboarding();
+  }
+
+  Future<void> _checkOnboarding() async {
+    final done = await UserStorage.isOnboardingComplete();
+    UserProfile? profile;
+    if (done) {
+      profile = await UserStorage.getProfile();
+    }
+    if (mounted) {
+      setState(() {
+        _isOnboarded = done;
+        _userProfile = profile;
+        _checkedOnboarding = true;
+      });
+    }
+  }
+
+  void _onComplete(UserProfile profile) {
+    setState(() {
+      _userProfile = profile;
+      _isOnboarded = true;
+    });
+  }
 
   @override
   Widget build(BuildContext context) => MaterialApp(
@@ -429,7 +484,16 @@ class SonixApp extends StatelessWidget {
       ),
       fontFamily: GoogleFonts.inter().fontFamily,
     ),
-    home: const SonixHome(),
+    home: !_checkedOnboarding
+        ? const Scaffold(
+            backgroundColor: _ink,
+            body: Center(
+              child: CircularProgressIndicator(color: Colors.white),
+            ),
+          )
+        : (_isOnboarded
+            ? SonixHome(userProfile: _userProfile)
+            : OnboardingScreen(onComplete: _onComplete)),
   );
 }
 
@@ -438,7 +502,9 @@ class SonixApp extends StatelessWidget {
 /* -------------------------------------------------------------------------- */
 
 class SonixHome extends StatefulWidget {
-  const SonixHome({super.key});
+  const SonixHome({super.key, this.userProfile});
+
+  final UserProfile? userProfile;
 
   @override
   State<SonixHome> createState() => _SonixHomeState();
@@ -446,6 +512,7 @@ class SonixHome extends StatefulWidget {
 
 class _SonixHomeState extends State<SonixHome>
     with TickerProviderStateMixin {
+  UserProfile? _userProfile;
   final _search = TextEditingController();
   final _audio = AudioPlayer();
   late final AnimationController _gradientAnim;
@@ -455,6 +522,10 @@ class _SonixHomeState extends State<SonixHome>
   List<Song> _queue = [..._homeSongs];
   List<Song> _history = [];
   bool _isFetchingMoreSuggestions = false;
+
+  Map<String, Song> _likedSongs = {};
+  bool _viewingLikedSongs = false;
+  String _songQuality = '320kbps';
 
   Playlist? _openedPlaylist;
   bool _loadingPlaylist = false;
@@ -479,6 +550,16 @@ class _SonixHomeState extends State<SonixHome>
   @override
   void initState() {
     super.initState();
+    _userProfile = widget.userProfile;
+    if (_userProfile == null) {
+      UserStorage.getProfile().then((p) {
+        if (mounted && p != null) setState(() => _userProfile = p);
+      });
+    }
+    _loadLikedSongs();
+    UserStorage.getSongQuality().then((q) {
+      if (mounted) setState(() => _songQuality = q);
+    });
     _gradientAnim = AnimationController(
       vsync: this,
       duration: const Duration(seconds: 14),
@@ -524,6 +605,7 @@ class _SonixHomeState extends State<SonixHome>
       _searching = true;
       _homeMode = false;
       _openedPlaylist = null;
+      _viewingLikedSongs = false;
     });
     try {
       final data = await Api.search(query);
@@ -556,6 +638,7 @@ class _SonixHomeState extends State<SonixHome>
   Future<void> _openPlaylist(Playlist playlist) async {
     setState(() {
       _openedPlaylist = playlist;
+      _viewingLikedSongs = false;
       _loadingPlaylist = playlist.songs.isEmpty;
     });
 
@@ -610,12 +693,12 @@ class _SonixHomeState extends State<SonixHome>
 
       final resolved = details == null ? song : Song.fromJson(details);
       final urls = resolved.downloadUrls;
-      final match = urls.where((item) => item['quality'] == '320kbps').toList();
-      final stream =
-          (match.isNotEmpty
-                  ? match.first
-                  : (urls.isEmpty ? null : urls.last))?['url']
-              as String?;
+      final match = urls.where((item) => item['quality'] == _songQuality).toList();
+      final stream = (match.isNotEmpty
+              ? match.first
+              : (urls.where((item) => item['quality'] == '320kbps').isNotEmpty
+                  ? urls.firstWhere((item) => item['quality'] == '320kbps')
+                  : (urls.isEmpty ? null : urls.last)))?['url'] as String?;
 
       setState(() => _current = resolved.copyWith(streamUrl: stream));
 
@@ -723,12 +806,40 @@ class _SonixHomeState extends State<SonixHome>
       _audio.seek(Duration(milliseconds: (seconds * 1000).round()));
 
   Future<void> _download(Song song) async {
-    final url =
-        song.streamUrl ??
-        (song.downloadUrls.isEmpty
-            ? null
-            : song.downloadUrls.last['url'] as String?);
-    if (url == null) return;
+    String? url = song.streamUrl;
+    if (url == null && song.downloadUrls.isNotEmpty) {
+      final match = song.downloadUrls.where((i) => i['quality'] == _songQuality).toList();
+      url = (match.isNotEmpty ? match.first : song.downloadUrls.last)['url'] as String?;
+    }
+    if (url == null) {
+      try {
+        final details = await Api.details(song.id);
+        if (details != null) {
+          final resolved = Song.fromJson(details);
+          final urls = resolved.downloadUrls;
+          final match = urls.where((item) => item['quality'] == _songQuality).toList();
+          url = (match.isNotEmpty
+                  ? match.first
+                  : (urls.where((item) => item['quality'] == '320kbps').isNotEmpty
+                      ? urls.firstWhere((item) => item['quality'] == '320kbps')
+                      : (urls.isEmpty ? null : urls.last)))?['url'] as String?;
+        }
+      } catch (_) {}
+    }
+
+    if (url == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Text('Download link not available for this track'),
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+            duration: const Duration(seconds: 2),
+          ),
+        );
+      }
+      return;
+    }
     final uri = Uri.tryParse(url);
     if (uri == null) return;
     await launchUrl(uri, mode: LaunchMode.externalApplication);
@@ -790,13 +901,15 @@ class _SonixHomeState extends State<SonixHome>
   @override
   Widget build(BuildContext context) {
     return PopScope(
-      canPop: !_fullScreen && _openedPlaylist == null,
+      canPop: !_fullScreen && _openedPlaylist == null && !_viewingLikedSongs,
       onPopInvokedWithResult: (didPop, _) {
         if (!didPop) {
           if (_fullScreen) {
             setState(() => _fullScreen = false);
           } else if (_openedPlaylist != null) {
             setState(() => _openedPlaylist = null);
+          } else if (_viewingLikedSongs) {
+            setState(() => _viewingLikedSongs = false);
           }
         }
       },
@@ -808,12 +921,16 @@ class _SonixHomeState extends State<SonixHome>
                 children: [
                   if (_openedPlaylist != null)
                     _playlistHeader()
+                  else if (_viewingLikedSongs)
+                    _likedSongsHeader()
                   else
                     _header(),
                   Expanded(
                     child: _openedPlaylist != null
                         ? _playlistView()
-                        : (_homeMode ? _home() : _searchResults()),
+                        : (_viewingLikedSongs
+                            ? _likedSongsView()
+                            : (_homeMode ? _home() : _searchResults())),
                   ),
                   if (_current != null) _playerBar(),
                 ],
@@ -865,6 +982,7 @@ class _SonixHomeState extends State<SonixHome>
             setState(() {
               _homeMode = true;
               _openedPlaylist = null;
+              _viewingLikedSongs = false;
               _playlistResults = [];
             });
           },
@@ -884,7 +1002,9 @@ class _SonixHomeState extends State<SonixHome>
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    'Sonix',
+                    _userProfile != null && _userProfile!.name.isNotEmpty
+                        ? 'Hello, ${_userProfile!.name.split(' ').first}'
+                        : 'Sonix',
                     style: TextStyle(
                       fontSize: 18,
                       fontWeight: FontWeight.w800,
@@ -892,7 +1012,9 @@ class _SonixHomeState extends State<SonixHome>
                     ),
                   ),
                   Text(
-                    'SONG PLAYER',
+                    _userProfile != null && _userProfile!.name.isNotEmpty
+                        ? 'ENJOY YOUR MUSIC'
+                        : 'SONG PLAYER',
                     style: TextStyle(
                       fontSize: 9,
                       color: _muted,
@@ -902,6 +1024,24 @@ class _SonixHomeState extends State<SonixHome>
                     ),
                   ),
                 ],
+              ),
+              const Spacer(),
+              GestureDetector(
+                onTap: _openUserMenu,
+                child: Container(
+                  width: 38,
+                  height: 38,
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: .12),
+                    shape: BoxShape.circle,
+                    border: Border.all(color: Colors.white24, width: 1.2),
+                  ),
+                  child: const Icon(
+                    PhosphorIconsBold.user,
+                    size: 20,
+                    color: Colors.white,
+                  ),
+                ),
               ),
             ],
           ),
@@ -928,6 +1068,7 @@ class _SonixHomeState extends State<SonixHome>
                       setState(() {
                         _homeMode = true;
                         _openedPlaylist = null;
+                        _viewingLikedSongs = false;
                         _playlistResults = [];
                       });
                     },
@@ -1061,6 +1202,27 @@ class _SonixHomeState extends State<SonixHome>
                 ClipRRect(
                   borderRadius: BorderRadius.circular(8),
                   child: _art(song.artwork, width: 145, height: 178),
+                ),
+                Positioned(
+                  top: 8,
+                  right: 8,
+                  child: GestureDetector(
+                    onTap: () => _showSongOptions(song, contextQueue),
+                    child: Container(
+                      width: 30,
+                      height: 30,
+                      decoration: BoxDecoration(
+                        color: Colors.black.withValues(alpha: .65),
+                        shape: BoxShape.circle,
+                        border: Border.all(color: Colors.white12),
+                      ),
+                      child: const Icon(
+                        PhosphorIconsRegular.dotsThreeVertical,
+                        color: Colors.white,
+                        size: 18,
+                      ),
+                    ),
+                  ),
                 ),
                 Positioned(
                   right: 9,
@@ -1207,6 +1369,7 @@ class _SonixHomeState extends State<SonixHome>
 
   Widget _row(Song song, [List<Song>? contextQueue]) {
     final isCurrent = _current?.id == song.id;
+    final isLiked = _likedSongs.containsKey(song.id);
     return InkWell(
       onTap: () {
         if (contextQueue != null && _queue != contextQueue) {
@@ -1246,21 +1409,18 @@ class _SonixHomeState extends State<SonixHome>
               ),
             ),
             IconButton(
-              onPressed: () {
-                if (contextQueue != null && _queue != contextQueue) {
-                  setState(() => _queue = [...contextQueue]);
-                }
-                _play(song);
-              },
+              onPressed: () => _toggleLike(song),
               icon: Icon(
-                isCurrent && _audio.playing
-                    ? PhosphorIconsRegular.pause
-                    : PhosphorIconsRegular.play,
+                isLiked ? PhosphorIconsFill.heart : PhosphorIconsRegular.heart,
+                color: isLiked ? Colors.redAccent : _muted,
+                size: 20,
               ),
+              tooltip: isLiked ? 'Unlike' : 'Like',
             ),
             IconButton(
-              onPressed: () => _download(song),
-              icon: const Icon(PhosphorIconsRegular.downloadSimple, size: 19),
+              onPressed: () => _showSongOptions(song, contextQueue),
+              icon: const Icon(PhosphorIconsRegular.dotsThreeVertical, size: 20),
+              tooltip: 'More options',
             ),
           ],
         ),
@@ -1534,6 +1694,7 @@ class _SonixHomeState extends State<SonixHome>
 
   Widget _playlistSongRow(int index, Song song, Playlist playlist) {
     final isCurrent = _current?.id == song.id;
+    final isLiked = _likedSongs.containsKey(song.id);
     return InkWell(
       onTap: () {
         if (_queue != playlist.songs) {
@@ -1593,22 +1754,18 @@ class _SonixHomeState extends State<SonixHome>
                 ),
               ),
             IconButton(
-              onPressed: () {
-                if (_queue != playlist.songs) {
-                  setState(() => _queue = [...playlist.songs]);
-                }
-                _play(song);
-              },
+              onPressed: () => _toggleLike(song),
               icon: Icon(
-                isCurrent && _audio.playing
-                    ? PhosphorIconsRegular.pause
-                    : PhosphorIconsRegular.play,
+                isLiked ? PhosphorIconsFill.heart : PhosphorIconsRegular.heart,
+                color: isLiked ? Colors.redAccent : _muted,
                 size: 20,
               ),
+              tooltip: isLiked ? 'Unlike' : 'Like',
             ),
             IconButton(
-              onPressed: () => _download(song),
-              icon: const Icon(PhosphorIconsRegular.downloadSimple, size: 18),
+              onPressed: () => _showSongOptions(song, playlist.songs),
+              icon: const Icon(PhosphorIconsRegular.dotsThreeVertical, size: 20),
+              tooltip: 'More options',
             ),
           ],
         ),
@@ -1618,6 +1775,7 @@ class _SonixHomeState extends State<SonixHome>
 
   Widget _searchRow(int index, Song song) {
     final isCurrent = _current?.id == song.id;
+    final isLiked = _likedSongs.containsKey(song.id);
     return InkWell(
       onTap: () {
         if (_queue != _results) {
@@ -1659,17 +1817,18 @@ class _SonixHomeState extends State<SonixHome>
               ),
             ),
             IconButton(
-              onPressed: () {
-                if (_queue != _results) {
-                  setState(() => _queue = [..._results]);
-                }
-                _play(song);
-              },
-              icon: const Icon(PhosphorIconsRegular.play),
+              onPressed: () => _toggleLike(song),
+              icon: Icon(
+                isLiked ? PhosphorIconsFill.heart : PhosphorIconsRegular.heart,
+                color: isLiked ? Colors.redAccent : _muted,
+                size: 20,
+              ),
+              tooltip: isLiked ? 'Unlike' : 'Like',
             ),
             IconButton(
-              onPressed: () => _download(song),
-              icon: const Icon(PhosphorIconsRegular.downloadSimple, size: 19),
+              onPressed: () => _showSongOptions(song, _results),
+              icon: const Icon(PhosphorIconsRegular.dotsThreeVertical, size: 20),
+              tooltip: 'More options',
             ),
           ],
         ),
@@ -1733,6 +1892,19 @@ class _SonixHomeState extends State<SonixHome>
                         ),
                       ],
                     ),
+                  ),
+                  IconButton(
+                    onPressed: () => _toggleLike(track),
+                    icon: Icon(
+                      _likedSongs.containsKey(track.id)
+                          ? PhosphorIconsFill.heart
+                          : PhosphorIconsRegular.heart,
+                      size: 20,
+                      color: _likedSongs.containsKey(track.id)
+                          ? Colors.redAccent
+                          : _muted,
+                    ),
+                    tooltip: _likedSongs.containsKey(track.id) ? 'Unlike' : 'Like',
                   ),
                   IconButton(
                     onPressed: () =>
@@ -1985,6 +2157,24 @@ class _SonixHomeState extends State<SonixHome>
                             ),
                           ),
                           IconButton(
+                            onPressed: () => _toggleLike(track),
+                            icon: Icon(
+                              _likedSongs.containsKey(track.id)
+                                  ? PhosphorIconsFill.heart
+                                  : PhosphorIconsRegular.heart,
+                              color: _likedSongs.containsKey(track.id)
+                                  ? Colors.redAccent
+                                  : Colors.white,
+                              size: 22,
+                            ),
+                            tooltip: _likedSongs.containsKey(track.id) ? 'Unlike' : 'Like',
+                          ),
+                          IconButton(
+                            onPressed: () => _showSongOptions(track),
+                            icon: const Icon(PhosphorIconsRegular.dotsThreeVertical, size: 22),
+                            tooltip: 'Options',
+                          ),
+                          IconButton(
                             onPressed: () =>
                                 setState(() => _fullScreen = false),
                             icon: const Icon(PhosphorIconsRegular.caretDown),
@@ -2201,6 +2391,734 @@ class _SonixHomeState extends State<SonixHome>
 
   String _time(Duration value) =>
       '${value.inMinutes}:${(value.inSeconds % 60).toString().padLeft(2, '0')}';
+
+  /* -------------------------- LIKED SONGS & SETTINGS ----------------------- */
+
+  Future<void> _loadLikedSongs() async {
+    try {
+      final rawList = await UserStorage.getLikedSongsRaw();
+      final loaded = <String, Song>{};
+      for (final item in rawList) {
+        final song = Song.fromJson(item);
+        loaded[song.id] = song;
+      }
+      if (mounted) {
+        setState(() => _likedSongs = loaded);
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _toggleLike(Song song) async {
+    final currentlyLiked = _likedSongs.containsKey(song.id);
+    final updated = Map<String, Song>.from(_likedSongs);
+    if (currentlyLiked) {
+      updated.remove(song.id);
+    } else {
+      updated[song.id] = song;
+    }
+    setState(() => _likedSongs = updated);
+
+    final rawList = updated.values.map((s) => s.toJson()).toList();
+    await UserStorage.saveLikedSongsRaw(rawList);
+  }
+
+  void _openUserMenu() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
+      builder: (ctx) => SafeArea(
+        top: false,
+        child: Container(
+          padding: EdgeInsets.fromLTRB(20, 16, 20, 16 + MediaQuery.paddingOf(ctx).bottom),
+          decoration: const BoxDecoration(
+            color: Color(0xff16161b),
+            borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+            border: Border(top: BorderSide(color: Colors.white12)),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+            Container(
+              width: 40,
+              height: 4,
+              decoration: BoxDecoration(
+                color: Colors.white24,
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            const SizedBox(height: 18),
+            ListTile(
+              contentPadding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+              leading: Container(
+                width: 44,
+                height: 44,
+                decoration: BoxDecoration(
+                  gradient: const LinearGradient(
+                    colors: [Color(0xffff416c), Color(0xffff4b2b)],
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                  ),
+                  borderRadius: BorderRadius.circular(12),
+                  boxShadow: [
+                    BoxShadow(
+                      color: const Color(0xffff416c).withValues(alpha: .3),
+                      blurRadius: 10,
+                      offset: const Offset(0, 3),
+                    ),
+                  ],
+                ),
+                child: const Icon(PhosphorIconsFill.heart, color: Colors.white, size: 22),
+              ),
+              title: const Text(
+                'Liked Songs',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: Colors.white),
+              ),
+              subtitle: Text(
+                '${_likedSongs.length} ${_likedSongs.length == 1 ? 'track' : 'tracks'}',
+                style: const TextStyle(fontSize: 12, color: _muted),
+              ),
+              trailing: const Icon(PhosphorIconsRegular.caretRight, color: _muted, size: 20),
+              onTap: () {
+                Navigator.of(ctx).pop();
+                setState(() {
+                  _viewingLikedSongs = true;
+                  _openedPlaylist = null;
+                  _homeMode = false;
+                });
+              },
+            ),
+            ListTile(
+              contentPadding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+              leading: Container(
+                width: 44,
+                height: 44,
+                decoration: BoxDecoration(
+                  color: Colors.white.withValues(alpha: .08),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.white12),
+                ),
+                child: const Icon(PhosphorIconsRegular.gearSix, color: Colors.white, size: 22),
+              ),
+              title: const Text(
+                'Settings',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: Colors.white),
+              ),
+              subtitle: const Text(
+                'Audio quality & profile preferences',
+                style: TextStyle(fontSize: 12, color: _muted),
+              ),
+              trailing: const Icon(PhosphorIconsRegular.caretRight, color: _muted, size: 20),
+              onTap: () {
+                Navigator.of(ctx).pop();
+                _openSettings();
+              },
+            ),
+          ],
+        ),
+      ),
+    ),
+  );
+}
+
+  void _openSettings() {
+    final nameCtrl = TextEditingController(text: _userProfile?.name ?? '');
+    final ageCtrl = TextEditingController(text: _userProfile?.age != null ? '${_userProfile!.age}' : '');
+    String selectedQuality = _songQuality;
+
+    final qualityOptions = [
+      {
+        'value': '320kbps',
+        'label': 'Very High (320 kbps)',
+        'desc': 'Best sound quality, higher data usage',
+      },
+      {
+        'value': '160kbps',
+        'label': 'High (160 kbps)',
+        'desc': 'Great sound, balanced data usage',
+      },
+      {
+        'value': '96kbps',
+        'label': 'Medium (96 kbps)',
+        'desc': 'Good quality, data saver',
+      },
+      {
+        'value': '48kbps',
+        'label': 'Low (48 kbps)',
+        'desc': 'Minimal data, best for slow networks',
+      },
+    ];
+
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
+      builder: (ctx) => StatefulBuilder(
+        builder: (_, setModalState) => SafeArea(
+          top: false,
+          child: Padding(
+            padding: EdgeInsets.only(bottom: MediaQuery.of(ctx).viewInsets.bottom),
+            child: Container(
+              constraints: BoxConstraints(
+                maxHeight: MediaQuery.of(ctx).size.height * 0.85,
+              ),
+              padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+              decoration: const BoxDecoration(
+                color: Color(0xff16161b),
+                borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+                border: Border(top: BorderSide(color: Colors.white12)),
+              ),
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                  Center(
+                    child: Container(
+                      width: 40,
+                      height: 4,
+                      decoration: BoxDecoration(
+                        color: Colors.white24,
+                        borderRadius: BorderRadius.circular(2),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 18),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Text(
+                        'Settings',
+                        style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800, color: Colors.white),
+                      ),
+                      IconButton(
+                        icon: const Icon(PhosphorIconsRegular.x, size: 20, color: _muted),
+                        onPressed: () => Navigator.of(ctx).pop(),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+                  const Text(
+                    'Song Audio Quality',
+                    style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: _muted, letterSpacing: 0.5),
+                  ),
+                  const SizedBox(height: 10),
+                  ...qualityOptions.map((opt) {
+                    final isSelected = selectedQuality == opt['value'];
+                    return Container(
+                      margin: const EdgeInsets.only(bottom: 8),
+                      decoration: BoxDecoration(
+                        color: isSelected
+                            ? Colors.white.withValues(alpha: .1)
+                            : Colors.white.withValues(alpha: .04),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: isSelected ? Colors.white70 : Colors.white10,
+                          width: isSelected ? 1.2 : 1,
+                        ),
+                      ),
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(12),
+                        onTap: () async {
+                          setModalState(() => selectedQuality = opt['value']!);
+                          setState(() => _songQuality = opt['value']!);
+                          await UserStorage.saveSongQuality(opt['value']!);
+                        },
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                          child: Row(
+                            children: [
+                              Icon(
+                                isSelected
+                                    ? PhosphorIconsFill.checkCircle
+                                    : PhosphorIconsRegular.circle,
+                                color: isSelected ? Colors.white : _muted,
+                                size: 20,
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      opt['label']!,
+                                      style: TextStyle(
+                                        fontSize: 14,
+                                        fontWeight: isSelected ? FontWeight.w700 : FontWeight.w500,
+                                        color: Colors.white,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 2),
+                                    Text(
+                                      opt['desc']!,
+                                      style: const TextStyle(fontSize: 11, color: _muted),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    );
+                  }),
+                  const SizedBox(height: 20),
+                  const Divider(color: Colors.white12, height: 1),
+                  const SizedBox(height: 18),
+                  const Text(
+                    'Edit Profile',
+                    style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: _muted, letterSpacing: 0.5),
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: nameCtrl,
+                    style: const TextStyle(color: Colors.white, fontSize: 15),
+                    decoration: InputDecoration(
+                      labelText: 'Your Name',
+                      labelStyle: const TextStyle(color: _muted),
+                      prefixIcon: const Icon(PhosphorIconsRegular.user, color: _muted, size: 20),
+                      filled: true,
+                      fillColor: Colors.white.withValues(alpha: .06),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(14),
+                        borderSide: BorderSide.none,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  TextField(
+                    controller: ageCtrl,
+                    keyboardType: TextInputType.number,
+                    style: const TextStyle(color: Colors.white, fontSize: 15),
+                    decoration: InputDecoration(
+                      labelText: 'Your Age',
+                      labelStyle: const TextStyle(color: _muted),
+                      prefixIcon: const Icon(PhosphorIconsRegular.calendar, color: _muted, size: 20),
+                      filled: true,
+                      fillColor: Colors.white.withValues(alpha: .06),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(14),
+                        borderSide: BorderSide.none,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 22),
+                  SizedBox(
+                    width: double.infinity,
+                    height: 48,
+                    child: ElevatedButton(
+                      onPressed: () async {
+                        final name = nameCtrl.text.trim();
+                        final age = int.tryParse(ageCtrl.text.trim());
+                        if (name.isNotEmpty && age != null && age > 0) {
+                          final updated = UserProfile(name: name, age: age);
+                          await UserStorage.saveProfile(name: name, age: age);
+                          if (mounted) {
+                            setState(() => _userProfile = updated);
+                          }
+                          if (ctx.mounted) {
+                            Navigator.of(ctx).pop();
+                          }
+                          if (mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: const Text('Profile updated successfully'),
+                                behavior: SnackBarBehavior.floating,
+                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                                duration: const Duration(seconds: 2),
+                              ),
+                            );
+                          }
+                        }
+                      },
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.white,
+                        foregroundColor: Colors.black,
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                        elevation: 0,
+                      ),
+                      child: const Text(
+                        'Save Changes',
+                        style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
+                      ),
+                    ),
+                  ),
+                  SizedBox(height: math.max(MediaQuery.paddingOf(ctx).bottom, 24.0) + 16.0),
+                ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _showSongOptions(Song song, [List<Song>? contextQueue]) {
+    final isLiked = _likedSongs.containsKey(song.id);
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
+      builder: (ctx) => Container(
+        padding: const EdgeInsets.fromLTRB(20, 16, 20, 32),
+        decoration: const BoxDecoration(
+          color: Color(0xff16161b),
+          borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+          border: Border(top: BorderSide(color: Colors.white12)),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 40,
+              height: 4,
+              decoration: BoxDecoration(
+                color: Colors.white24,
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            const SizedBox(height: 18),
+            Row(
+              children: [
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(8),
+                  child: _art(song.artwork, width: 56, height: 56),
+                ),
+                const SizedBox(width: 14),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        song.title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: Colors.white),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        song.artist,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontSize: 13, color: _muted),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 20),
+            const Divider(color: Colors.white12, height: 1),
+            const SizedBox(height: 10),
+            ListTile(
+              contentPadding: const EdgeInsets.symmetric(horizontal: 4),
+              leading: Icon(
+                isLiked ? PhosphorIconsFill.heart : PhosphorIconsRegular.heart,
+                color: isLiked ? Colors.redAccent : Colors.white,
+                size: 24,
+              ),
+              title: Text(
+                isLiked ? 'Remove from Liked Songs' : 'Add to Liked Songs',
+                style: TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w600,
+                  color: isLiked ? Colors.redAccent : Colors.white,
+                ),
+              ),
+              onTap: () {
+                Navigator.of(ctx).pop();
+                _toggleLike(song);
+              },
+            ),
+            ListTile(
+              contentPadding: const EdgeInsets.symmetric(horizontal: 4),
+              leading: const Icon(
+                PhosphorIconsBold.play,
+                color: Colors.white,
+                size: 24,
+              ),
+              title: const Text(
+                'Play Song',
+                style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: Colors.white),
+              ),
+              onTap: () {
+                Navigator.of(ctx).pop();
+                if (contextQueue != null && _queue != contextQueue) {
+                  setState(() => _queue = [...contextQueue]);
+                }
+                _play(song);
+              },
+            ),
+            ListTile(
+              contentPadding: const EdgeInsets.symmetric(horizontal: 4),
+              leading: const Icon(
+                PhosphorIconsBold.downloadSimple,
+                color: Colors.white,
+                size: 24,
+              ),
+              title: const Text(
+                'Download',
+                style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: Colors.white),
+              ),
+              subtitle: Text(
+                'Get audio in $_songQuality',
+                style: const TextStyle(fontSize: 12, color: _muted),
+              ),
+              onTap: () {
+                Navigator.of(ctx).pop();
+                _download(song);
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /* ---------------------------- LIKED SONGS VIEW -------------------------- */
+
+  Widget _likedSongsHeader() => Container(
+    padding: const EdgeInsets.fromLTRB(10, 10, 16, 10),
+    decoration: const BoxDecoration(
+      color: Color(0xee080808),
+      border: Border(bottom: BorderSide(color: Color(0x18ffffff))),
+    ),
+    child: Row(
+      children: [
+        IconButton(
+          icon: const Icon(PhosphorIconsRegular.arrowLeft, size: 22),
+          onPressed: () => setState(() => _viewingLikedSongs = false),
+        ),
+        const SizedBox(width: 4),
+        const Expanded(
+          child: Text(
+            'Liked Songs',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+          ),
+        ),
+      ],
+    ),
+  );
+
+  Widget _likedSongsView() {
+    final songs = _likedSongs.values.toList();
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 16, 16, 120),
+      children: [
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Container(
+              width: 130,
+              height: 130,
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(12),
+                gradient: const LinearGradient(
+                  colors: [Color(0xffff416c), Color(0xffff4b2b)],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: const Color(0xffff416c).withValues(alpha: .35),
+                    blurRadius: 18,
+                    offset: const Offset(0, 6),
+                  ),
+                ],
+              ),
+              child: const Center(
+                child: Icon(
+                  PhosphorIconsFill.heart,
+                  color: Colors.white,
+                  size: 64,
+                ),
+              ),
+            ),
+            const SizedBox(width: 16),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Liked Songs',
+                    style: TextStyle(fontSize: 22, fontWeight: FontWeight.w800),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    _userProfile != null && _userProfile!.name.isNotEmpty
+                        ? 'Curated by ${_userProfile!.name}'
+                        : 'Your personal collection',
+                    style: const TextStyle(color: _muted, fontSize: 13),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    '${songs.length} ${songs.length == 1 ? 'song' : 'songs'}',
+                    style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Colors.white70),
+                  ),
+                  const SizedBox(height: 14),
+                  if (songs.isNotEmpty)
+                    Row(
+                      children: [
+                        ElevatedButton.icon(
+                          onPressed: () {
+                            setState(() => _queue = [...songs]);
+                            _play(songs.first);
+                          },
+                          icon: const Icon(PhosphorIconsBold.play, size: 16, color: Colors.black),
+                          label: const Text(
+                            'Play All',
+                            style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: Colors.black),
+                          ),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.white,
+                            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+                            elevation: 0,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        IconButton(
+                          onPressed: () {
+                            final shuffled = [...songs]..shuffle();
+                            setState(() => _queue = shuffled);
+                            _play(shuffled.first);
+                          },
+                          icon: const Icon(PhosphorIconsRegular.shuffle, size: 20, color: Colors.white),
+                          tooltip: 'Shuffle',
+                          style: IconButton.styleFrom(
+                            backgroundColor: Colors.white.withValues(alpha: .1),
+                            shape: const CircleBorder(),
+                          ),
+                        ),
+                      ],
+                    ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 24),
+        if (songs.isEmpty)
+          Container(
+            padding: const EdgeInsets.symmetric(vertical: 60),
+            child: Column(
+              children: [
+                Icon(
+                  PhosphorIconsRegular.heart,
+                  size: 56,
+                  color: Colors.white.withValues(alpha: .2),
+                ),
+                const SizedBox(height: 16),
+                const Text(
+                  'No Liked Songs Yet',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+                ),
+                const SizedBox(height: 8),
+                const Text(
+                  'Tap the heart icon on any song to save it here permanently.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: _muted, fontSize: 13),
+                ),
+              ],
+            ),
+          )
+        else ...[
+          const Text(
+            'Tracks',
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(height: 12),
+          ...songs.asMap().entries.map(
+            (entry) => _likedSongRow(entry.key, entry.value, songs),
+          ),
+        ],
+      ],
+    );
+  }
+
+  Widget _likedSongRow(int index, Song song, List<Song> likedList) {
+    final isCurrent = _current?.id == song.id;
+    final isLiked = _likedSongs.containsKey(song.id);
+    return InkWell(
+      onTap: () {
+        if (_queue != likedList) {
+          setState(() => _queue = [...likedList]);
+        }
+        _play(song);
+      },
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 7),
+        child: Row(
+          children: [
+            SizedBox(
+              width: 28,
+              child: Text(
+                isCurrent && _audio.playing ? '▶' : '${index + 1}',
+                style: TextStyle(
+                  color: isCurrent ? Colors.white : _muted,
+                  fontWeight: isCurrent ? FontWeight.bold : FontWeight.normal,
+                ),
+              ),
+            ),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(6),
+              child: _art(song.artwork, width: 48, height: 48),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    song.title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontWeight: FontWeight.w700,
+                      fontSize: 14,
+                      color: isCurrent ? Colors.white : Colors.white.withValues(alpha: .9),
+                    ),
+                  ),
+                  const SizedBox(height: 3),
+                  Text(
+                    song.artist,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(color: _muted, fontSize: 12, fontWeight: FontWeight.w500),
+                  ),
+                ],
+              ),
+            ),
+            if (song.duration > 0)
+              Padding(
+                padding: const EdgeInsets.only(right: 6),
+                child: Text(
+                  _time(Duration(seconds: song.duration)),
+                  style: const TextStyle(color: _muted, fontSize: 11),
+                ),
+              ),
+            IconButton(
+              onPressed: () => _toggleLike(song),
+              icon: Icon(
+                isLiked ? PhosphorIconsFill.heart : PhosphorIconsRegular.heart,
+                color: isLiked ? Colors.redAccent : _muted,
+                size: 20,
+              ),
+              tooltip: isLiked ? 'Unlike' : 'Like',
+            ),
+            IconButton(
+              onPressed: () => _showSongOptions(song, likedList),
+              icon: const Icon(PhosphorIconsRegular.dotsThreeVertical, size: 20),
+              tooltip: 'More options',
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 }
 
 /* --------------------------- AUTO-SCROLL LYRICS -------------------------- */

@@ -37,6 +37,7 @@ dependencies:
   palette_generator: ^0.3.3+6
   phosphor_icons: ^3.0.1
   url_launcher: ^6.3.2
+  shared_preferences: ^2.5.2
 
 dev_dependencies:
   flutter_test:
