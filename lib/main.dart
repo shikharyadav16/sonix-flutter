@@ -4,6 +4,8 @@ import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
+import 'package:google_fonts/google_fonts.dart';
 import 'package:http/http.dart' as http;
 import 'package:just_audio/just_audio.dart';
 import 'package:palette_generator/palette_generator.dart';
@@ -123,11 +125,11 @@ class Api {
         : null;
   }
 
-  static Future<List<Song>> suggestions(String id) async {
+  static Future<List<Song>> suggestions(String id, {int limit = 15}) async {
     final response = await http.get(
       Uri.parse(
         '$_apiRoot/api/songs/${Uri.encodeComponent(id)}/suggestions'
-        '?id=${Uri.encodeComponent(id)}&limit=5',
+        '?id=${Uri.encodeComponent(id)}&limit=$limit',
       ),
     );
     if (response.statusCode >= 400) return [];
@@ -269,7 +271,10 @@ class SonixApp extends StatelessWidget {
         seedColor: Colors.white,
         brightness: Brightness.dark,
       ),
-      fontFamily: 'Arial',
+      textTheme: GoogleFonts.interTextTheme(
+        ThemeData(brightness: Brightness.dark).textTheme,
+      ),
+      fontFamily: GoogleFonts.inter().fontFamily,
     ),
     home: const SonixHome(),
   );
@@ -286,14 +291,17 @@ class SonixHome extends StatefulWidget {
   State<SonixHome> createState() => _SonixHomeState();
 }
 
-class _SonixHomeState extends State<SonixHome> {
+class _SonixHomeState extends State<SonixHome>
+    with TickerProviderStateMixin {
   final _search = TextEditingController();
   final _audio = AudioPlayer();
+  late final AnimationController _gradientAnim;
 
   List<Song> _results = [];
   List<Song> _queue = [..._homeSongs];
   List<Song> _history = [];
   List<Song> _suggestions = [];
+  bool _isFetchingMoreSuggestions = false;
 
   Song? _current;
   bool _searching = false;
@@ -315,6 +323,10 @@ class _SonixHomeState extends State<SonixHome> {
   @override
   void initState() {
     super.initState();
+    _gradientAnim = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 14),
+    )..repeat(reverse: true);
     _search.addListener(_onSearchChanged);
     _playingSub = _audio.playingStream.listen((_) {
       if (mounted) setState(() {});
@@ -332,6 +344,7 @@ class _SonixHomeState extends State<SonixHome> {
 
   @override
   void dispose() {
+    _gradientAnim.dispose();
     _search.removeListener(_onSearchChanged);
     _playingSub?.cancel();
     _processingSub?.cancel();
@@ -450,20 +463,64 @@ class _SonixHomeState extends State<SonixHome> {
     }
   }
 
-  void _playNextSuggestion() {
+  void _playNextSuggestion() async {
     if (_isLoadingTrack || _current == null || _suggestions.isEmpty) return;
     final index = _suggestions.indexWhere(
       (song) => song.id == _current!.id,
     );
-    if (index < 0 || index + 1 >= _suggestions.length) return;
+    if (index < 0) return;
+
+    // If current song is the last in suggestions, fetch more first.
+    if (index + 1 >= _suggestions.length) {
+      await _fetchMoreSuggestionsIfNeeded();
+      // After fetching, check if there's a next song now.
+      if (index + 1 < _suggestions.length) {
+        unawaited(_play(_suggestions[index + 1]));
+      }
+      return;
+    }
     unawaited(_play(_suggestions[index + 1]));
+  }
+
+  /// When the current song is the last in the suggestions list,
+  /// fetch the next 15 recommendations based on it.
+  Future<void> _fetchMoreSuggestionsIfNeeded() async {
+    if (_isFetchingMoreSuggestions || _current == null || _suggestions.isEmpty) {
+      return;
+    }
+    final currentIndex = _suggestions.indexWhere(
+      (song) => song.id == _current!.id,
+    );
+    // Only fetch more when the current song is the last in the list.
+    if (currentIndex < 0 || currentIndex != _suggestions.length - 1) return;
+
+    _isFetchingMoreSuggestions = true;
+    try {
+      final newSuggestions = await Api.suggestions(_current!.id, limit: 15);
+      if (!mounted || newSuggestions.isEmpty) return;
+      // Filter out songs already in the list to avoid duplicates.
+      final existingIds = _suggestions.map((s) => s.id).toSet();
+      final unique = newSuggestions.where((s) => !existingIds.contains(s.id)).toList();
+      if (unique.isNotEmpty) {
+        setState(() => _suggestions = [..._suggestions, ...unique]);
+      }
+    } catch (_) {
+      // Silently ignore - the user can still use manual next.
+    } finally {
+      _isFetchingMoreSuggestions = false;
+    }
   }
 
   void _next() {
     final list = _suggestions.isNotEmpty ? _suggestions : _queue;
     if (list.isEmpty) return;
     final index = list.indexWhere((song) => song.id == _current?.id);
-    _play(list[(index + 1) % list.length]);
+    final nextIndex = (index + 1) % list.length;
+    _play(list[nextIndex]);
+    // If we're nearing the end of suggestions, prefetch more.
+    if (_suggestions.isNotEmpty && index >= _suggestions.length - 2) {
+      unawaited(_fetchMoreSuggestionsIfNeeded());
+    }
   }
 
   void _previous() {
@@ -536,8 +593,8 @@ class _SonixHomeState extends State<SonixHome> {
   Color _toneArtworkColor(Color color) {
     final hsl = HSLColor.fromColor(color);
     return hsl
-        .withSaturation((hsl.saturation * .8).clamp(.2, .8))
-        .withLightness(hsl.lightness.clamp(.16, .52))
+        .withSaturation((hsl.saturation * 1.1).clamp(.35, .95))
+        .withLightness(hsl.lightness.clamp(.28, .62))
         .toColor();
   }
 
@@ -552,74 +609,89 @@ class _SonixHomeState extends State<SonixHome> {
     final primary = colors[0];
     final secondary = colors.length > 1 ? colors[1] : primary;
     final tertiary = colors.length > 2 ? colors[2] : secondary;
-    final opacity = strong ? 1.0 : .68;
-    final blur = strong ? 92.0 : 58.0;
+    final opacity = strong ? 1.0 : .82;
+    final blur = strong ? 100.0 : 64.0;
 
     return Positioned.fill(
       child: IgnorePointer(
-        child: ImageFiltered(
-          imageFilter: ui.ImageFilter.blur(sigmaX: blur, sigmaY: blur),
-          child: Stack(
-            children: [
-              Positioned(
-                left: strong ? -110 : -80,
-                top: strong ? -150 : -90,
-                width: strong ? 480 : 280,
-                height: strong ? 480 : 280,
-                child: AnimatedContainer(
-                  duration: const Duration(milliseconds: 850),
-                  curve: Curves.easeInOut,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    gradient: RadialGradient(
-                      colors: [
-                        primary.withValues(alpha: opacity),
-                        Colors.transparent,
-                      ],
+        child: AnimatedBuilder(
+          animation: _gradientAnim,
+          builder: (context, child) {
+            final ease = Curves.easeInOutCubic.transform(_gradientAnim.value);
+            final breath = math.sin(ease * math.pi);
+            final shift = ease * 2.0 - 1.0;
+            final dx1 = shift * (strong ? 28.0 : 15.0);
+            final dy1 = breath * (strong ? 22.0 : 12.0);
+            final dx2 = -breath * (strong ? 26.0 : 14.0);
+            final dy2 = shift * (strong ? 24.0 : 13.0);
+            final dx3 = shift * (strong ? 22.0 : 12.0);
+            final dy3 = -breath * (strong ? 25.0 : 13.0);
+
+            return ImageFiltered(
+              imageFilter: ui.ImageFilter.blur(sigmaX: blur, sigmaY: blur),
+              child: Stack(
+                children: [
+                  Positioned(
+                    left: (strong ? -110.0 : -80.0) + dx1,
+                    top: (strong ? -150.0 : -90.0) + dy1,
+                    width: strong ? 500.0 : 300.0,
+                    height: strong ? 500.0 : 300.0,
+                    child: Container(
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        gradient: RadialGradient(
+                          colors: [
+                            primary.withValues(alpha: opacity),
+                            primary.withValues(alpha: opacity * .3),
+                            Colors.transparent,
+                          ],
+                          stops: const [0.0, 0.5, 1.0],
+                        ),
+                      ),
                     ),
                   ),
-                ),
-              ),
-              Positioned(
-                right: strong ? -130 : -80,
-                top: strong ? 20 : -35,
-                width: strong ? 460 : 260,
-                height: strong ? 460 : 260,
-                child: AnimatedContainer(
-                  duration: const Duration(milliseconds: 950),
-                  curve: Curves.easeInOut,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    gradient: RadialGradient(
-                      colors: [
-                        secondary.withValues(alpha: opacity * .72),
-                        Colors.transparent,
-                      ],
+                  Positioned(
+                    right: (strong ? -130.0 : -80.0) + dx2,
+                    top: (strong ? 20.0 : -35.0) + dy2,
+                    width: strong ? 480.0 : 280.0,
+                    height: strong ? 480.0 : 280.0,
+                    child: Container(
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        gradient: RadialGradient(
+                          colors: [
+                            secondary.withValues(alpha: opacity * .85),
+                            secondary.withValues(alpha: opacity * .25),
+                            Colors.transparent,
+                          ],
+                          stops: const [0.0, 0.45, 1.0],
+                        ),
+                      ),
                     ),
                   ),
-                ),
-              ),
-              Positioned(
-                left: strong ? 40 : 20,
-                bottom: strong ? -230 : -90,
-                width: strong ? 620 : 330,
-                height: strong ? 420 : 240,
-                child: AnimatedContainer(
-                  duration: const Duration(milliseconds: 1050),
-                  curve: Curves.easeInOut,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    gradient: RadialGradient(
-                      colors: [
-                        tertiary.withValues(alpha: opacity * .62),
-                        Colors.transparent,
-                      ],
+                  Positioned(
+                    left: (strong ? 40.0 : 20.0) + dx3,
+                    bottom: (strong ? -230.0 : -90.0) + dy3,
+                    width: strong ? 640.0 : 350.0,
+                    height: strong ? 440.0 : 260.0,
+                    child: Container(
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        gradient: RadialGradient(
+                          colors: [
+                            tertiary.withValues(alpha: opacity * .78),
+                            tertiary.withValues(alpha: opacity * .2),
+                            Colors.transparent,
+                          ],
+                          stops: const [0.0, 0.5, 1.0],
+                        ),
+                      ),
                     ),
                   ),
-                ),
+                ],
               ),
-            ],
-          ),
+            );
+          },
         ),
       ),
     );
@@ -683,7 +755,8 @@ class _SonixHomeState extends State<SonixHome> {
       color: Color(0xee080808),
       border: Border(bottom: BorderSide(color: Color(0x18ffffff))),
     ),
-    child: Row(
+    child: Column(
+      mainAxisSize: MainAxisSize.min,
       children: [
         GestureDetector(
           onTap: () {
@@ -702,12 +775,16 @@ class _SonixHomeState extends State<SonixHome> {
                 child: const Icon(PhosphorIconsRegular.musicNote),
               ),
               const SizedBox(width: 10),
-              const Column(
+              Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
                     'Sonix',
-                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+                    style: TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.w800,
+                      fontFamily: GoogleFonts.inter().fontFamily,
+                    ),
                   ),
                   Text(
                     'SONG PLAYER',
@@ -715,6 +792,8 @@ class _SonixHomeState extends State<SonixHome> {
                       fontSize: 9,
                       color: _muted,
                       letterSpacing: 1.2,
+                      fontWeight: FontWeight.w600,
+                      fontFamily: GoogleFonts.inter().fontFamily,
                     ),
                   ),
                 ],
@@ -722,37 +801,35 @@ class _SonixHomeState extends State<SonixHome> {
             ],
           ),
         ),
-        const SizedBox(width: 16),
-        Expanded(
-          child: TextField(
-            controller: _search,
-            textInputAction: TextInputAction.search,
-            onSubmitted: _runSearch,
-            style: const TextStyle(fontSize: 13),
-            decoration: InputDecoration(
-              hintText: 'Search songs...',
-              hintStyle: const TextStyle(color: _muted),
-              prefixIcon: const Icon(
-                PhosphorIconsRegular.magnifyingGlass,
-                size: 19,
-              ),
-              suffixIcon: _search.text.isEmpty
-                  ? null
-                  : IconButton(
-                      icon: const Icon(PhosphorIconsRegular.x, size: 17),
-                      onPressed: () {
-                        _search.clear();
-                        setState(() => _homeMode = true);
-                      },
-                    ),
-              filled: true,
-              fillColor: Colors.white.withValues(alpha: .06),
-              border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(30),
-                borderSide: BorderSide.none,
-              ),
-              contentPadding: const EdgeInsets.symmetric(vertical: 12),
+        const SizedBox(height: 12),
+        TextField(
+          controller: _search,
+          textInputAction: TextInputAction.search,
+          onSubmitted: _runSearch,
+          style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+          decoration: InputDecoration(
+            hintText: 'Search songs, artists, albums...',
+            hintStyle: const TextStyle(color: _muted, fontWeight: FontWeight.w400),
+            prefixIcon: const Icon(
+              PhosphorIconsRegular.magnifyingGlass,
+              size: 19,
             ),
+            suffixIcon: _search.text.isEmpty
+                ? null
+                : IconButton(
+                    icon: const Icon(PhosphorIconsRegular.x, size: 17),
+                    onPressed: () {
+                      _search.clear();
+                      setState(() => _homeMode = true);
+                    },
+                  ),
+            filled: true,
+            fillColor: Colors.white.withValues(alpha: .06),
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(30),
+              borderSide: BorderSide.none,
+            ),
+            contentPadding: const EdgeInsets.symmetric(vertical: 12),
           ),
         ),
       ],
@@ -836,7 +913,7 @@ class _SonixHomeState extends State<SonixHome> {
             padding: const EdgeInsets.only(bottom: 12),
             child: Text(
               title,
-              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w700),
+              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
             ),
           ),
           if (horizontal)
@@ -895,6 +972,7 @@ class _SonixHomeState extends State<SonixHome> {
               style: const TextStyle(
                 color: _muted,
                 fontSize: 10,
+                fontWeight: FontWeight.w600,
                 letterSpacing: .7,
               ),
             ),
@@ -903,7 +981,7 @@ class _SonixHomeState extends State<SonixHome> {
               song.title,
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
-              style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
+              style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w700),
             ),
           ],
         ),
@@ -934,14 +1012,14 @@ class _SonixHomeState extends State<SonixHome> {
                     song.artist,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(color: _muted, fontSize: 11),
+                    style: const TextStyle(color: _muted, fontSize: 11, fontWeight: FontWeight.w500),
                   ),
                   const SizedBox(height: 4),
                   Text(
                     song.title,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(fontWeight: FontWeight.w600),
+                    style: const TextStyle(fontWeight: FontWeight.w700),
                   ),
                 ],
               ),
@@ -1006,7 +1084,7 @@ class _SonixHomeState extends State<SonixHome> {
       children: [
         const Text(
           'Songs',
-          style: TextStyle(fontSize: 21, fontWeight: FontWeight.w700),
+          style: TextStyle(fontSize: 21, fontWeight: FontWeight.w800),
         ),
         const SizedBox(height: 12),
         ..._results.asMap().entries.map(
@@ -1041,14 +1119,14 @@ class _SonixHomeState extends State<SonixHome> {
                     song.title,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(fontWeight: FontWeight.w600),
+                    style: const TextStyle(fontWeight: FontWeight.w700),
                   ),
                   const SizedBox(height: 4),
                   Text(
                     song.artist,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(color: _muted, fontSize: 12),
+                    style: const TextStyle(color: _muted, fontSize: 12, fontWeight: FontWeight.w500),
                   ),
                 ],
               ),
@@ -1071,129 +1149,109 @@ class _SonixHomeState extends State<SonixHome> {
 
   Widget _playerBar() {
     final track = _current!;
-    return FutureBuilder<List<Color>>(
-      future: _paletteFor(track),
-      builder: (context, paletteSnapshot) {
-        final colors = _paletteOrDefault(paletteSnapshot);
-        return Container(
-          decoration: const BoxDecoration(
-            color: _ink,
-            border: Border(top: BorderSide(color: Color(0x30ffffff))),
-          ),
-          child: GestureDetector(
-            behavior: HitTestBehavior.opaque,
-            onTap: _openFullScreen,
-            child: Stack(
-              children: [
-                _ambientLayer(colors, strong: false),
-                Container(color: Colors.black.withValues(alpha: .06)),
-                Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    _progressBar(minHeight: 2),
-                    Padding(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 12,
-                        vertical: 9,
-                      ),
-                      child: Row(
+    return Container(
+      decoration: const BoxDecoration(
+        color: _surface,
+        border: Border(top: BorderSide(color: Color(0x22ffffff))),
+      ),
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: _openFullScreen,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            _progressBar(minHeight: 2),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Row(
                       children: [
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(6),
+                          child: _art(track.artwork, width: 44, height: 44),
+                        ),
+                        const SizedBox(width: 9),
                         Expanded(
-                          child: Row(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
-                              ClipRRect(
-                                borderRadius: BorderRadius.circular(6),
-                                child: _art(
-                                  track.artwork,
-                                  width: 44,
-                                  height: 44,
+                              Text(
+                                track.title,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.w700,
+                                  fontSize: 13,
                                 ),
                               ),
-                              const SizedBox(width: 9),
-                              Expanded(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(
-                                      track.title,
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: const TextStyle(
-                                        fontWeight: FontWeight.w600,
-                                        fontSize: 12,
-                                      ),
-                                    ),
-                                    Text(
-                                      track.artist,
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: const TextStyle(
-                                        color: _muted,
-                                        fontSize: 10,
-                                      ),
-                                    ),
-                                  ],
+                              Text(
+                                track.artist,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  color: _muted,
+                                  fontWeight: FontWeight.w500,
+                                  fontSize: 11,
                                 ),
                               ),
                             ],
                           ),
                         ),
-                        IconButton(
-                          onPressed: () =>
-                              setState(() => _lyricsOpen = !_lyricsOpen),
-                          icon: Icon(
-                            PhosphorIconsRegular.textAa,
-                            size: 20,
-                            color: _lyricsOpen ? Colors.white : _muted,
-                          ),
-                          tooltip: 'Lyrics',
-                        ),
-                        IconButton(
-                          onPressed: _previous,
-                          icon: const Icon(
-                            PhosphorIconsRegular.skipBack,
-                            size: 20,
-                          ),
-                        ),
-                        StreamBuilder<bool>(
-                          stream: _audio.playingStream,
-                          builder: (_, snapshot) => IconButton(
-                            onPressed: _isLoadingTrack
-                                ? null
-                                : _togglePlayPause,
-                            icon: _isLoadingTrack
-                                ? const SizedBox(
-                                    width: 24,
-                                    height: 24,
-                                    child: CircularProgressIndicator(
-                                      strokeWidth: 2.4,
-                                    ),
-                                  )
-                                : Icon(
-                                    snapshot.data == true
-                                        ? PhosphorIconsRegular.pauseCircle
-                                        : PhosphorIconsRegular.playCircle,
-                                    size: 34,
-                                  ),
-                          ),
-                        ),
-                        IconButton(
-                          onPressed: _next,
-                          icon: const Icon(
-                            PhosphorIconsRegular.skipForward,
-                            size: 20,
-                          ),
-                        ),
-                        ],
-                      ),
+                      ],
                     ),
-                  ],
-                ),
-              ],
+                  ),
+                  IconButton(
+                    onPressed: () =>
+                        setState(() => _lyricsOpen = !_lyricsOpen),
+                    icon: Icon(
+                      PhosphorIconsRegular.textAa,
+                      size: 20,
+                      color: _lyricsOpen ? Colors.white : _muted,
+                    ),
+                    tooltip: 'Lyrics',
+                  ),
+                  IconButton(
+                    onPressed: _previous,
+                    icon: const Icon(
+                      PhosphorIconsRegular.skipBack,
+                      size: 20,
+                    ),
+                  ),
+                  StreamBuilder<bool>(
+                    stream: _audio.playingStream,
+                    builder: (_, snapshot) => IconButton(
+                      onPressed: _isLoadingTrack ? null : _togglePlayPause,
+                      icon: _isLoadingTrack
+                          ? const SizedBox(
+                              width: 24,
+                              height: 24,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2.4,
+                              ),
+                            )
+                          : Icon(
+                              snapshot.data == true
+                                  ? PhosphorIconsRegular.pauseCircle
+                                  : PhosphorIconsRegular.playCircle,
+                              size: 34,
+                            ),
+                    ),
+                  ),
+                  IconButton(
+                    onPressed: _next,
+                    icon: const Icon(
+                      PhosphorIconsRegular.skipForward,
+                      size: 20,
+                    ),
+                  ),
+                ],
+              ),
             ),
-          ),
-        );
-      },
+          ],
+        ),
+      ),
     );
   }
 
@@ -1227,84 +1285,48 @@ class _SonixHomeState extends State<SonixHome> {
     initialChildSize: .78,
     maxChildSize: .94,
     minChildSize: .45,
-    builder: (_, controller) => Container(
+    builder: (context, controller) => Container(
       decoration: const BoxDecoration(
         color: Color(0xff18181d),
         borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
       ),
-      child: Column(
-        children: [
-          const SizedBox(height: 10),
-          Container(
-            width: 42,
-            height: 4,
-            decoration: BoxDecoration(
-              color: Colors.white24,
-              borderRadius: BorderRadius.circular(2),
+      child: SafeArea(
+        top: false,
+        child: Column(
+          children: [
+            const SizedBox(height: 10),
+            Container(
+              width: 42,
+              height: 4,
+              decoration: BoxDecoration(
+                color: Colors.white24,
+                borderRadius: BorderRadius.circular(2),
+              ),
             ),
-          ),
-          ListTile(
-            title: const Text(
-              'Lyrics',
-              style: TextStyle(fontWeight: FontWeight.bold),
+            ListTile(
+              title: const Text(
+                'Lyrics',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+              trailing: IconButton(
+                onPressed: () => setState(() => _lyricsOpen = false),
+                icon: const Icon(PhosphorIconsRegular.x),
+              ),
             ),
-            trailing: IconButton(
-              onPressed: () => setState(() => _lyricsOpen = false),
-              icon: const Icon(PhosphorIconsRegular.x),
-            ),
-          ),
-          Expanded(child: _lyricsBody(controller)),
-        ],
+            Expanded(child: _lyricsBody(controller)),
+          ],
+        ),
       ),
     ),
   );
 
   Widget _lyricsBody([ScrollController? controller]) {
-    if (_lyrics == null) {
-      return const Center(child: CircularProgressIndicator());
-    }
-
-    final plain = _lyrics!['plainLyrics'] as String?;
-
-    if (_parsedLyrics.isEmpty) {
-      return SingleChildScrollView(
-        controller: controller,
-        padding: const EdgeInsets.all(22),
-        child: Text(
-          plain ?? 'No lyrics found for this track.',
-          style: const TextStyle(fontSize: 18, height: 1.7, color: _muted),
-        ),
-      );
-    }
-
-    return StreamBuilder<Duration>(
-      stream: _audio.positionStream,
-      builder: (_, snapshot) {
-        final time = snapshot.data?.inMilliseconds ?? 0;
-        var active = -1;
-        for (var i = 0; i < _parsedLyrics.length; i++) {
-          if (time >= _parsedLyrics[i].time * 1000) active = i;
-        }
-        return ListView.builder(
-          controller: controller,
-          padding: const EdgeInsets.symmetric(vertical: 30, horizontal: 22),
-          itemCount: _parsedLyrics.length,
-          itemBuilder: (_, i) => InkWell(
-            onTap: () => _seek(_parsedLyrics[i].time),
-            child: Padding(
-              padding: const EdgeInsets.symmetric(vertical: 8),
-              child: Text(
-                _parsedLyrics[i].text,
-                style: TextStyle(
-                  fontSize: i == active ? 23 : 18,
-                  fontWeight: i == active ? FontWeight.w700 : FontWeight.w400,
-                  color: i == active ? Colors.white : const Color(0xff66666d),
-                ),
-              ),
-            ),
-          ),
-        );
-      },
+    return _LyricsAutoScrollView(
+      lyrics: _lyrics,
+      parsedLyrics: _parsedLyrics,
+      positionStream: _audio.positionStream,
+      onSeek: _seek,
+      controller: controller,
     );
   }
 
@@ -1317,37 +1339,99 @@ class _SonixHomeState extends State<SonixHome> {
       builder: (context, paletteSnapshot) {
         final colors = _paletteOrDefault(paletteSnapshot);
         final artworkColor = colors.first;
+        final secondaryColor = colors.length > 1 ? colors[1] : artworkColor;
+        final tertiaryColor = colors.length > 2 ? colors[2] : secondaryColor;
         return Material(
           color: _ink,
           child: Stack(
             children: [
               Container(color: const ui.Color(0xff080808)),
-              ImageFiltered(
-                imageFilter: ui.ImageFilter.blur(sigmaX: 90, sigmaY: 90),
-                child: Container(
-                  decoration: BoxDecoration(
-                    gradient: RadialGradient(
-                      center: const Alignment(0, -0.25),
-                      radius: 1.25,
-                      colors: [
-                        artworkColor.withValues(alpha: 0.85),
-                        artworkColor.withValues(alpha: 0.42),
-                        const ui.Color(0xff080808),
+              // Animated multi-blob gradient background.
+              AnimatedBuilder(
+                animation: _gradientAnim,
+                builder: (context, child) {
+                  final ease = Curves.easeInOutCubic.transform(_gradientAnim.value);
+                  final breath = math.sin(ease * math.pi);
+                  final shift = ease * 2.0 - 1.0;
+                  return ImageFiltered(
+                    imageFilter: ui.ImageFilter.blur(sigmaX: 100, sigmaY: 100),
+                    child: Stack(
+                      children: [
+                        // Primary orb — top area (anchored behind album artwork & title).
+                        Positioned.fill(
+                          child: Container(
+                            decoration: BoxDecoration(
+                              gradient: RadialGradient(
+                                center: Alignment(
+                                  -0.05 + shift * 0.08,
+                                  -0.42 + breath * 0.07,
+                                ),
+                                radius: 1.05 + breath * 0.18,
+                                colors: [
+                                  artworkColor.withValues(alpha: 0.6),
+                                  artworkColor.withValues(alpha: 0.6),
+                                  Colors.transparent,
+                                ],
+                                stops: const [0.0, 0.42, 1.0],
+                              ),
+                            ),
+                          ),
+                        ),
+                        // Secondary orb — right side (anchored mid-right).
+                        Positioned.fill(
+                          child: Container(
+                            decoration: BoxDecoration(
+                              gradient: RadialGradient(
+                                center: Alignment(
+                                  0.50 - breath * 0.09,
+                                  0.05 + shift * 0.10,
+                                ),
+                                radius: 0.92 + (1.0 - breath) * 0.16,
+                                colors: [
+                                  secondaryColor.withValues(alpha: 0.92),
+                                  secondaryColor.withValues(alpha: 0.45),
+                                  Colors.transparent,
+                                ],
+                                stops: const [0.0, 0.38, 1.0],
+                              ),
+                            ),
+                          ),
+                        ),
+                        // Tertiary orb — bottom (anchored around playback controls).
+                        Positioned.fill(
+                          child: Container(
+                            decoration: BoxDecoration(
+                              gradient: RadialGradient(
+                                center: Alignment(
+                                  -0.32 + shift * 0.08,
+                                  0.62 - breath * 0.08,
+                                ),
+                                radius: 0.98 + breath * 0.16,
+                                colors: [
+                                  tertiaryColor.withValues(alpha: 0.28),
+                                  tertiaryColor.withValues(alpha: 0.38),
+                                  Colors.transparent,
+                                ],
+                                stops: const [0.0, 0.4, 1.0],
+                              ),
+                            ),
+                          ),
+                        ),
                       ],
-                      stops: const [0.0, 0.48, 1.0],
                     ),
-                  ),
-                ),
+                  );
+                },
               ),
+              // Subtle darkening overlay for readability.
               Container(
                 decoration: const BoxDecoration(
                   gradient: LinearGradient(
                     begin: Alignment.topCenter,
                     end: Alignment.bottomCenter,
                     colors: [
+                      ui.Color(0x10000000),
                       ui.Color(0x30000000),
-                      ui.Color(0x66000000),
-                      ui.Color(0xcc000000),
+                      ui.Color(0x70000000),
                     ],
                     stops: [0.0, 0.55, 1.0],
                   ),
@@ -1586,3 +1670,262 @@ class _SonixHomeState extends State<SonixHome> {
   String _time(Duration value) =>
       '${value.inMinutes}:${(value.inSeconds % 60).toString().padLeft(2, '0')}';
 }
+
+/* --------------------------- AUTO-SCROLL LYRICS -------------------------- */
+
+class _LyricsAutoScrollView extends StatefulWidget {
+  const _LyricsAutoScrollView({
+    required this.lyrics,
+    required this.parsedLyrics,
+    required this.positionStream,
+    required this.onSeek,
+    this.controller,
+  });
+
+  final Map<String, dynamic>? lyrics;
+  final List<LyricLine> parsedLyrics;
+  final Stream<Duration> positionStream;
+  final ValueChanged<double> onSeek;
+  final ScrollController? controller;
+
+  @override
+  State<_LyricsAutoScrollView> createState() => _LyricsAutoScrollViewState();
+}
+
+class _LyricsAutoScrollViewState extends State<_LyricsAutoScrollView> {
+  late final ScrollController _internalController;
+  final Map<int, GlobalKey> _itemKeys = {};
+  int _lastActiveIndex = -1;
+  bool _userInteracting = false;
+  Timer? _userResumeTimer;
+
+  ScrollController get _effectiveController =>
+      widget.controller ?? _internalController;
+
+  @override
+  void initState() {
+    super.initState();
+    _internalController = ScrollController();
+  }
+
+  @override
+  void didUpdateWidget(covariant _LyricsAutoScrollView oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.parsedLyrics != oldWidget.parsedLyrics) {
+      _itemKeys.clear();
+      _lastActiveIndex = -1;
+      _userInteracting = false;
+      _userResumeTimer?.cancel();
+    }
+  }
+
+  @override
+  void dispose() {
+    _userResumeTimer?.cancel();
+    _internalController.dispose();
+    super.dispose();
+  }
+
+  GlobalKey _keyForIndex(int index) =>
+      _itemKeys.putIfAbsent(index, () => GlobalKey());
+
+  void _scrollToIndex(int index) {
+    if (index < 0 || index >= widget.parsedLyrics.length) return;
+    final targetContext = _itemKeys[index]?.currentContext;
+    if (targetContext != null) {
+      Scrollable.ensureVisible(
+        targetContext,
+        alignment: 0.35,
+        duration: const Duration(milliseconds: 380),
+        curve: Curves.easeOutCubic,
+      );
+    } else if (_effectiveController.hasClients) {
+      final maxScroll = _effectiveController.position.maxScrollExtent;
+      final estimatedOffset = (index * 56.0).clamp(0.0, maxScroll);
+      _effectiveController
+          .animateTo(
+            estimatedOffset,
+            duration: const Duration(milliseconds: 300),
+            curve: Curves.easeOutCubic,
+          )
+          .then((_) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          final ctx = _itemKeys[index]?.currentContext;
+          if (ctx != null && mounted) {
+            Scrollable.ensureVisible(
+              ctx,
+              alignment: 0.35,
+              duration: const Duration(milliseconds: 220),
+              curve: Curves.easeOutCubic,
+            );
+          }
+        });
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (widget.lyrics == null) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    final plain = widget.lyrics!['plainLyrics'] as String?;
+
+    if (widget.parsedLyrics.isEmpty) {
+      return SingleChildScrollView(
+        controller: _effectiveController,
+        padding: const EdgeInsets.all(24),
+        child: Text(
+          plain ?? 'No lyrics found for this track.',
+          style: const TextStyle(fontSize: 18, height: 1.7, color: _muted),
+        ),
+      );
+    }
+
+    return StreamBuilder<Duration>(
+      stream: widget.positionStream,
+      builder: (context, snapshot) {
+        final time = snapshot.data?.inMilliseconds ?? 0;
+        var active = -1;
+        for (var i = 0; i < widget.parsedLyrics.length; i++) {
+          if (time >= widget.parsedLyrics[i].time * 1000) {
+            active = i;
+          }
+        }
+
+        if (active != _lastActiveIndex) {
+          _lastActiveIndex = active;
+          if (!_userInteracting && active >= 0) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (mounted) _scrollToIndex(active);
+            });
+          }
+        }
+
+        return Stack(
+          children: [
+            NotificationListener<ScrollNotification>(
+              onNotification: (notification) {
+                if (notification is UserScrollNotification) {
+                  if (notification.direction != ScrollDirection.idle) {
+                    _userResumeTimer?.cancel();
+                    if (!_userInteracting) {
+                      setState(() => _userInteracting = true);
+                    }
+                  } else {
+                    _userResumeTimer?.cancel();
+                    _userResumeTimer = Timer(
+                      const Duration(milliseconds: 3500),
+                      () {
+                        if (mounted) {
+                          setState(() => _userInteracting = false);
+                          if (_lastActiveIndex >= 0) {
+                            _scrollToIndex(_lastActiveIndex);
+                          }
+                        }
+                      },
+                    );
+                  }
+                }
+                return false;
+              },
+              child: ListView.builder(
+                controller: _effectiveController,
+                padding: const EdgeInsets.fromLTRB(22, 100, 22, 220),
+                itemCount: widget.parsedLyrics.length,
+                itemBuilder: (context, i) {
+                  final isCurrent = i == active;
+                  return InkWell(
+                    key: _keyForIndex(i),
+                    borderRadius: BorderRadius.circular(12),
+                    onTap: () {
+                      widget.onSeek(widget.parsedLyrics[i].time);
+                      _userResumeTimer?.cancel();
+                      setState(() => _userInteracting = false);
+                      _scrollToIndex(i);
+                    },
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        vertical: 10,
+                        horizontal: 8,
+                      ),
+                      child: AnimatedDefaultTextStyle(
+                        duration: const Duration(milliseconds: 250),
+                        curve: Curves.easeOut,
+                        style: TextStyle(
+                          fontSize: isCurrent ? 24 : 18,
+                          fontWeight:
+                              isCurrent ? FontWeight.w700 : FontWeight.w500,
+                          color: isCurrent
+                              ? Colors.white
+                              : const Color(0x66ffffff),
+                          height: 1.45,
+                        ),
+                        child: Text(widget.parsedLyrics[i].text),
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+            // Floating "Sync lyrics" pill when user scrolled away
+            if (_userInteracting && active >= 0)
+              Positioned(
+                bottom: 24.0 + math.max(MediaQuery.paddingOf(context).bottom, 14.0),
+                left: 0,
+                right: 0,
+                child: Center(
+                  child: GestureDetector(
+                    onTap: () {
+                      _userResumeTimer?.cancel();
+                      setState(() => _userInteracting = false);
+                      _scrollToIndex(active);
+                    },
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 8,
+                      ),
+                      decoration: BoxDecoration(
+                        color: const Color(0xdd222228),
+                        borderRadius: BorderRadius.circular(24),
+                        border: Border.all(color: Colors.white24),
+                        boxShadow: const [
+                          BoxShadow(
+                            color: Colors.black45,
+                            blurRadius: 10,
+                            offset: Offset(0, 4),
+                          ),
+                        ],
+                      ),
+                      child: const Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            PhosphorIconsRegular.arrowsClockwise,
+                            size: 16,
+                            color: Colors.white,
+                          ),
+                          SizedBox(width: 8),
+                          Text(
+                            'Sync lyrics',
+                            style: TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.w600,
+                              color: Colors.white,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        );
+      },
+    );
+  }
+}
+
