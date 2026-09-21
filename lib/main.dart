@@ -454,7 +454,6 @@ class _SonixHomeState extends State<SonixHome>
   List<Playlist> _playlistResults = [];
   List<Song> _queue = [..._homeSongs];
   List<Song> _history = [];
-  List<Song> _suggestions = [];
   bool _isFetchingMoreSuggestions = false;
 
   Playlist? _openedPlaylist;
@@ -490,7 +489,7 @@ class _SonixHomeState extends State<SonixHome>
     });
     _processingSub = _audio.processingStateStream.listen((state) {
       if (state == ProcessingState.completed && mounted) {
-        _playNextSuggestion();
+        _playNext();
       }
     });
   }
@@ -596,7 +595,6 @@ class _SonixHomeState extends State<SonixHome>
       _lyrics = null;
       _parsedLyrics = [];
       _lyricsOpen = false;
-      _suggestions = [];
       _history = [
         song,
         ..._history.where((item) => item.id != song.id),
@@ -630,9 +628,11 @@ class _SonixHomeState extends State<SonixHome>
         setState(() => _isLoadingTrack = false);
       }
 
-      final suggestion = await Api.suggestions(resolved.id);
-      if (!mounted || request != _playRequest) return;
-      setState(() => _suggestions = [resolved, ...suggestion]);
+      // Only fetch suggestions if this song is the last song of the queue
+      final currentIndex = _queue.indexWhere((s) => s.id == resolved.id);
+      if (currentIndex >= 0 && currentIndex == _queue.length - 1) {
+        unawaited(_fetchMoreSuggestionsForQueue(resolved.id));
+      }
 
       final lyricData = await Api.lyrics(resolved);
       if (!mounted || request != _playRequest) return;
@@ -650,64 +650,57 @@ class _SonixHomeState extends State<SonixHome>
     }
   }
 
-  void _playNextSuggestion() async {
-    if (_isLoadingTrack || _current == null || _suggestions.isEmpty) return;
-    final index = _suggestions.indexWhere(
+  void _playNext() async {
+    if (_isLoadingTrack || _current == null || _queue.isEmpty) return;
+    final index = _queue.indexWhere(
       (song) => song.id == _current!.id,
     );
     if (index < 0) return;
 
-    // If current song is the last in suggestions, fetch more first.
-    if (index + 1 >= _suggestions.length) {
-      await _fetchMoreSuggestionsIfNeeded();
+    // If current song is the last in the queue, fetch more first.
+    if (index + 1 >= _queue.length) {
+      await _fetchMoreSuggestionsForQueue(_current!.id);
+      if (!mounted) return;
       // After fetching, check if there's a next song now.
-      if (index + 1 < _suggestions.length) {
-        unawaited(_play(_suggestions[index + 1]));
+      if (index + 1 < _queue.length) {
+        unawaited(_play(_queue[index + 1]));
       }
       return;
     }
-    unawaited(_play(_suggestions[index + 1]));
+
+    unawaited(_play(_queue[index + 1]));
+
+    // If the next song is now the last song in the queue, prefetch more suggestions.
+    if (index + 1 == _queue.length - 1) {
+      unawaited(_fetchMoreSuggestionsForQueue(_queue[index + 1].id));
+    }
   }
 
-  /// When the current song is the last in the suggestions list,
-  /// fetch the next 15 recommendations based on it.
-  Future<void> _fetchMoreSuggestionsIfNeeded() async {
-    if (_isFetchingMoreSuggestions || _current == null || _suggestions.isEmpty) {
-      return;
-    }
-    final currentIndex = _suggestions.indexWhere(
-      (song) => song.id == _current!.id,
-    );
-    // Only fetch more when the current song is the last in the list.
-    if (currentIndex < 0 || currentIndex != _suggestions.length - 1) return;
+  /// When the current song is the last in the queue,
+  /// fetch the next 15 recommendations based on it and append to the queue.
+  Future<void> _fetchMoreSuggestionsForQueue(String songId) async {
+    if (_isFetchingMoreSuggestions || _queue.isEmpty) return;
 
     _isFetchingMoreSuggestions = true;
     try {
-      final newSuggestions = await Api.suggestions(_current!.id, limit: 15);
+      final newSuggestions = await Api.suggestions(songId, limit: 15);
       if (!mounted || newSuggestions.isEmpty) return;
-      // Filter out songs already in the list to avoid duplicates.
-      final existingIds = _suggestions.map((s) => s.id).toSet();
-      final unique = newSuggestions.where((s) => !existingIds.contains(s.id)).toList();
-      if (unique.isNotEmpty) {
-        setState(() => _suggestions = [..._suggestions, ...unique]);
+      // Filter out songs already in the queue to avoid duplicates.
+      final existingIds = _queue.map((s) => s.id).toSet();
+      final unique =
+          newSuggestions.where((s) => !existingIds.contains(s.id)).toList();
+      if (unique.isNotEmpty && mounted) {
+        setState(() => _queue = [..._queue, ...unique]);
       }
     } catch (_) {
-      // Silently ignore - the user can still use manual next.
+      // Silently ignore
     } finally {
       _isFetchingMoreSuggestions = false;
     }
   }
 
   void _next() {
-    final list = _suggestions.isNotEmpty ? _suggestions : _queue;
-    if (list.isEmpty) return;
-    final index = list.indexWhere((song) => song.id == _current?.id);
-    final nextIndex = (index + 1) % list.length;
-    _play(list[nextIndex]);
-    // If we're nearing the end of suggestions, prefetch more.
-    if (_suggestions.isNotEmpty && index >= _suggestions.length - 2) {
-      unawaited(_fetchMoreSuggestionsIfNeeded());
-    }
+    _playNext();
   }
 
   void _previous() {
@@ -1040,19 +1033,24 @@ class _SonixHomeState extends State<SonixHome>
                 scrollDirection: Axis.horizontal,
                 itemCount: songs.length,
                 separatorBuilder: (_, _) => const SizedBox(width: 14),
-                itemBuilder: (_, i) => _card(songs[i]),
+                itemBuilder: (_, i) => _card(songs[i], songs),
               ),
             )
           else
-            Column(children: songs.map(_row).toList()),
+            Column(children: songs.map((s) => _row(s, songs)).toList()),
           const SizedBox(height: 26),
         ],
       );
 
-  Widget _card(Song song) {
+  Widget _card(Song song, [List<Song>? contextQueue]) {
     final isCurrent = _current?.id == song.id;
     return GestureDetector(
-      onTap: () => _play(song),
+      onTap: () {
+        if (contextQueue != null && _queue != contextQueue) {
+          setState(() => _queue = [...contextQueue]);
+        }
+        _play(song);
+      },
       child: SizedBox(
         width: 145,
         child: Column(
@@ -1207,10 +1205,15 @@ class _SonixHomeState extends State<SonixHome>
     ),
   );
 
-  Widget _row(Song song) {
+  Widget _row(Song song, [List<Song>? contextQueue]) {
     final isCurrent = _current?.id == song.id;
     return InkWell(
-      onTap: () => _play(song),
+      onTap: () {
+        if (contextQueue != null && _queue != contextQueue) {
+          setState(() => _queue = [...contextQueue]);
+        }
+        _play(song);
+      },
       child: Container(
         margin: const EdgeInsets.only(bottom: 8),
         padding: const EdgeInsets.all(7),
@@ -1243,7 +1246,12 @@ class _SonixHomeState extends State<SonixHome>
               ),
             ),
             IconButton(
-              onPressed: () => _play(song),
+              onPressed: () {
+                if (contextQueue != null && _queue != contextQueue) {
+                  setState(() => _queue = [...contextQueue]);
+                }
+                _play(song);
+              },
               icon: Icon(
                 isCurrent && _audio.playing
                     ? PhosphorIconsRegular.pause
@@ -1611,7 +1619,12 @@ class _SonixHomeState extends State<SonixHome>
   Widget _searchRow(int index, Song song) {
     final isCurrent = _current?.id == song.id;
     return InkWell(
-      onTap: () => _play(song),
+      onTap: () {
+        if (_queue != _results) {
+          setState(() => _queue = [..._results]);
+        }
+        _play(song);
+      },
       child: Padding(
         padding: const EdgeInsets.symmetric(vertical: 7),
         child: Row(
@@ -1646,7 +1659,12 @@ class _SonixHomeState extends State<SonixHome>
               ),
             ),
             IconButton(
-              onPressed: () => _play(song),
+              onPressed: () {
+                if (_queue != _results) {
+                  setState(() => _queue = [..._results]);
+                }
+                _play(song);
+              },
               icon: const Icon(PhosphorIconsRegular.play),
             ),
             IconButton(
