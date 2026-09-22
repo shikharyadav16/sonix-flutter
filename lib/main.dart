@@ -12,15 +12,19 @@ import 'package:palette_generator/palette_generator.dart';
 import 'package:phosphor_icons/phosphor_icons.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import 'constants.dart';
+import 'crossfade_player.dart';
 import 'onboarding_screen.dart';
 import 'user_storage.dart';
 
-const _apiRoot = 'https://music-api.albatross0071.workers.dev';
-const _fallbackArt =
-    'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcRKzFIZo0IV9H2PER0gKrlsPHoB0NIxu_U_JSJySOR_3A&s=10';
-const _ink = Color(0xff080808);
-const _surface = Color(0xff151518);
-const _muted = Color(0xff92929b);
+/// Two distinct playback modes.
+enum PlaybackMode { suggestions, playlist }
+
+const _apiRoot = AppConstants.apiBaseUrl;
+const _fallbackArt = AppConstants.fallbackArtworkUrl;
+const _ink = AppConstants.colorInk;
+const _surface = AppConstants.colorSurface;
+const _muted = AppConstants.colorMuted;
 
 /* -------------------------------------------------------------------------- */
 /*                                   MODELS                                   */
@@ -117,7 +121,7 @@ class Song {
     'album': album,
     'artwork': artwork,
     'image': [
-      {'quality': '500x500', 'url': artwork}
+      {'quality': '500x500', 'url': artwork},
     ],
     'duration': duration,
     'streamUrl': streamUrl,
@@ -174,7 +178,9 @@ class Playlist {
   );
 
   factory Playlist.fromJson(Map<String, dynamic> json) {
-    final images = (json['image'] as List? ?? const []).whereType<Map>().toList();
+    final images = (json['image'] as List? ?? const [])
+        .whereType<Map>()
+        .toList();
     final image = images.firstWhere(
       (item) => item['quality'] == '500x500',
       orElse: () => images.isEmpty ? const {} : images.last,
@@ -193,7 +199,8 @@ class Playlist {
       artwork: '${image['url'] ?? ''}',
       url: '${json['url'] ?? ''}',
       language: '${json['language'] ?? ''}',
-      songCount: int.tryParse('${json['songCount'] ?? songsList.length}') ??
+      songCount:
+          int.tryParse('${json['songCount'] ?? songsList.length}') ??
           songsList.length,
       songs: songsList,
     );
@@ -204,12 +211,7 @@ class Playlist {
 /*                                    API                                     */
 /* -------------------------------------------------------------------------- */
 
-const _apiHeaders = {
-  'origin': 'https://listenfree.in',
-  'referer': 'https://listenfree.in/',
-  'user-agent':
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36',
-};
+const _apiHeaders = AppConstants.apiHeaders;
 
 class Api {
   static Future<Map<String, dynamic>> search(String query) async {
@@ -235,7 +237,8 @@ class Api {
         : null;
   }
 
-  static Future<List<Song>> suggestions(String id, {int limit = 15}) async {
+  static Future<List<Song>> suggestions(String id,
+      {int limit = AppConstants.suggestionsBatchSize}) async {
     final response = await http.get(
       Uri.parse(
         '$_apiRoot/api/songs/${Uri.encodeComponent(id)}/suggestions'
@@ -253,7 +256,8 @@ class Api {
         : [];
   }
 
-  static Future<Playlist?> playlist(String id, {int limit = 50}) async {
+  static Future<Playlist?> playlist(String id,
+      {int limit = AppConstants.playlistFetchLimit}) async {
     try {
       final response = await http.get(
         Uri.parse(
@@ -528,15 +532,6 @@ final _topHitsSongs = <Song>[
   ),
 ];
 
-final _homeSongs = {
-  for (final s in [
-    ..._trendingSongs,
-    ..._suggestedSongs,
-    ..._mostPlayedSongs,
-    ..._topHitsSongs,
-  ])
-    s.id: s,
-}.values.toList();
 
 final _featuredPlaylists = <Playlist>[
   Playlist(
@@ -589,7 +584,10 @@ final _featuredPlaylists = <Playlist>[
   ),
 ];
 
-void main() => runApp(const SonixApp());
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(const SonixApp());
+}
 
 class SonixApp extends StatefulWidget {
   const SonixApp({super.key});
@@ -650,13 +648,11 @@ class _SonixAppState extends State<SonixApp> {
     home: !_checkedOnboarding
         ? const Scaffold(
             backgroundColor: _ink,
-            body: Center(
-              child: CircularProgressIndicator(color: Colors.white),
-            ),
+            body: Center(child: CircularProgressIndicator(color: Colors.white)),
           )
         : (_isOnboarded
-            ? SonixHome(userProfile: _userProfile)
-            : OnboardingScreen(onComplete: _onComplete)),
+              ? SonixHome(userProfile: _userProfile)
+              : OnboardingScreen(onComplete: _onComplete)),
   );
 }
 
@@ -673,18 +669,24 @@ class SonixHome extends StatefulWidget {
   State<SonixHome> createState() => _SonixHomeState();
 }
 
-class _SonixHomeState extends State<SonixHome>
-    with TickerProviderStateMixin {
+class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
   UserProfile? _userProfile;
   final _search = TextEditingController();
-  final _audio = AudioPlayer();
+  late final CrossfadePlayer _audio;
   late final AnimationController _gradientAnim;
 
   List<Song> _results = [];
   List<Playlist> _playlistResults = [];
-  List<Song> _queue = [..._homeSongs];
   List<Song> _history = [];
-  bool _isFetchingMoreSuggestions = false;
+
+  // ---- Queue / playback mode state ----
+  PlaybackMode _playbackMode = PlaybackMode.suggestions;
+  List<Song> _suggestionQueue = [];   // holds 15 suggestions at a time
+  List<Song> _playlistQueue = [];     // all songs for playlist repeat
+  int _playlistQueueIndex = -1;       // current index inside _playlistQueue
+  bool _isFetchingSuggestions = false; // guard concurrent fetches
+  Song? _preparedSong;
+  String? _preparedStreamUrl;
 
   Map<String, Song> _likedSongs = {};
   bool _viewingLikedSongs = false;
@@ -709,12 +711,17 @@ class _SonixHomeState extends State<SonixHome>
   List<LyricLine> _parsedLyrics = [];
 
   StreamSubscription<bool>? _playingSub;
-  StreamSubscription<ProcessingState>? _processingSub;
+  StreamSubscription<ProcessingState>? _processingStateSub;
   final Map<String, Future<List<Color>>> _paletteFutures = {};
 
   @override
   void initState() {
     super.initState();
+    _audio = CrossfadePlayer(
+        crossfadeSeconds: AppConstants.crossfadeDurationSeconds);
+    _audio.onPrepareNextTrack = _onPrepareNextTrack;
+    _audio.onAutoCrossfadeTriggered = _onCrossfadeTriggered;
+
     _userProfile = widget.userProfile;
     if (_userProfile == null) {
       UserStorage.getProfile().then((p) {
@@ -727,15 +734,17 @@ class _SonixHomeState extends State<SonixHome>
     });
     _gradientAnim = AnimationController(
       vsync: this,
-      duration: const Duration(seconds: 14),
+      duration: const Duration(
+          seconds: AppConstants.backgroundAnimationDurationSeconds),
     )..repeat(reverse: true);
     _search.addListener(_onSearchChanged);
     _playingSub = _audio.playingStream.listen((_) {
       if (mounted) setState(() {});
     });
-    _processingSub = _audio.processingStateStream.listen((state) {
-      if (state == ProcessingState.completed && mounted) {
-        _playNext();
+    // Detect song completion to auto-advance.
+    _processingStateSub = _audio.processingStateStream.listen((state) {
+      if (state == ProcessingState.completed) {
+        _onSongCompleted();
       }
     });
   }
@@ -750,7 +759,7 @@ class _SonixHomeState extends State<SonixHome>
     _gradientAnim.dispose();
     _search.removeListener(_onSearchChanged);
     _playingSub?.cancel();
-    _processingSub?.cancel();
+    _processingStateSub?.cancel();
     _audio.dispose();
     _search.dispose();
     super.dispose();
@@ -788,7 +797,6 @@ class _SonixHomeState extends State<SonixHome>
       setState(() {
         _results = songs;
         _playlistResults = playlists;
-        _queue = songs;
       });
     } catch (_) {
       if (mounted) {
@@ -825,9 +833,38 @@ class _SonixHomeState extends State<SonixHome>
 
   /* ------------------------------ PLAYBACK ------------------------------- */
 
+  AudioSource _sourceForSong(Song song, String stream) =>
+      AudioSource.uri(Uri.parse(stream), tag: song.id);
+
+
+  /// Resolve a song's stream URL and full metadata via the API.
+  Future<(Song, String?)?> _resolveSong(Song song) async {
+    final details = await Api.details(song.id);
+    final resolved = details == null ? song : Song.fromJson(details);
+    final urls = resolved.downloadUrls;
+    final match = urls.where((item) => item['quality'] == _songQuality).toList();
+    final stream =
+        (match.isNotEmpty
+                ? match.first
+                : (urls
+                          .where((item) => item['quality'] == '320kbps')
+                          .isNotEmpty
+                      ? urls.firstWhere(
+                          (item) => item['quality'] == '320kbps',
+                        )
+                      : (urls.isEmpty ? null : urls.last)))?['url']
+            as String?;
+    return (resolved, stream);
+  }
+
+  /// Low-level: play a single song directly on the CrossfadePlayer.
+  /// Does NOT touch queues or modes — callers manage that.
   Future<void> _play(Song song) async {
     final request = ++_playRequest;
-    // Same track -> just toggle.
+    _preparedSong = null;
+    _preparedStreamUrl = null;
+
+    // Same track -> just toggle play/pause.
     if (_current?.id == song.id && !_isLoadingTrack) {
       if (_audio.playing) {
         await _audio.pause();
@@ -838,6 +875,9 @@ class _SonixHomeState extends State<SonixHome>
       return;
     }
 
+    // Stop previous track immediately so old audio doesn't play while new song is being fetched
+    unawaited(_audio.stop());
+
     setState(() {
       _current = song;
       _isLoadingTrack = true;
@@ -847,42 +887,34 @@ class _SonixHomeState extends State<SonixHome>
       _history = [
         song,
         ..._history.where((item) => item.id != song.id),
-      ].take(5).toList();
+      ].take(AppConstants.historyLimit).toList();
     });
 
     try {
-      await _audio.stop();
       if (!mounted || request != _playRequest) return;
 
-      final details = await Api.details(song.id);
+      final result = await _resolveSong(song);
       if (!mounted || request != _playRequest) return;
 
-      final resolved = details == null ? song : Song.fromJson(details);
-      final urls = resolved.downloadUrls;
-      final match = urls.where((item) => item['quality'] == _songQuality).toList();
-      final stream = (match.isNotEmpty
-              ? match.first
-              : (urls.where((item) => item['quality'] == '320kbps').isNotEmpty
-                  ? urls.firstWhere((item) => item['quality'] == '320kbps')
-                  : (urls.isEmpty ? null : urls.last)))?['url'] as String?;
+      if (result == null) {
+        setState(() => _isLoadingTrack = false);
+        return;
+      }
+
+      final (resolved, stream) = result;
 
       setState(() => _current = resolved.copyWith(streamUrl: stream));
 
       if (stream != null) {
-        await _audio.setUrl(stream);
+        final source = _sourceForSong(resolved, stream);
+        await _audio.playDirect(source, fadeCurrentOut: false);
         if (!mounted || request != _playRequest) return;
         setState(() => _isLoadingTrack = false);
-        unawaited(_audio.play());
       } else if (mounted && request == _playRequest) {
         setState(() => _isLoadingTrack = false);
       }
 
-      // Only fetch suggestions if this song is the last song of the queue
-      final currentIndex = _queue.indexWhere((s) => s.id == resolved.id);
-      if (currentIndex >= 0 && currentIndex == _queue.length - 1) {
-        unawaited(_fetchMoreSuggestionsForQueue(resolved.id));
-      }
-
+      // Fetch lyrics in background.
       final lyricData = await Api.lyrics(resolved);
       if (!mounted || request != _playRequest) return;
       setState(() {
@@ -899,68 +931,242 @@ class _SonixHomeState extends State<SonixHome>
     }
   }
 
-  void _playNext() async {
-    if (_isLoadingTrack || _current == null || _queue.isEmpty) return;
-    final index = _queue.indexWhere(
-      (song) => song.id == _current!.id,
-    );
-    if (index < 0) return;
+  /* ------------- MODE 1: Individual song + suggestions queue ------------- */
 
-    // If current song is the last in the queue, fetch more first.
-    if (index + 1 >= _queue.length) {
-      await _fetchMoreSuggestionsForQueue(_current!.id);
+  /// Called when user selects an individual song (from Home, Search, etc.).
+  /// Clears existing queue, plays the song, fetches 15 suggestions.
+  Future<void> _playSongForSuggestionMode(Song song) async {
+    // Switch to suggestion mode and clear everything.
+    setState(() {
+      _playbackMode = PlaybackMode.suggestions;
+      _suggestionQueue = [];
+      _playlistQueue = [];
+      _playlistQueueIndex = -1;
+    });
+
+    // Play the selected song.
+    await _play(song);
+    if (!mounted || _current?.id != song.id) return;
+
+    // Fetch 15 suggestions.
+    unawaited(_fetchSuggestions(song.id));
+  }
+
+  /// Fetch exactly 15 suggestions. Replaces the suggestion queue entirely.
+  Future<void> _fetchSuggestions(String songId) async {
+    if (_isFetchingSuggestions) return;
+    _isFetchingSuggestions = true;
+    try {
+      final suggestions = await Api.suggestions(songId, limit: 15);
       if (!mounted) return;
-      // After fetching, check if there's a next song now.
-      if (index + 1 < _queue.length) {
-        unawaited(_play(_queue[index + 1]));
+      // Filter out the currently playing song to avoid duplication.
+      final currentId = _current?.id;
+      final unique = suggestions
+          .where((s) => s.id != currentId)
+          .toList();
+      setState(() => _suggestionQueue = unique);
+    } catch (_) {
+      // Silently ignore fetch errors.
+    } finally {
+      _isFetchingSuggestions = false;
+    }
+  }
+
+  /* -------------------- MODE 2: Playlist repeat queue -------------------- */
+
+  /// Called when user presses Play All / Shuffle on a playlist or liked songs.
+  /// Clears suggestion queue, loads all playlist songs, plays first, repeats.
+  Future<void> _playPlaylist(List<Song> songs) async {
+    if (songs.isEmpty) return;
+
+    setState(() {
+      _playbackMode = PlaybackMode.playlist;
+      _suggestionQueue = [];
+      _playlistQueue = [...songs];
+      _playlistQueueIndex = 0;
+    });
+
+    await _play(songs.first);
+  }
+
+  /* -------------------- Song completion / auto-advance ------------------- */
+
+  /// Called when the active player reaches ProcessingState.completed.
+  void _onSongCompleted() {
+    if (_isLoadingTrack || _current == null) return;
+    // If an active crossfade is currently transitioning, skip auto-advance.
+    if (_audio.isCrossfading) return;
+    _advanceToNextSong();
+  }
+
+  /// Advance to the next song based on current playback mode.
+  void _advanceToNextSong() {
+    if (_playbackMode == PlaybackMode.playlist) {
+      _advancePlaylist();
+    } else {
+      _advanceSuggestionQueue();
+    }
+  }
+
+  void _advancePlaylist() {
+    if (_playlistQueue.isEmpty) return;
+    _playlistQueueIndex = (_playlistQueueIndex + 1) % _playlistQueue.length;
+    _play(_playlistQueue[_playlistQueueIndex]);
+  }
+
+  void _advanceSuggestionQueue() {
+    if (_suggestionQueue.isEmpty) {
+      // Queue exhausted — fetch more based on current song.
+      if (_current != null) {
+        _fetchSuggestions(_current!.id).then((_) {
+          if (_suggestionQueue.isNotEmpty && mounted) {
+            final next = _suggestionQueue.removeAt(0);
+            setState(() {});
+            _play(next);
+          }
+        });
       }
       return;
     }
 
-    unawaited(_play(_queue[index + 1]));
+    final next = _suggestionQueue.removeAt(0);
+    setState(() {});
+    _play(next);
 
-    // If the next song is now the last song in the queue, prefetch more suggestions.
-    if (index + 1 == _queue.length - 1) {
-      unawaited(_fetchMoreSuggestionsForQueue(_queue[index + 1].id));
+    // If queue is now empty after this removal, prefetch next batch.
+    if (_suggestionQueue.isEmpty && _current != null) {
+      unawaited(_fetchSuggestions(next.id));
     }
   }
 
-  /// When the current song is the last in the queue,
-  /// fetch the next 15 recommendations based on it and append to the queue.
-  Future<void> _fetchMoreSuggestionsForQueue(String songId) async {
-    if (_isFetchingMoreSuggestions || _queue.isEmpty) return;
+  /* ----------------------- Crossfade callbacks --------------------------- */
 
-    _isFetchingMoreSuggestions = true;
-    try {
-      final newSuggestions = await Api.suggestions(songId, limit: 15);
-      if (!mounted || newSuggestions.isEmpty) return;
-      // Filter out songs already in the queue to avoid duplicates.
-      final existingIds = _queue.map((s) => s.id).toSet();
-      final unique =
-          newSuggestions.where((s) => !existingIds.contains(s.id)).toList();
-      if (unique.isNotEmpty && mounted) {
-        setState(() => _queue = [..._queue, ...unique]);
+  /// Called ~13s before song ends (prefetch window: 8s before crossfade starts).
+  void _onPrepareNextTrack() {
+    final nextSong = _peekNextSong();
+    if (nextSong == null) return;
+
+    _resolveSong(nextSong).then((result) {
+      if (result == null || !mounted) return;
+      final (resolved, stream) = result;
+      if (stream != null) {
+        _preparedSong = resolved;
+        _preparedStreamUrl = stream;
+        _audio.prepareNext(_sourceForSong(resolved, stream), uri: stream);
       }
-    } catch (_) {
-      // Silently ignore
-    } finally {
-      _isFetchingMoreSuggestions = false;
+    }).catchError((_) {});
+  }
+
+  /// Called when 5 seconds remain — start the 5s crossfade transition.
+  void _onCrossfadeTriggered() {
+    if (_audio.isCrossfading || _isLoadingTrack) return;
+    final nextSong = _peekNextSong();
+    if (nextSong == null) return;
+
+    void executeCrossfade(Song resolved, String stream) {
+      final source = _sourceForSong(resolved, stream);
+      _audio.startCrossfade(
+        nextSource: source,
+        nextUri: stream,
+        onCompleted: () {
+          if (!mounted) return;
+          _consumeNextSong(resolved);
+
+          setState(() {
+            _current = resolved.copyWith(streamUrl: stream);
+            _isLoadingTrack = false;
+            _history = [
+              resolved,
+              ..._history.where((item) => item.id != resolved.id),
+            ].take(AppConstants.historyLimit).toList();
+          });
+
+          _preparedSong = null;
+          _preparedStreamUrl = null;
+
+          Api.lyrics(resolved).then((lyricData) {
+            if (mounted) {
+              setState(() {
+                _lyrics = lyricData;
+                _parsedLyrics = parseLyrics(lyricData?['syncedLyrics'] as String?);
+              });
+            }
+          }).catchError((_) {});
+        },
+      );
+    }
+
+    if (_preparedSong != null &&
+        _preparedSong!.id == nextSong.id &&
+        _preparedStreamUrl != null) {
+      executeCrossfade(_preparedSong!, _preparedStreamUrl!);
+    } else {
+      _resolveSong(nextSong).then((result) {
+        if (result == null || !mounted) return;
+        final (resolved, stream) = result;
+        if (stream == null) return;
+        executeCrossfade(resolved, stream);
+      }).catchError((_) {});
     }
   }
+
+  /// Peek at the next song WITHOUT removing it from the queue.
+  Song? _peekNextSong() {
+    if (_playbackMode == PlaybackMode.playlist) {
+      if (_playlistQueue.isEmpty) return null;
+      final nextIdx = (_playlistQueueIndex + 1) % _playlistQueue.length;
+      return _playlistQueue[nextIdx];
+    } else {
+      return _suggestionQueue.isNotEmpty ? _suggestionQueue.first : null;
+    }
+  }
+
+  /// Consume (advance past) the next song in the queue.
+  void _consumeNextSong([Song? justPlayed]) {
+    if (_playbackMode == PlaybackMode.playlist) {
+      if (_playlistQueue.isEmpty) return;
+      _playlistQueueIndex = (_playlistQueueIndex + 1) % _playlistQueue.length;
+    } else {
+      if (_suggestionQueue.isNotEmpty) {
+        final consumed = _suggestionQueue.removeAt(0);
+        // If queue just became empty, trigger a prefetch.
+        if (_suggestionQueue.isEmpty) {
+          final targetSong = justPlayed ?? _current ?? consumed;
+          unawaited(_fetchSuggestions(targetSong.id));
+        }
+      }
+    }
+    setState(() {});
+  }
+
+  /* ---------------------- Next / Previous / Controls --------------------- */
 
   void _next() {
-    _playNext();
+    if (_isLoadingTrack || _current == null) return;
+    _advanceToNextSong();
   }
 
   void _previous() {
-    final list = _history.length > 1 ? _history : _queue;
-    if (list.isEmpty) return;
-    final index = list.indexWhere((song) => song.id == _current?.id);
-    _play(list[index <= 0 ? list.length - 1 : index - 1]);
+    if (_history.length > 1) {
+      // Play the previous song from history.
+      final index = _history.indexWhere((song) => song.id == _current?.id);
+      if (index > 0) {
+        _play(_history[index]);
+      } else if (_history.length > 1) {
+        _play(_history[1]);
+      }
+    } else if (_playbackMode == PlaybackMode.playlist && _playlistQueue.isNotEmpty) {
+      _playlistQueueIndex = (_playlistQueueIndex - 1 + _playlistQueue.length) % _playlistQueue.length;
+      _play(_playlistQueue[_playlistQueueIndex]);
+    }
   }
 
   void _togglePlayPause() {
     if (_current == null) return;
+    if (_audio.processingState == ProcessingState.completed) {
+      _advanceToNextSong();
+      return;
+    }
     if (_audio.playing) {
       unawaited(_audio.pause());
     } else {
@@ -974,8 +1180,12 @@ class _SonixHomeState extends State<SonixHome>
   Future<void> _download(Song song) async {
     String? url = song.streamUrl;
     if (url == null && song.downloadUrls.isNotEmpty) {
-      final match = song.downloadUrls.where((i) => i['quality'] == _songQuality).toList();
-      url = (match.isNotEmpty ? match.first : song.downloadUrls.last)['url'] as String?;
+      final match = song.downloadUrls
+          .where((i) => i['quality'] == _songQuality)
+          .toList();
+      url =
+          (match.isNotEmpty ? match.first : song.downloadUrls.last)['url']
+              as String?;
     }
     if (url == null) {
       try {
@@ -983,12 +1193,20 @@ class _SonixHomeState extends State<SonixHome>
         if (details != null) {
           final resolved = Song.fromJson(details);
           final urls = resolved.downloadUrls;
-          final match = urls.where((item) => item['quality'] == _songQuality).toList();
-          url = (match.isNotEmpty
-                  ? match.first
-                  : (urls.where((item) => item['quality'] == '320kbps').isNotEmpty
-                      ? urls.firstWhere((item) => item['quality'] == '320kbps')
-                      : (urls.isEmpty ? null : urls.last)))?['url'] as String?;
+          final match = urls
+              .where((item) => item['quality'] == _songQuality)
+              .toList();
+          url =
+              (match.isNotEmpty
+                      ? match.first
+                      : (urls
+                                .where((item) => item['quality'] == '320kbps')
+                                .isNotEmpty
+                            ? urls.firstWhere(
+                                (item) => item['quality'] == '320kbps',
+                              )
+                            : (urls.isEmpty ? null : urls.last)))?['url']
+                  as String?;
         }
       } catch (_) {}
     }
@@ -999,7 +1217,9 @@ class _SonixHomeState extends State<SonixHome>
           SnackBar(
             content: const Text('Download link not available for this track'),
             behavior: SnackBarBehavior.floating,
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(10),
+            ),
             duration: const Duration(seconds: 2),
           ),
         );
@@ -1014,7 +1234,9 @@ class _SonixHomeState extends State<SonixHome>
   /* ------------------------------- PALETTE ------------------------------- */
 
   Future<List<Color>> _paletteFor(Song song) {
-    final key = song.artwork.trim().isEmpty ? _fallbackArt : song.artwork.trim();
+    final key = song.artwork.trim().isEmpty
+        ? _fallbackArt
+        : song.artwork.trim();
     return _paletteFutures.putIfAbsent(key, () async {
       try {
         final palette = await PaletteGenerator.fromImageProvider(
@@ -1095,8 +1317,8 @@ class _SonixHomeState extends State<SonixHome>
                     child: _openedPlaylist != null
                         ? _playlistView()
                         : (_viewingLikedSongs
-                            ? _likedSongsView()
-                            : (_homeMode ? _home() : _searchResults())),
+                              ? _likedSongsView()
+                              : (_homeMode ? _home() : _searchResults())),
                   ),
                   if (_current != null) _playerBar(),
                 ],
@@ -1220,7 +1442,10 @@ class _SonixHomeState extends State<SonixHome>
           style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
           decoration: InputDecoration(
             hintText: 'Search songs, artists, albums...',
-            hintStyle: const TextStyle(color: _muted, fontWeight: FontWeight.w400),
+            hintStyle: const TextStyle(
+              color: _muted,
+              fontWeight: FontWeight.w400,
+            ),
             prefixIcon: const Icon(
               PhosphorIconsRegular.magnifyingGlass,
               size: 19,
@@ -1348,12 +1573,7 @@ class _SonixHomeState extends State<SonixHome>
   Widget _card(Song song, [List<Song>? contextQueue]) {
     final isCurrent = _current?.id == song.id;
     return GestureDetector(
-      onTap: () {
-        if (contextQueue != null && _queue != contextQueue) {
-          setState(() => _queue = [...contextQueue]);
-        }
-        _play(song);
-      },
+      onTap: () => _playSongForSuggestionMode(song),
       child: SizedBox(
         width: 145,
         child: Column(
@@ -1474,7 +1694,10 @@ class _SonixHomeState extends State<SonixHome>
                 bottom: 8,
                 left: 8,
                 child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 7,
+                    vertical: 3,
+                  ),
                   decoration: BoxDecoration(
                     color: Colors.black.withValues(alpha: .75),
                     borderRadius: BorderRadius.circular(6),
@@ -1483,11 +1706,19 @@ class _SonixHomeState extends State<SonixHome>
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      const Icon(PhosphorIconsRegular.musicNotes, size: 11, color: Colors.white70),
+                      const Icon(
+                        PhosphorIconsRegular.musicNotes,
+                        size: 11,
+                        color: Colors.white70,
+                      ),
                       const SizedBox(width: 4),
                       Text(
                         '${playlist.songCount > 0 ? playlist.songCount : 20} songs',
-                        style: const TextStyle(fontSize: 10, fontWeight: FontWeight.w600, color: Colors.white70),
+                        style: const TextStyle(
+                          fontSize: 10,
+                          fontWeight: FontWeight.w600,
+                          color: Colors.white70,
+                        ),
                       ),
                     ],
                   ),
@@ -1513,7 +1744,11 @@ class _SonixHomeState extends State<SonixHome>
             playlist.title,
             maxLines: 2,
             overflow: TextOverflow.ellipsis,
-            style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w700, height: 1.25),
+            style: const TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w700,
+              height: 1.25,
+            ),
           ),
           if (playlist.description.isNotEmpty) ...[
             const SizedBox(height: 3),
@@ -1521,7 +1756,11 @@ class _SonixHomeState extends State<SonixHome>
               playlist.description,
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
-              style: const TextStyle(color: _muted, fontSize: 11, fontWeight: FontWeight.w500),
+              style: const TextStyle(
+                color: _muted,
+                fontSize: 11,
+                fontWeight: FontWeight.w500,
+              ),
             ),
           ],
         ],
@@ -1533,12 +1772,7 @@ class _SonixHomeState extends State<SonixHome>
     final isCurrent = _current?.id == song.id;
     final isLiked = _likedSongs.containsKey(song.id);
     return InkWell(
-      onTap: () {
-        if (contextQueue != null && _queue != contextQueue) {
-          setState(() => _queue = [...contextQueue]);
-        }
-        _play(song);
-      },
+      onTap: () => _playSongForSuggestionMode(song),
       child: Container(
         margin: const EdgeInsets.only(bottom: 8),
         padding: const EdgeInsets.all(7),
@@ -1558,7 +1792,11 @@ class _SonixHomeState extends State<SonixHome>
                     song.artist,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(color: _muted, fontSize: 11, fontWeight: FontWeight.w500),
+                    style: const TextStyle(
+                      color: _muted,
+                      fontSize: 11,
+                      fontWeight: FontWeight.w500,
+                    ),
                   ),
                   const SizedBox(height: 4),
                   Text(
@@ -1581,7 +1819,10 @@ class _SonixHomeState extends State<SonixHome>
             ),
             IconButton(
               onPressed: () => _showSongOptions(song, contextQueue),
-              icon: const Icon(PhosphorIconsRegular.dotsThreeVertical, size: 20),
+              icon: const Icon(
+                PhosphorIconsRegular.dotsThreeVertical,
+                size: 20,
+              ),
               tooltip: 'More options',
             ),
           ],
@@ -1644,11 +1885,18 @@ class _SonixHomeState extends State<SonixHome>
             padding: const EdgeInsets.only(bottom: 12),
             child: Row(
               children: [
-                const Icon(PhosphorIconsRegular.playlist, size: 20, color: Colors.white),
+                const Icon(
+                  PhosphorIconsRegular.playlist,
+                  size: 20,
+                  color: Colors.white,
+                ),
                 const SizedBox(width: 8),
                 Text(
                   'Playlists (${_playlistResults.length})',
-                  style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
+                  style: const TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.w800,
+                  ),
                 ),
               ],
             ),
@@ -1723,7 +1971,10 @@ class _SonixHomeState extends State<SonixHome>
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 7,
+                      vertical: 3,
+                    ),
                     decoration: BoxDecoration(
                       color: Colors.white.withValues(alpha: .12),
                       borderRadius: BorderRadius.circular(5),
@@ -1761,7 +2012,11 @@ class _SonixHomeState extends State<SonixHome>
                   const SizedBox(height: 8),
                   Text(
                     '${playlist.songs.isNotEmpty ? playlist.songs.length : (playlist.songCount > 0 ? playlist.songCount : 0)} Songs',
-                    style: const TextStyle(color: _muted, fontSize: 12, fontWeight: FontWeight.w600),
+                    style: const TextStyle(
+                      color: _muted,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                    ),
                   ),
                 ],
               ),
@@ -1775,21 +2030,26 @@ class _SonixHomeState extends State<SonixHome>
               child: ElevatedButton.icon(
                 onPressed: playlist.songs.isEmpty
                     ? null
-                    : () {
-                        setState(() {
-                          _queue = [...playlist.songs];
-                        });
-                        _play(playlist.songs.first);
-                      },
-                icon: const Icon(PhosphorIconsFill.play, size: 18, color: Colors.black),
+                    : () => _playPlaylist(playlist.songs),
+                icon: const Icon(
+                  PhosphorIconsFill.play,
+                  size: 18,
+                  color: Colors.black,
+                ),
                 label: const Text(
                   'Play All',
-                  style: TextStyle(color: Colors.black, fontWeight: FontWeight.w800, fontSize: 14),
+                  style: TextStyle(
+                    color: Colors.black,
+                    fontWeight: FontWeight.w800,
+                    fontSize: 14,
+                  ),
                 ),
                 style: ElevatedButton.styleFrom(
                   backgroundColor: Colors.white,
                   padding: const EdgeInsets.symmetric(vertical: 13),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(30),
+                  ),
                   elevation: 0,
                 ),
               ),
@@ -1801,20 +2061,27 @@ class _SonixHomeState extends State<SonixHome>
                     ? null
                     : () {
                         final shuffled = [...playlist.songs]..shuffle();
-                        setState(() {
-                          _queue = shuffled;
-                        });
-                        _play(shuffled.first);
+                        _playPlaylist(shuffled);
                       },
-                icon: const Icon(PhosphorIconsRegular.shuffle, size: 18, color: Colors.white),
+                icon: const Icon(
+                  PhosphorIconsRegular.shuffle,
+                  size: 18,
+                  color: Colors.white,
+                ),
                 label: const Text(
                   'Shuffle',
-                  style: TextStyle(color: Colors.white, fontWeight: FontWeight.w700, fontSize: 14),
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.w700,
+                    fontSize: 14,
+                  ),
                 ),
                 style: OutlinedButton.styleFrom(
                   side: const BorderSide(color: Colors.white24),
                   padding: const EdgeInsets.symmetric(vertical: 13),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(30),
+                  ),
                 ),
               ),
             ),
@@ -1828,7 +2095,10 @@ class _SonixHomeState extends State<SonixHome>
               children: [
                 CircularProgressIndicator(),
                 SizedBox(height: 16),
-                Text('Loading playlist songs...', style: TextStyle(color: _muted)),
+                Text(
+                  'Loading playlist songs...',
+                  style: TextStyle(color: _muted),
+                ),
               ],
             ),
           ),
@@ -1858,12 +2128,7 @@ class _SonixHomeState extends State<SonixHome>
     final isCurrent = _current?.id == song.id;
     final isLiked = _likedSongs.containsKey(song.id);
     return InkWell(
-      onTap: () {
-        if (_queue != playlist.songs) {
-          setState(() => _queue = [...playlist.songs]);
-        }
-        _play(song);
-      },
+      onTap: () => _playSongForSuggestionMode(song),
       child: Padding(
         padding: const EdgeInsets.symmetric(vertical: 7),
         child: Row(
@@ -1894,7 +2159,9 @@ class _SonixHomeState extends State<SonixHome>
                     style: TextStyle(
                       fontWeight: FontWeight.w700,
                       fontSize: 14,
-                      color: isCurrent ? Colors.white : Colors.white.withValues(alpha: .9),
+                      color: isCurrent
+                          ? Colors.white
+                          : Colors.white.withValues(alpha: .9),
                     ),
                   ),
                   const SizedBox(height: 3),
@@ -1902,7 +2169,11 @@ class _SonixHomeState extends State<SonixHome>
                     song.artist,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(color: _muted, fontSize: 12, fontWeight: FontWeight.w500),
+                    style: const TextStyle(
+                      color: _muted,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w500,
+                    ),
                   ),
                 ],
               ),
@@ -1926,7 +2197,10 @@ class _SonixHomeState extends State<SonixHome>
             ),
             IconButton(
               onPressed: () => _showSongOptions(song, playlist.songs),
-              icon: const Icon(PhosphorIconsRegular.dotsThreeVertical, size: 20),
+              icon: const Icon(
+                PhosphorIconsRegular.dotsThreeVertical,
+                size: 20,
+              ),
               tooltip: 'More options',
             ),
           ],
@@ -1939,12 +2213,7 @@ class _SonixHomeState extends State<SonixHome>
     final isCurrent = _current?.id == song.id;
     final isLiked = _likedSongs.containsKey(song.id);
     return InkWell(
-      onTap: () {
-        if (_queue != _results) {
-          setState(() => _queue = [..._results]);
-        }
-        _play(song);
-      },
+      onTap: () => _playSongForSuggestionMode(song),
       child: Padding(
         padding: const EdgeInsets.symmetric(vertical: 7),
         child: Row(
@@ -1973,7 +2242,11 @@ class _SonixHomeState extends State<SonixHome>
                     song.artist,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(color: _muted, fontSize: 12, fontWeight: FontWeight.w500),
+                    style: const TextStyle(
+                      color: _muted,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w500,
+                    ),
                   ),
                 ],
               ),
@@ -1989,7 +2262,10 @@ class _SonixHomeState extends State<SonixHome>
             ),
             IconButton(
               onPressed: () => _showSongOptions(song, _results),
-              icon: const Icon(PhosphorIconsRegular.dotsThreeVertical, size: 20),
+              icon: const Icon(
+                PhosphorIconsRegular.dotsThreeVertical,
+                size: 20,
+              ),
               tooltip: 'More options',
             ),
           ],
@@ -2066,11 +2342,12 @@ class _SonixHomeState extends State<SonixHome>
                           ? Colors.redAccent
                           : _muted,
                     ),
-                    tooltip: _likedSongs.containsKey(track.id) ? 'Unlike' : 'Like',
+                    tooltip: _likedSongs.containsKey(track.id)
+                        ? 'Unlike'
+                        : 'Like',
                   ),
                   IconButton(
-                    onPressed: () =>
-                        setState(() => _lyricsOpen = !_lyricsOpen),
+                    onPressed: () => setState(() => _lyricsOpen = !_lyricsOpen),
                     icon: Icon(
                       PhosphorIconsRegular.textAa,
                       size: 20,
@@ -2080,30 +2357,31 @@ class _SonixHomeState extends State<SonixHome>
                   ),
                   IconButton(
                     onPressed: _previous,
-                    icon: const Icon(
-                      PhosphorIconsRegular.skipBack,
-                      size: 20,
-                    ),
+                    icon: const Icon(PhosphorIconsRegular.skipBack, size: 20),
                   ),
                   StreamBuilder<bool>(
                     stream: _audio.playingStream,
-                    builder: (_, snapshot) => IconButton(
-                      onPressed: _isLoadingTrack ? null : _togglePlayPause,
-                      icon: _isLoadingTrack
-                          ? const SizedBox(
-                              width: 24,
-                              height: 24,
-                              child: CircularProgressIndicator(
-                                strokeWidth: 2.4,
+                    initialData: _audio.playing,
+                    builder: (_, snapshot) {
+                      final isPlaying = snapshot.data ?? _audio.playing;
+                      return IconButton(
+                        onPressed: _isLoadingTrack ? null : _togglePlayPause,
+                        icon: _isLoadingTrack
+                            ? const SizedBox(
+                                width: 24,
+                                height: 24,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2.4,
+                                ),
+                              )
+                            : Icon(
+                                isPlaying
+                                    ? PhosphorIconsRegular.pauseCircle
+                                    : PhosphorIconsRegular.playCircle,
+                                size: 34,
                               ),
-                            )
-                          : Icon(
-                              snapshot.data == true
-                                  ? PhosphorIconsRegular.pauseCircle
-                                  : PhosphorIconsRegular.playCircle,
-                              size: 34,
-                            ),
-                    ),
+                      );
+                    },
                   ),
                   IconButton(
                     onPressed: _next,
@@ -2121,14 +2399,27 @@ class _SonixHomeState extends State<SonixHome>
     );
   }
 
+  Duration? get _currentTrackDuration {
+    final playerDur = _audio.duration;
+    if (playerDur != null && playerDur > Duration.zero) {
+      return playerDur;
+    }
+    if (_current != null && _current!.duration > 0) {
+      return Duration(seconds: _current!.duration);
+    }
+    return playerDur;
+  }
+
   Widget _progressBar({double minHeight = 3}) => StreamBuilder<Duration?>(
     stream: _audio.durationStream,
+    initialData: _currentTrackDuration,
     builder: (_, durationSnapshot) {
-      final duration = durationSnapshot.data;
+      final duration = durationSnapshot.data ?? _currentTrackDuration;
       return StreamBuilder<Duration>(
         stream: _audio.positionStream,
+        initialData: _audio.position,
         builder: (_, positionSnapshot) {
-          final position = positionSnapshot.data ?? Duration.zero;
+          final position = positionSnapshot.data ?? _audio.position;
           final total = duration?.inMilliseconds ?? 0;
           final value = total <= 0
               ? 0.0
@@ -2216,7 +2507,9 @@ class _SonixHomeState extends State<SonixHome>
               AnimatedBuilder(
                 animation: _gradientAnim,
                 builder: (context, child) {
-                  final ease = Curves.easeInOutCubic.transform(_gradientAnim.value);
+                  final ease = Curves.easeInOutCubic.transform(
+                    _gradientAnim.value,
+                  );
                   final breath = math.sin(ease * math.pi);
                   final shift = ease * 2.0 - 1.0;
                   return ImageFiltered(
@@ -2329,11 +2622,16 @@ class _SonixHomeState extends State<SonixHome>
                                   : Colors.white,
                               size: 22,
                             ),
-                            tooltip: _likedSongs.containsKey(track.id) ? 'Unlike' : 'Like',
+                            tooltip: _likedSongs.containsKey(track.id)
+                                ? 'Unlike'
+                                : 'Like',
                           ),
                           IconButton(
                             onPressed: () => _showSongOptions(track),
-                            icon: const Icon(PhosphorIconsRegular.dotsThreeVertical, size: 22),
+                            icon: const Icon(
+                              PhosphorIconsRegular.dotsThreeVertical,
+                              size: 22,
+                            ),
                             tooltip: 'Options',
                           ),
                           IconButton(
@@ -2443,25 +2741,29 @@ class _SonixHomeState extends State<SonixHome>
                         const SizedBox(width: 12),
                         StreamBuilder<bool>(
                           stream: _audio.playingStream,
-                          builder: (_, snapshot) => IconButton(
-                            onPressed: _isLoadingTrack
-                                ? null
-                                : _togglePlayPause,
-                            icon: _isLoadingTrack
-                                ? const SizedBox(
-                                    width: 52,
-                                    height: 52,
-                                    child: CircularProgressIndicator(
-                                      strokeWidth: 3,
+                          initialData: _audio.playing,
+                          builder: (_, snapshot) {
+                            final isPlaying = snapshot.data ?? _audio.playing;
+                            return IconButton(
+                              onPressed: _isLoadingTrack
+                                  ? null
+                                  : _togglePlayPause,
+                              icon: _isLoadingTrack
+                                  ? const SizedBox(
+                                      width: 52,
+                                      height: 52,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 3,
+                                      ),
+                                    )
+                                  : Icon(
+                                      isPlaying
+                                          ? PhosphorIconsRegular.pauseCircle
+                                          : PhosphorIconsRegular.playCircle,
+                                      size: 64,
                                     ),
-                                  )
-                                : Icon(
-                                    snapshot.data == true
-                                        ? PhosphorIconsRegular.pauseCircle
-                                        : PhosphorIconsRegular.playCircle,
-                                    size: 64,
-                                  ),
-                          ),
+                            );
+                          },
                         ),
                         const SizedBox(width: 12),
                         IconButton(
@@ -2486,13 +2788,21 @@ class _SonixHomeState extends State<SonixHome>
 
   Widget _fullScreenSlider() => StreamBuilder<Duration?>(
     stream: _audio.durationStream,
+    initialData: _currentTrackDuration,
     builder: (_, durationSnapshot) {
-      final duration = durationSnapshot.data ?? Duration.zero;
+      var duration = durationSnapshot.data ?? _currentTrackDuration;
+      if (duration == null || duration == Duration.zero) {
+        if (_current != null && _current!.duration > 0) {
+          duration = Duration(seconds: _current!.duration);
+        }
+      }
+      duration ??= Duration.zero;
       final maxMs = duration.inMilliseconds.toDouble();
       return StreamBuilder<Duration>(
         stream: _audio.positionStream,
+        initialData: _audio.position,
         builder: (_, positionSnapshot) {
-          final position = positionSnapshot.data ?? Duration.zero;
+          final position = positionSnapshot.data ?? _audio.position;
           final value = maxMs <= 0
               ? 0.0
               : position.inMilliseconds.clamp(0, maxMs.toInt()).toDouble();
@@ -2509,7 +2819,7 @@ class _SonixHomeState extends State<SonixHome>
                 ),
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [Text(_time(position)), Text(_time(duration))],
+                  children: [Text(_time(position)), Text(_time(duration!))],
                 ),
               ],
             ),
@@ -2592,7 +2902,12 @@ class _SonixHomeState extends State<SonixHome>
       builder: (ctx) => SafeArea(
         top: false,
         child: Container(
-          padding: EdgeInsets.fromLTRB(20, 16, 20, 16 + MediaQuery.paddingOf(ctx).bottom),
+          padding: EdgeInsets.fromLTRB(
+            20,
+            16,
+            20,
+            16 + MediaQuery.paddingOf(ctx).bottom,
+          ),
           decoration: const BoxDecoration(
             color: Color(0xff16161b),
             borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
@@ -2601,87 +2916,117 @@ class _SonixHomeState extends State<SonixHome>
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-            Container(
-              width: 40,
-              height: 4,
-              decoration: BoxDecoration(
-                color: Colors.white24,
-                borderRadius: BorderRadius.circular(2),
-              ),
-            ),
-            const SizedBox(height: 18),
-            ListTile(
-              contentPadding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
-              leading: Container(
-                width: 44,
-                height: 44,
+              Container(
+                width: 40,
+                height: 4,
                 decoration: BoxDecoration(
-                  gradient: const LinearGradient(
-                    colors: [Color(0xffff416c), Color(0xffff4b2b)],
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                  ),
-                  borderRadius: BorderRadius.circular(12),
-                  boxShadow: [
-                    BoxShadow(
-                      color: const Color(0xffff416c).withValues(alpha: .3),
-                      blurRadius: 10,
-                      offset: const Offset(0, 3),
+                  color: Colors.white24,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+              const SizedBox(height: 18),
+              ListTile(
+                contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 4,
+                  vertical: 4,
+                ),
+                leading: Container(
+                  width: 44,
+                  height: 44,
+                  decoration: BoxDecoration(
+                    gradient: const LinearGradient(
+                      colors: [Color(0xffff416c), Color(0xffff4b2b)],
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
                     ),
-                  ],
+                    borderRadius: BorderRadius.circular(12),
+                    boxShadow: [
+                      BoxShadow(
+                        color: const Color(0xffff416c).withValues(alpha: .3),
+                        blurRadius: 10,
+                        offset: const Offset(0, 3),
+                      ),
+                    ],
+                  ),
+                  child: const Icon(
+                    PhosphorIconsFill.heart,
+                    color: Colors.white,
+                    size: 22,
+                  ),
                 ),
-                child: const Icon(PhosphorIconsFill.heart, color: Colors.white, size: 22),
-              ),
-              title: const Text(
-                'Liked Songs',
-                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: Colors.white),
-              ),
-              subtitle: Text(
-                '${_likedSongs.length} ${_likedSongs.length == 1 ? 'track' : 'tracks'}',
-                style: const TextStyle(fontSize: 12, color: _muted),
-              ),
-              trailing: const Icon(PhosphorIconsRegular.caretRight, color: _muted, size: 20),
-              onTap: () {
-                Navigator.of(ctx).pop();
-                setState(() {
-                  _viewingLikedSongs = true;
-                  _openedPlaylist = null;
-                  _homeMode = false;
-                });
-              },
-            ),
-            ListTile(
-              contentPadding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
-              leading: Container(
-                width: 44,
-                height: 44,
-                decoration: BoxDecoration(
-                  color: Colors.white.withValues(alpha: .08),
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: Colors.white12),
+                title: const Text(
+                  'Liked Songs',
+                  style: TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.w700,
+                    color: Colors.white,
+                  ),
                 ),
-                child: const Icon(PhosphorIconsRegular.gearSix, color: Colors.white, size: 22),
+                subtitle: Text(
+                  '${_likedSongs.length} ${_likedSongs.length == 1 ? 'track' : 'tracks'}',
+                  style: const TextStyle(fontSize: 12, color: _muted),
+                ),
+                trailing: const Icon(
+                  PhosphorIconsRegular.caretRight,
+                  color: _muted,
+                  size: 20,
+                ),
+                onTap: () {
+                  Navigator.of(ctx).pop();
+                  setState(() {
+                    _viewingLikedSongs = true;
+                    _openedPlaylist = null;
+                    _homeMode = false;
+                  });
+                },
               ),
-              title: const Text(
-                'Settings',
-                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: Colors.white),
+              ListTile(
+                contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 4,
+                  vertical: 4,
+                ),
+                leading: Container(
+                  width: 44,
+                  height: 44,
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: .08),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: Colors.white12),
+                  ),
+                  child: const Icon(
+                    PhosphorIconsRegular.gearSix,
+                    color: Colors.white,
+                    size: 22,
+                  ),
+                ),
+                title: const Text(
+                  'Settings',
+                  style: TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.w700,
+                    color: Colors.white,
+                  ),
+                ),
+                subtitle: const Text(
+                  'Audio quality & profile preferences',
+                  style: TextStyle(fontSize: 12, color: _muted),
+                ),
+                trailing: const Icon(
+                  PhosphorIconsRegular.caretRight,
+                  color: _muted,
+                  size: 20,
+                ),
+                onTap: () {
+                  Navigator.of(ctx).pop();
+                  _openSettings();
+                },
               ),
-              subtitle: const Text(
-                'Audio quality & profile preferences',
-                style: TextStyle(fontSize: 12, color: _muted),
-              ),
-              trailing: const Icon(PhosphorIconsRegular.caretRight, color: _muted, size: 20),
-              onTap: () {
-                Navigator.of(ctx).pop();
-                _openSettings();
-              },
-            ),
-          ],
+            ],
+          ),
         ),
       ),
-    ),
-  );
-}
+    );
+  }
 
   Duration? get _sleepTimerRemaining {
     if (_sleepTimerEndTime == null) return null;
@@ -2712,14 +3057,23 @@ class _SonixHomeState extends State<SonixHome>
           SnackBar(
             content: const Row(
               children: [
-                Icon(PhosphorIconsRegular.moonStars, color: Colors.white, size: 20),
+                Icon(
+                  PhosphorIconsRegular.moonStars,
+                  color: Colors.white,
+                  size: 20,
+                ),
                 SizedBox(width: 10),
-                Text('Sleep timer reached. Music paused.', style: TextStyle(fontWeight: FontWeight.w600)),
+                Text(
+                  'Sleep timer reached. Music paused.',
+                  style: TextStyle(fontWeight: FontWeight.w600),
+                ),
               ],
             ),
             backgroundColor: const Color(0xee1c1c22),
             behavior: SnackBarBehavior.floating,
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(10),
+            ),
             duration: const Duration(seconds: 4),
           ),
         );
@@ -2737,7 +3091,9 @@ class _SonixHomeState extends State<SonixHome>
 
   void _openSettings() {
     final nameCtrl = TextEditingController(text: _userProfile?.name ?? '');
-    final ageCtrl = TextEditingController(text: _userProfile?.age != null ? '${_userProfile!.age}' : '');
+    final ageCtrl = TextEditingController(
+      text: _userProfile?.age != null ? '${_userProfile!.age}' : '',
+    );
     final hoursCtrl = TextEditingController(text: '0');
     final minutesCtrl = TextEditingController(text: '30');
     String selectedQuality = _songQuality;
@@ -2780,486 +3136,647 @@ class _SonixHomeState extends State<SonixHome>
           return SafeArea(
             top: false,
             child: Padding(
-              padding: EdgeInsets.only(bottom: MediaQuery.of(ctx).viewInsets.bottom),
+              padding: EdgeInsets.only(
+                bottom: MediaQuery.of(ctx).viewInsets.bottom,
+              ),
               child: Container(
-              constraints: BoxConstraints(
-                maxHeight: MediaQuery.of(ctx).size.height * 0.85,
-              ),
-              padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
-              decoration: const BoxDecoration(
-                color: Color(0xff16161b),
-                borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-                border: Border(top: BorderSide(color: Colors.white12)),
-              ),
-              child: SingleChildScrollView(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                  Center(
-                    child: Container(
-                      width: 40,
-                      height: 4,
-                      decoration: BoxDecoration(
-                        color: Colors.white24,
-                        borderRadius: BorderRadius.circular(2),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 18),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                constraints: BoxConstraints(
+                  maxHeight: MediaQuery.of(ctx).size.height * 0.85,
+                ),
+                padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+                decoration: const BoxDecoration(
+                  color: Color(0xff16161b),
+                  borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+                  border: Border(top: BorderSide(color: Colors.white12)),
+                ),
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      const Text(
-                        'Settings',
-                        style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800, color: Colors.white),
-                      ),
-                      IconButton(
-                        icon: const Icon(PhosphorIconsRegular.x, size: 20, color: _muted),
-                        onPressed: () => Navigator.of(ctx).pop(),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 16),
-                  const Text(
-                    'Song Audio Quality',
-                    style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: _muted, letterSpacing: 0.5),
-                  ),
-                  const SizedBox(height: 10),
-                  ...qualityOptions.map((opt) {
-                    final isSelected = selectedQuality == opt['value'];
-                    return Container(
-                      margin: const EdgeInsets.only(bottom: 8),
-                      decoration: BoxDecoration(
-                        color: isSelected
-                            ? Colors.white.withValues(alpha: .1)
-                            : Colors.white.withValues(alpha: .04),
-                        borderRadius: BorderRadius.circular(12),
-                        border: Border.all(
-                          color: isSelected ? Colors.white70 : Colors.white10,
-                          width: isSelected ? 1.2 : 1,
-                        ),
-                      ),
-                      child: InkWell(
-                        borderRadius: BorderRadius.circular(12),
-                        onTap: () async {
-                          setModalState(() => selectedQuality = opt['value']!);
-                          setState(() => _songQuality = opt['value']!);
-                          await UserStorage.saveSongQuality(opt['value']!);
-                        },
-                        child: Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                          child: Row(
-                            children: [
-                              Icon(
-                                isSelected
-                                    ? PhosphorIconsFill.checkCircle
-                                    : PhosphorIconsRegular.circle,
-                                color: isSelected ? Colors.white : _muted,
-                                size: 20,
-                              ),
-                              const SizedBox(width: 12),
-                              Expanded(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(
-                                      opt['label']!,
-                                      style: TextStyle(
-                                        fontSize: 14,
-                                        fontWeight: isSelected ? FontWeight.w700 : FontWeight.w500,
-                                        color: Colors.white,
-                                      ),
-                                    ),
-                                    const SizedBox(height: 2),
-                                    Text(
-                                      opt['desc']!,
-                                      style: const TextStyle(fontSize: 11, color: _muted),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ],
+                      Center(
+                        child: Container(
+                          width: 40,
+                          height: 4,
+                          decoration: BoxDecoration(
+                            color: Colors.white24,
+                            borderRadius: BorderRadius.circular(2),
                           ),
                         ),
                       ),
-                    );
-                  }),
-                  const SizedBox(height: 20),
-                  const Divider(color: Colors.white12, height: 1),
-                  const SizedBox(height: 18),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      const Row(
+                      const SizedBox(height: 18),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
-                          Icon(PhosphorIconsRegular.moonStars, color: Colors.white, size: 18),
-                          SizedBox(width: 8),
-                          Text(
-                            'Sleep Timer',
-                            style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: _muted, letterSpacing: 0.5),
+                          const Text(
+                            'Settings',
+                            style: TextStyle(
+                              fontSize: 20,
+                              fontWeight: FontWeight.w800,
+                              color: Colors.white,
+                            ),
+                          ),
+                          IconButton(
+                            icon: const Icon(
+                              PhosphorIconsRegular.x,
+                              size: 20,
+                              color: _muted,
+                            ),
+                            onPressed: () => Navigator.of(ctx).pop(),
                           ),
                         ],
                       ),
-                      if (_sleepTimerEndTime != null)
-                        Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+                      const SizedBox(height: 16),
+                      const Text(
+                        'Song Audio Quality',
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w700,
+                          color: _muted,
+                          letterSpacing: 0.5,
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      ...qualityOptions.map((opt) {
+                        final isSelected = selectedQuality == opt['value'];
+                        return Container(
+                          margin: const EdgeInsets.only(bottom: 8),
                           decoration: BoxDecoration(
-                            color: Colors.indigoAccent.withValues(alpha: .2),
-                            borderRadius: BorderRadius.circular(10),
-                            border: Border.all(color: Colors.indigoAccent.withValues(alpha: .4)),
+                            color: isSelected
+                                ? Colors.white.withValues(alpha: .1)
+                                : Colors.white.withValues(alpha: .04),
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(
+                              color: isSelected
+                                  ? Colors.white70
+                                  : Colors.white10,
+                              width: isSelected ? 1.2 : 1,
+                            ),
                           ),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
+                          child: InkWell(
+                            borderRadius: BorderRadius.circular(12),
+                            onTap: () async {
+                              setModalState(
+                                () => selectedQuality = opt['value']!,
+                              );
+                              setState(() => _songQuality = opt['value']!);
+                              await UserStorage.saveSongQuality(opt['value']!);
+                            },
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 14,
+                                vertical: 12,
+                              ),
+                              child: Row(
+                                children: [
+                                  Icon(
+                                    isSelected
+                                        ? PhosphorIconsFill.checkCircle
+                                        : PhosphorIconsRegular.circle,
+                                    color: isSelected ? Colors.white : _muted,
+                                    size: 20,
+                                  ),
+                                  const SizedBox(width: 12),
+                                  Expanded(
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
+                                        Text(
+                                          opt['label']!,
+                                          style: TextStyle(
+                                            fontSize: 14,
+                                            fontWeight: isSelected
+                                                ? FontWeight.w700
+                                                : FontWeight.w500,
+                                            color: Colors.white,
+                                          ),
+                                        ),
+                                        const SizedBox(height: 2),
+                                        Text(
+                                          opt['desc']!,
+                                          style: const TextStyle(
+                                            fontSize: 11,
+                                            color: _muted,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        );
+                      }),
+                      const SizedBox(height: 20),
+                      const Divider(color: Colors.white12, height: 1),
+                      const SizedBox(height: 18),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          const Row(
                             children: [
-                              Container(
-                                width: 6,
-                                height: 6,
-                                decoration: const BoxDecoration(
-                                  color: Colors.indigoAccent,
-                                  shape: BoxShape.circle,
+                              Icon(
+                                PhosphorIconsRegular.moonStars,
+                                color: Colors.white,
+                                size: 18,
+                              ),
+                              SizedBox(width: 8),
+                              Text(
+                                'Sleep Timer',
+                                style: TextStyle(
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w700,
+                                  color: _muted,
+                                  letterSpacing: 0.5,
                                 ),
                               ),
-                              const SizedBox(width: 6),
-                              Text(
-                                () {
-                                  final rem = _sleepTimerRemaining ?? Duration.zero;
-                                  final h = rem.inHours;
-                                  final m = rem.inMinutes % 60;
-                                  final s = rem.inSeconds % 60;
-                                  if (h > 0) return '${h}h ${m}m ${s}s left';
-                                  return '${m}m ${s}s left';
-                                }(),
-                                style: const TextStyle(
-                                  fontSize: 11,
-                                  fontWeight: FontWeight.w700,
-                                  color: Colors.white,
+                            ],
+                          ),
+                          if (_sleepTimerEndTime != null)
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 9,
+                                vertical: 4,
+                              ),
+                              decoration: BoxDecoration(
+                                color: Colors.indigoAccent.withValues(
+                                  alpha: .2,
+                                ),
+                                borderRadius: BorderRadius.circular(10),
+                                border: Border.all(
+                                  color: Colors.indigoAccent.withValues(
+                                    alpha: .4,
+                                  ),
+                                ),
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Container(
+                                    width: 6,
+                                    height: 6,
+                                    decoration: const BoxDecoration(
+                                      color: Colors.indigoAccent,
+                                      shape: BoxShape.circle,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 6),
+                                  Text(
+                                    () {
+                                      final rem =
+                                          _sleepTimerRemaining ?? Duration.zero;
+                                      final h = rem.inHours;
+                                      final m = rem.inMinutes % 60;
+                                      final s = rem.inSeconds % 60;
+                                      if (h > 0) {
+                                        return '${h}h ${m}m ${s}s left';
+                                      }
+                                      return '${m}m ${s}s left';
+                                    }(),
+                                    style: const TextStyle(
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.w700,
+                                      color: Colors.white,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      if (_sleepTimerEndTime != null) ...[
+                        Container(
+                          padding: const EdgeInsets.all(14),
+                          decoration: BoxDecoration(
+                            color: Colors.white.withValues(alpha: .04),
+                            borderRadius: BorderRadius.circular(14),
+                            border: Border.all(color: Colors.white12),
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                children: [
+                                  Container(
+                                    padding: const EdgeInsets.all(8),
+                                    decoration: BoxDecoration(
+                                      color: Colors.indigoAccent.withValues(
+                                        alpha: .2,
+                                      ),
+                                      borderRadius: BorderRadius.circular(8),
+                                    ),
+                                    child: const Icon(
+                                      PhosphorIconsRegular.clockCountdown,
+                                      color: Colors.indigoAccent,
+                                      size: 20,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 12),
+                                  const Expanded(
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
+                                        Text(
+                                          'Sleep Timer is Active',
+                                          style: TextStyle(
+                                            fontSize: 14,
+                                            fontWeight: FontWeight.w700,
+                                            color: Colors.white,
+                                          ),
+                                        ),
+                                        SizedBox(height: 2),
+                                        Text(
+                                          'Playback will stop automatically',
+                                          style: TextStyle(
+                                            fontSize: 12,
+                                            color: _muted,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 12),
+                              SizedBox(
+                                width: double.infinity,
+                                height: 40,
+                                child: OutlinedButton.icon(
+                                  onPressed: () {
+                                    _cancelSleepTimer();
+                                    setModalState(() {});
+                                    ScaffoldMessenger.of(context).showSnackBar(
+                                      SnackBar(
+                                        content: const Text(
+                                          'Sleep timer turned off',
+                                        ),
+                                        behavior: SnackBarBehavior.floating,
+                                        shape: RoundedRectangleBorder(
+                                          borderRadius: BorderRadius.circular(
+                                            10,
+                                          ),
+                                        ),
+                                        duration: const Duration(seconds: 2),
+                                      ),
+                                    );
+                                  },
+                                  icon: const Icon(
+                                    PhosphorIconsRegular.xCircle,
+                                    size: 18,
+                                    color: Colors.redAccent,
+                                  ),
+                                  label: const Text(
+                                    'Turn Off Sleep Timer',
+                                    style: TextStyle(
+                                      color: Colors.redAccent,
+                                      fontWeight: FontWeight.w700,
+                                      fontSize: 13,
+                                    ),
+                                  ),
+                                  style: OutlinedButton.styleFrom(
+                                    side: BorderSide(
+                                      color: Colors.redAccent.withValues(
+                                        alpha: .5,
+                                      ),
+                                    ),
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(10),
+                                    ),
+                                  ),
                                 ),
                               ),
                             ],
                           ),
                         ),
-                    ],
-                  ),
-                  const SizedBox(height: 12),
-                  if (_sleepTimerEndTime != null) ...[
-                    Container(
-                      padding: const EdgeInsets.all(14),
-                      decoration: BoxDecoration(
-                        color: Colors.white.withValues(alpha: .04),
-                        borderRadius: BorderRadius.circular(14),
-                        border: Border.all(color: Colors.white12),
-                      ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Row(
-                            children: [
-                              Container(
-                                padding: const EdgeInsets.all(8),
-                                decoration: BoxDecoration(
-                                  color: Colors.indigoAccent.withValues(alpha: .2),
-                                  borderRadius: BorderRadius.circular(8),
-                                ),
-                                child: const Icon(
-                                  PhosphorIconsRegular.clockCountdown,
-                                  color: Colors.indigoAccent,
-                                  size: 20,
-                                ),
-                              ),
-                              const SizedBox(width: 12),
-                              const Expanded(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(
-                                      'Sleep Timer is Active',
-                                      style: TextStyle(
-                                        fontSize: 14,
-                                        fontWeight: FontWeight.w700,
-                                        color: Colors.white,
+                      ] else ...[
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  const Text(
+                                    'Hours',
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w600,
+                                      color: _muted,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 6),
+                                  TextField(
+                                    controller: hoursCtrl,
+                                    keyboardType: TextInputType.number,
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 16,
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                    textAlign: TextAlign.center,
+                                    decoration: InputDecoration(
+                                      hintText: '0',
+                                      hintStyle: const TextStyle(color: _muted),
+                                      filled: true,
+                                      fillColor: Colors.white.withValues(
+                                        alpha: .06,
+                                      ),
+                                      contentPadding:
+                                          const EdgeInsets.symmetric(
+                                            vertical: 12,
+                                          ),
+                                      border: OutlineInputBorder(
+                                        borderRadius: BorderRadius.circular(12),
+                                        borderSide: BorderSide.none,
                                       ),
                                     ),
-                                    SizedBox(height: 2),
-                                    Text(
-                                      'Playback will stop automatically',
-                                      style: TextStyle(fontSize: 12, color: _muted),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            const SizedBox(width: 14),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  const Text(
+                                    'Minutes',
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w600,
+                                      color: _muted,
                                     ),
-                                  ],
+                                  ),
+                                  const SizedBox(height: 6),
+                                  TextField(
+                                    controller: minutesCtrl,
+                                    keyboardType: TextInputType.number,
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 16,
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                    textAlign: TextAlign.center,
+                                    decoration: InputDecoration(
+                                      hintText: '30',
+                                      hintStyle: const TextStyle(color: _muted),
+                                      filled: true,
+                                      fillColor: Colors.white.withValues(
+                                        alpha: .06,
+                                      ),
+                                      contentPadding:
+                                          const EdgeInsets.symmetric(
+                                            vertical: 12,
+                                          ),
+                                      border: OutlineInputBorder(
+                                        borderRadius: BorderRadius.circular(12),
+                                        borderSide: BorderSide.none,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 10),
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: [
+                            for (final preset in [
+                              {'label': '15 min', 'h': '0', 'm': '15'},
+                              {'label': '30 min', 'h': '0', 'm': '30'},
+                              {'label': '45 min', 'h': '0', 'm': '45'},
+                              {'label': '1 hr', 'h': '1', 'm': '0'},
+                              {'label': '2 hrs', 'h': '2', 'm': '0'},
+                            ])
+                              GestureDetector(
+                                onTap: () {
+                                  setModalState(() {
+                                    hoursCtrl.text = preset['h']!;
+                                    minutesCtrl.text = preset['m']!;
+                                  });
+                                },
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 11,
+                                    vertical: 5,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: Colors.white.withValues(alpha: .07),
+                                    borderRadius: BorderRadius.circular(20),
+                                    border: Border.all(color: Colors.white12),
+                                  ),
+                                  child: Text(
+                                    preset['label']!,
+                                    style: const TextStyle(
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w600,
+                                      color: Colors.white,
+                                    ),
+                                  ),
                                 ),
                               ),
-                            ],
-                          ),
-                          const SizedBox(height: 12),
-                          SizedBox(
-                            width: double.infinity,
-                            height: 40,
-                            child: OutlinedButton.icon(
-                              onPressed: () {
-                                _cancelSleepTimer();
-                                setModalState(() {});
+                          ],
+                        ),
+                        const SizedBox(height: 14),
+                        SizedBox(
+                          width: double.infinity,
+                          height: 42,
+                          child: ElevatedButton.icon(
+                            onPressed: () {
+                              final h =
+                                  int.tryParse(hoursCtrl.text.trim()) ?? 0;
+                              final m =
+                                  int.tryParse(minutesCtrl.text.trim()) ?? 0;
+                              final totalSeconds = (h * 3600) + (m * 60);
+                              if (totalSeconds <= 0) {
                                 ScaffoldMessenger.of(context).showSnackBar(
                                   SnackBar(
-                                    content: const Text('Sleep timer turned off'),
+                                    content: const Text(
+                                      'Please enter a duration greater than 0 minutes',
+                                    ),
                                     behavior: SnackBarBehavior.floating,
-                                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(10),
+                                    ),
                                     duration: const Duration(seconds: 2),
                                   ),
                                 );
-                              },
-                              icon: const Icon(PhosphorIconsRegular.xCircle, size: 18, color: Colors.redAccent),
-                              label: const Text(
-                                'Turn Off Sleep Timer',
-                                style: TextStyle(color: Colors.redAccent, fontWeight: FontWeight.w700, fontSize: 13),
-                              ),
-                              style: OutlinedButton.styleFrom(
-                                side: BorderSide(color: Colors.redAccent.withValues(alpha: .5)),
-                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ] else ...[
-                    Row(
-                      children: [
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              const Text(
-                                'Hours',
-                                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: _muted),
-                              ),
-                              const SizedBox(height: 6),
-                              TextField(
-                                controller: hoursCtrl,
-                                keyboardType: TextInputType.number,
-                                style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w700),
-                                textAlign: TextAlign.center,
-                                decoration: InputDecoration(
-                                  hintText: '0',
-                                  hintStyle: const TextStyle(color: _muted),
-                                  filled: true,
-                                  fillColor: Colors.white.withValues(alpha: .06),
-                                  contentPadding: const EdgeInsets.symmetric(vertical: 12),
-                                  border: OutlineInputBorder(
-                                    borderRadius: BorderRadius.circular(12),
-                                    borderSide: BorderSide.none,
+                                return;
+                              }
+                              _setSleepTimer(Duration(seconds: totalSeconds));
+                              setModalState(() {});
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(
+                                  content: Text(
+                                    h > 0
+                                        ? 'Sleep timer set for $h hour${h > 1 ? 's' : ''} $m minute${m != 1 ? 's' : ''}'
+                                        : 'Sleep timer set for $m minute${m != 1 ? 's' : ''}',
                                   ),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                        const SizedBox(width: 14),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              const Text(
-                                'Minutes',
-                                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: _muted),
-                              ),
-                              const SizedBox(height: 6),
-                              TextField(
-                                controller: minutesCtrl,
-                                keyboardType: TextInputType.number,
-                                style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w700),
-                                textAlign: TextAlign.center,
-                                decoration: InputDecoration(
-                                  hintText: '30',
-                                  hintStyle: const TextStyle(color: _muted),
-                                  filled: true,
-                                  fillColor: Colors.white.withValues(alpha: .06),
-                                  contentPadding: const EdgeInsets.symmetric(vertical: 12),
-                                  border: OutlineInputBorder(
-                                    borderRadius: BorderRadius.circular(12),
-                                    borderSide: BorderSide.none,
+                                  behavior: SnackBarBehavior.floating,
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(10),
                                   ),
+                                  duration: const Duration(seconds: 2),
                                 ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 10),
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      children: [
-                        for (final preset in [
-                          {'label': '15 min', 'h': '0', 'm': '15'},
-                          {'label': '30 min', 'h': '0', 'm': '30'},
-                          {'label': '45 min', 'h': '0', 'm': '45'},
-                          {'label': '1 hr', 'h': '1', 'm': '0'},
-                          {'label': '2 hrs', 'h': '2', 'm': '0'},
-                        ])
-                          GestureDetector(
-                            onTap: () {
-                              setModalState(() {
-                                hoursCtrl.text = preset['h']!;
-                                minutesCtrl.text = preset['m']!;
-                              });
+                              );
                             },
-                            child: Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 5),
-                              decoration: BoxDecoration(
-                                color: Colors.white.withValues(alpha: .07),
-                                borderRadius: BorderRadius.circular(20),
-                                border: Border.all(color: Colors.white12),
+                            icon: const Icon(
+                              PhosphorIconsRegular.timer,
+                              size: 18,
+                            ),
+                            label: const Text(
+                              'Start Sleep Timer',
+                              style: TextStyle(
+                                fontWeight: FontWeight.w700,
+                                fontSize: 14,
                               ),
-                              child: Text(
-                                preset['label']!,
-                                style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Colors.white),
+                            ),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.white.withValues(
+                                alpha: .15,
                               ),
+                              foregroundColor: Colors.white,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                              elevation: 0,
                             ),
                           ),
+                        ),
                       ],
-                    ),
-                    const SizedBox(height: 14),
-                    SizedBox(
-                      width: double.infinity,
-                      height: 42,
-                      child: ElevatedButton.icon(
-                        onPressed: () {
-                          final h = int.tryParse(hoursCtrl.text.trim()) ?? 0;
-                          final m = int.tryParse(minutesCtrl.text.trim()) ?? 0;
-                          final totalSeconds = (h * 3600) + (m * 60);
-                          if (totalSeconds <= 0) {
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              SnackBar(
-                                content: const Text('Please enter a duration greater than 0 minutes'),
-                                behavior: SnackBarBehavior.floating,
-                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                                duration: const Duration(seconds: 2),
-                              ),
-                            );
-                            return;
-                          }
-                          _setSleepTimer(Duration(seconds: totalSeconds));
-                          setModalState(() {});
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            SnackBar(
-                              content: Text(
-                                h > 0
-                                    ? 'Sleep timer set for $h hour${h > 1 ? 's' : ''} $m minute${m != 1 ? 's' : ''}'
-                                    : 'Sleep timer set for $m minute${m != 1 ? 's' : ''}',
-                              ),
-                              behavior: SnackBarBehavior.floating,
-                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                              duration: const Duration(seconds: 2),
+                      const SizedBox(height: 20),
+                      const Divider(color: Colors.white12, height: 1),
+                      const SizedBox(height: 18),
+                      const Text(
+                        'Edit Profile',
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w700,
+                          color: _muted,
+                          letterSpacing: 0.5,
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: nameCtrl,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 15,
+                        ),
+                        decoration: InputDecoration(
+                          labelText: 'Your Name',
+                          labelStyle: const TextStyle(color: _muted),
+                          prefixIcon: const Icon(
+                            PhosphorIconsRegular.user,
+                            color: _muted,
+                            size: 20,
+                          ),
+                          filled: true,
+                          fillColor: Colors.white.withValues(alpha: .06),
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(14),
+                            borderSide: BorderSide.none,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      TextField(
+                        controller: ageCtrl,
+                        keyboardType: TextInputType.number,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 15,
+                        ),
+                        decoration: InputDecoration(
+                          labelText: 'Your Age',
+                          labelStyle: const TextStyle(color: _muted),
+                          prefixIcon: const Icon(
+                            PhosphorIconsRegular.calendar,
+                            color: _muted,
+                            size: 20,
+                          ),
+                          filled: true,
+                          fillColor: Colors.white.withValues(alpha: .06),
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(14),
+                            borderSide: BorderSide.none,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 22),
+                      SizedBox(
+                        width: double.infinity,
+                        height: 48,
+                        child: ElevatedButton(
+                          onPressed: () async {
+                            final name = nameCtrl.text.trim();
+                            final age = int.tryParse(ageCtrl.text.trim());
+                            if (name.isNotEmpty && age != null && age > 0) {
+                              final updated = UserProfile(name: name, age: age);
+                              await UserStorage.saveProfile(
+                                name: name,
+                                age: age,
+                              );
+                              if (mounted) {
+                                setState(() => _userProfile = updated);
+                              }
+                              if (ctx.mounted) {
+                                Navigator.of(ctx).pop();
+                              }
+                              if (mounted) {
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  SnackBar(
+                                    content: const Text(
+                                      'Profile updated successfully',
+                                    ),
+                                    behavior: SnackBarBehavior.floating,
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(10),
+                                    ),
+                                    duration: const Duration(seconds: 2),
+                                  ),
+                                );
+                              }
+                            }
+                          },
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.white,
+                            foregroundColor: Colors.black,
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(14),
                             ),
-                          );
-                        },
-                        icon: const Icon(PhosphorIconsRegular.timer, size: 18),
-                        label: const Text(
-                          'Start Sleep Timer',
-                          style: TextStyle(fontWeight: FontWeight.w700, fontSize: 14),
-                        ),
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: Colors.white.withValues(alpha: .15),
-                          foregroundColor: Colors.white,
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                          elevation: 0,
+                            elevation: 0,
+                          ),
+                          child: const Text(
+                            'Save Changes',
+                            style: TextStyle(
+                              fontSize: 15,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
                         ),
                       ),
-                    ),
-                  ],
-                  const SizedBox(height: 20),
-                  const Divider(color: Colors.white12, height: 1),
-                  const SizedBox(height: 18),
-                  const Text(
-                    'Edit Profile',
-                    style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: _muted, letterSpacing: 0.5),
-                  ),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: nameCtrl,
-                    style: const TextStyle(color: Colors.white, fontSize: 15),
-                    decoration: InputDecoration(
-                      labelText: 'Your Name',
-                      labelStyle: const TextStyle(color: _muted),
-                      prefixIcon: const Icon(PhosphorIconsRegular.user, color: _muted, size: 20),
-                      filled: true,
-                      fillColor: Colors.white.withValues(alpha: .06),
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(14),
-                        borderSide: BorderSide.none,
+                      SizedBox(
+                        height:
+                            math.max(MediaQuery.paddingOf(ctx).bottom, 24.0) +
+                            16.0,
                       ),
-                    ),
+                    ],
                   ),
-                  const SizedBox(height: 14),
-                  TextField(
-                    controller: ageCtrl,
-                    keyboardType: TextInputType.number,
-                    style: const TextStyle(color: Colors.white, fontSize: 15),
-                    decoration: InputDecoration(
-                      labelText: 'Your Age',
-                      labelStyle: const TextStyle(color: _muted),
-                      prefixIcon: const Icon(PhosphorIconsRegular.calendar, color: _muted, size: 20),
-                      filled: true,
-                      fillColor: Colors.white.withValues(alpha: .06),
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(14),
-                        borderSide: BorderSide.none,
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 22),
-                  SizedBox(
-                    width: double.infinity,
-                    height: 48,
-                    child: ElevatedButton(
-                      onPressed: () async {
-                        final name = nameCtrl.text.trim();
-                        final age = int.tryParse(ageCtrl.text.trim());
-                        if (name.isNotEmpty && age != null && age > 0) {
-                          final updated = UserProfile(name: name, age: age);
-                          await UserStorage.saveProfile(name: name, age: age);
-                          if (mounted) {
-                            setState(() => _userProfile = updated);
-                          }
-                          if (ctx.mounted) {
-                            Navigator.of(ctx).pop();
-                          }
-                          if (mounted) {
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              SnackBar(
-                                content: const Text('Profile updated successfully'),
-                                behavior: SnackBarBehavior.floating,
-                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                                duration: const Duration(seconds: 2),
-                              ),
-                            );
-                          }
-                        }
-                      },
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.white,
-                        foregroundColor: Colors.black,
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-                        elevation: 0,
-                      ),
-                      child: const Text(
-                        'Save Changes',
-                        style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
-                      ),
-                    ),
-                  ),
-                    SizedBox(height: math.max(MediaQuery.paddingOf(ctx).bottom, 24.0) + 16.0),
-                  ],
                 ),
               ),
             ),
-          ),
-        );
-      },
-    ),
-  ).whenComplete(() => liveTicker?.cancel());
-}
+          );
+        },
+      ),
+    ).whenComplete(() => liveTicker?.cancel());
+  }
 
   void _showSongOptions(Song song, [List<Song>? contextQueue]) {
     final isLiked = _likedSongs.containsKey(song.id);
@@ -3301,7 +3818,11 @@ class _SonixHomeState extends State<SonixHome>
                         song.title,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: Colors.white),
+                        style: const TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w700,
+                          color: Colors.white,
+                        ),
                       ),
                       const SizedBox(height: 4),
                       Text(
@@ -3347,14 +3868,15 @@ class _SonixHomeState extends State<SonixHome>
               ),
               title: const Text(
                 'Play Song',
-                style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: Colors.white),
+                style: TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.white,
+                ),
               ),
               onTap: () {
                 Navigator.of(ctx).pop();
-                if (contextQueue != null && _queue != contextQueue) {
-                  setState(() => _queue = [...contextQueue]);
-                }
-                _play(song);
+                _playSongForSuggestionMode(song);
               },
             ),
             ListTile(
@@ -3366,7 +3888,11 @@ class _SonixHomeState extends State<SonixHome>
               ),
               title: const Text(
                 'Download',
-                style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: Colors.white),
+                style: TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.white,
+                ),
               ),
               subtitle: Text(
                 'Get audio in $_songQuality',
@@ -3463,7 +3989,11 @@ class _SonixHomeState extends State<SonixHome>
                   const SizedBox(height: 8),
                   Text(
                     '${songs.length} ${songs.length == 1 ? 'song' : 'songs'}',
-                    style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Colors.white70),
+                    style: const TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: Colors.white70,
+                    ),
                   ),
                   const SizedBox(height: 14),
                   if (songs.isNotEmpty)
@@ -3471,18 +4001,30 @@ class _SonixHomeState extends State<SonixHome>
                       children: [
                         ElevatedButton.icon(
                           onPressed: () {
-                            setState(() => _queue = [...songs]);
-                            _play(songs.first);
+                            _playPlaylist(songs);
                           },
-                          icon: const Icon(PhosphorIconsBold.play, size: 16, color: Colors.black),
+                          icon: const Icon(
+                            PhosphorIconsBold.play,
+                            size: 16,
+                            color: Colors.black,
+                          ),
                           label: const Text(
                             'Play All',
-                            style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: Colors.black),
+                            style: TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.w700,
+                              color: Colors.black,
+                            ),
                           ),
                           style: ElevatedButton.styleFrom(
                             backgroundColor: Colors.white,
-                            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 14,
+                              vertical: 8,
+                            ),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(20),
+                            ),
                             elevation: 0,
                           ),
                         ),
@@ -3490,10 +4032,13 @@ class _SonixHomeState extends State<SonixHome>
                         IconButton(
                           onPressed: () {
                             final shuffled = [...songs]..shuffle();
-                            setState(() => _queue = shuffled);
-                            _play(shuffled.first);
+                            _playPlaylist(shuffled);
                           },
-                          icon: const Icon(PhosphorIconsRegular.shuffle, size: 20, color: Colors.white),
+                          icon: const Icon(
+                            PhosphorIconsRegular.shuffle,
+                            size: 20,
+                            color: Colors.white,
+                          ),
                           tooltip: 'Shuffle',
                           style: IconButton.styleFrom(
                             backgroundColor: Colors.white.withValues(alpha: .1),
@@ -3550,12 +4095,7 @@ class _SonixHomeState extends State<SonixHome>
     final isCurrent = _current?.id == song.id;
     final isLiked = _likedSongs.containsKey(song.id);
     return InkWell(
-      onTap: () {
-        if (_queue != likedList) {
-          setState(() => _queue = [...likedList]);
-        }
-        _play(song);
-      },
+      onTap: () => _playSongForSuggestionMode(song),
       child: Padding(
         padding: const EdgeInsets.symmetric(vertical: 7),
         child: Row(
@@ -3586,7 +4126,9 @@ class _SonixHomeState extends State<SonixHome>
                     style: TextStyle(
                       fontWeight: FontWeight.w700,
                       fontSize: 14,
-                      color: isCurrent ? Colors.white : Colors.white.withValues(alpha: .9),
+                      color: isCurrent
+                          ? Colors.white
+                          : Colors.white.withValues(alpha: .9),
                     ),
                   ),
                   const SizedBox(height: 3),
@@ -3594,7 +4136,11 @@ class _SonixHomeState extends State<SonixHome>
                     song.artist,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(color: _muted, fontSize: 12, fontWeight: FontWeight.w500),
+                    style: const TextStyle(
+                      color: _muted,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w500,
+                    ),
                   ),
                 ],
               ),
@@ -3618,7 +4164,10 @@ class _SonixHomeState extends State<SonixHome>
             ),
             IconButton(
               onPressed: () => _showSongOptions(song, likedList),
-              icon: const Icon(PhosphorIconsRegular.dotsThreeVertical, size: 20),
+              icon: const Icon(
+                PhosphorIconsRegular.dotsThreeVertical,
+                size: 20,
+              ),
               tooltip: 'More options',
             ),
           ],
@@ -3706,18 +4255,18 @@ class _LyricsAutoScrollViewState extends State<_LyricsAutoScrollView> {
             curve: Curves.easeOutCubic,
           )
           .then((_) {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          final ctx = _itemKeys[index]?.currentContext;
-          if (ctx != null && mounted) {
-            Scrollable.ensureVisible(
-              ctx,
-              alignment: 0.35,
-              duration: const Duration(milliseconds: 220),
-              curve: Curves.easeOutCubic,
-            );
-          }
-        });
-      });
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              final ctx = _itemKeys[index]?.currentContext;
+              if (ctx != null && mounted) {
+                Scrollable.ensureVisible(
+                  ctx,
+                  alignment: 0.35,
+                  duration: const Duration(milliseconds: 220),
+                  curve: Curves.easeOutCubic,
+                );
+              }
+            });
+          });
     }
   }
 
@@ -3812,8 +4361,9 @@ class _LyricsAutoScrollViewState extends State<_LyricsAutoScrollView> {
                         curve: Curves.easeOut,
                         style: TextStyle(
                           fontSize: isCurrent ? 24 : 18,
-                          fontWeight:
-                              isCurrent ? FontWeight.w700 : FontWeight.w500,
+                          fontWeight: isCurrent
+                              ? FontWeight.w700
+                              : FontWeight.w500,
                           color: isCurrent
                               ? Colors.white
                               : const Color(0x66ffffff),
@@ -3829,7 +4379,8 @@ class _LyricsAutoScrollViewState extends State<_LyricsAutoScrollView> {
             // Floating "Sync lyrics" pill when user scrolled away
             if (_userInteracting && active >= 0)
               Positioned(
-                bottom: 24.0 + math.max(MediaQuery.paddingOf(context).bottom, 14.0),
+                bottom:
+                    24.0 + math.max(MediaQuery.paddingOf(context).bottom, 14.0),
                 left: 0,
                 right: 0,
                 child: Center(
@@ -3885,4 +4436,3 @@ class _LyricsAutoScrollViewState extends State<_LyricsAutoScrollView> {
     );
   }
 }
-

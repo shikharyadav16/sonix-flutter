@@ -1,6 +1,8 @@
 import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'constants.dart';
+
 class UserProfile {
   const UserProfile({
     required this.name,
@@ -72,13 +74,14 @@ class UserStorage {
   }
 
   static const _keySongQuality = 'sonix_song_quality';
+  static const _keyCrossfadeSeconds = 'sonix_crossfade_seconds';
 
   static Future<String> getSongQuality() async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      return prefs.getString(_keySongQuality) ?? '320kbps';
+      return prefs.getString(_keySongQuality) ?? AppConstants.defaultSongQuality;
     } catch (_) {
-      return '320kbps';
+      return AppConstants.defaultSongQuality;
     }
   }
 
@@ -89,6 +92,23 @@ class UserStorage {
     } catch (_) {}
   }
 
+  static Future<int> getCrossfadeSeconds() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getInt(_keyCrossfadeSeconds) ??
+          AppConstants.crossfadeDurationSeconds;
+    } catch (_) {
+      return AppConstants.crossfadeDurationSeconds;
+    }
+  }
+
+  static Future<void> saveCrossfadeSeconds(int seconds) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setInt(_keyCrossfadeSeconds, seconds);
+    } catch (_) {}
+  }
+
   static Future<void> clearProfile() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_keyOnboardingDone);
@@ -96,5 +116,6 @@ class UserStorage {
     await prefs.remove(_keyUserAge);
     await prefs.remove(_keyLikedSongs);
     await prefs.remove(_keySongQuality);
+    await prefs.remove(_keyCrossfadeSeconds);
   }
 }
