@@ -35,6 +35,7 @@ dependencies:
   http: ^1.5.0
   just_audio: ^0.10.4
   just_audio_background: ^0.0.1-beta.17
+  audio_service: ^0.18.19
   palette_generator: ^0.3.3+6
   phosphor_icons: ^3.0.1
   url_launcher: ^6.3.2

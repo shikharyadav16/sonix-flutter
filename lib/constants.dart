@@ -25,7 +25,7 @@ abstract class AppConstants {
 
   /// Minimum track duration (in seconds) required for crossfading to activate.
   /// Songs shorter than this will play out to completion without crossfading.
-  static const int minCrossfadeSongDurationSeconds = 8;
+  static const int minCrossfadeSongDurationSeconds = 13;
 
   /// Update interval (in milliseconds) for the volume crossfade curve timer.
   /// 40ms equates to 25 volume updates per second for a smooth transition.

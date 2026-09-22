@@ -8,10 +8,12 @@ import 'package:flutter/rendering.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:http/http.dart' as http;
 import 'package:just_audio/just_audio.dart';
+import 'package:audio_service/audio_service.dart';
 import 'package:palette_generator/palette_generator.dart';
 import 'package:phosphor_icons/phosphor_icons.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import 'audio_handler.dart';
 import 'constants.dart';
 import 'crossfade_player.dart';
 import 'onboarding_screen.dart';
@@ -584,8 +586,21 @@ final _featuredPlaylists = <Playlist>[
   ),
 ];
 
+late final SonixAudioHandler audioHandler;
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  audioHandler = await AudioService.init(
+    builder: () => SonixAudioHandler(),
+    config: const AudioServiceConfig(
+      androidNotificationChannelId:
+          'com.example.song_player_mobile.channel.audio',
+      androidNotificationChannelName: 'Sonix Music Playback',
+      androidNotificationIcon: 'mipmap/ic_launcher',
+      androidShowNotificationBadge: true,
+      androidStopForegroundOnPause: true,
+    ),
+  );
   runApp(const SonixApp());
 }
 
@@ -717,8 +732,9 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
   @override
   void initState() {
     super.initState();
-    _audio = CrossfadePlayer(
-        crossfadeSeconds: AppConstants.crossfadeDurationSeconds);
+    _audio = audioHandler.player;
+    audioHandler.onSkipNext = _next;
+    audioHandler.onSkipPrevious = _previous;
     _audio.onPrepareNextTrack = _onPrepareNextTrack;
     _audio.onAutoCrossfadeTriggered = _onCrossfadeTriggered;
 
@@ -741,11 +757,12 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
     _playingSub = _audio.playingStream.listen((_) {
       if (mounted) setState(() {});
     });
-    // Detect song completion to auto-advance.
+    // Detect song completion to auto-advance and update UI on state changes.
     _processingStateSub = _audio.processingStateStream.listen((state) {
       if (state == ProcessingState.completed) {
         _onSongCompleted();
       }
+      if (mounted) setState(() {});
     });
   }
 
@@ -760,7 +777,6 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
     _search.removeListener(_onSearchChanged);
     _playingSub?.cancel();
     _processingStateSub?.cancel();
-    _audio.dispose();
     _search.dispose();
     super.dispose();
   }
@@ -907,6 +923,16 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
 
       if (stream != null) {
         final source = _sourceForSong(resolved, stream);
+        audioHandler.setSongItem(
+          id: resolved.id,
+          title: resolved.title,
+          artist: resolved.artist,
+          album: resolved.album,
+          artwork: resolved.artwork,
+          duration: resolved.duration > 0
+              ? Duration(seconds: resolved.duration)
+              : null,
+        );
         await _audio.playDirect(source, fadeCurrentOut: false);
         if (!mounted || request != _playRequest) return;
         setState(() => _isLoadingTrack = false);
@@ -1084,6 +1110,17 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
           _preparedSong = null;
           _preparedStreamUrl = null;
 
+          audioHandler.setSongItem(
+            id: resolved.id,
+            title: resolved.title,
+            artist: resolved.artist,
+            album: resolved.album,
+            artwork: resolved.artwork,
+            duration: resolved.duration > 0
+                ? Duration(seconds: resolved.duration)
+                : null,
+          );
+
           Api.lyrics(resolved).then((lyricData) {
             if (mounted) {
               setState(() {
@@ -1172,6 +1209,51 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
     } else {
       unawaited(_audio.play());
     }
+  }
+
+  /// Builds a unified play/pause button that visibly shows a loading spinner
+  /// whenever the song is resolving, loading, or buffering.
+  Widget _buildPlayPauseButton({
+    required double iconSize,
+    required double spinnerSize,
+    required double strokeWidth,
+  }) {
+    return StreamBuilder<bool>(
+      stream: _audio.playingStream,
+      initialData: _audio.playing,
+      builder: (_, playSnap) {
+        final isPlaying = playSnap.data ?? _audio.playing;
+        return StreamBuilder<ProcessingState>(
+          stream: _audio.processingStateStream,
+          initialData: _audio.processingState,
+          builder: (_, procSnap) {
+            final proc = procSnap.data ?? _audio.processingState;
+            final isBuffering = _isLoadingTrack ||
+                proc == ProcessingState.buffering ||
+                proc == ProcessingState.loading;
+
+            return IconButton(
+              onPressed: isBuffering ? null : _togglePlayPause,
+              icon: isBuffering
+                  ? SizedBox(
+                      width: spinnerSize,
+                      height: spinnerSize,
+                      child: CircularProgressIndicator(
+                        strokeWidth: strokeWidth,
+                        color: Colors.white,
+                      ),
+                    )
+                  : Icon(
+                      isPlaying
+                          ? PhosphorIconsRegular.pauseCircle
+                          : PhosphorIconsRegular.playCircle,
+                      size: iconSize,
+                    ),
+            );
+          },
+        );
+      },
+    );
   }
 
   void _seek(double seconds) =>
@@ -2359,29 +2441,10 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                     onPressed: _previous,
                     icon: const Icon(PhosphorIconsRegular.skipBack, size: 20),
                   ),
-                  StreamBuilder<bool>(
-                    stream: _audio.playingStream,
-                    initialData: _audio.playing,
-                    builder: (_, snapshot) {
-                      final isPlaying = snapshot.data ?? _audio.playing;
-                      return IconButton(
-                        onPressed: _isLoadingTrack ? null : _togglePlayPause,
-                        icon: _isLoadingTrack
-                            ? const SizedBox(
-                                width: 24,
-                                height: 24,
-                                child: CircularProgressIndicator(
-                                  strokeWidth: 2.4,
-                                ),
-                              )
-                            : Icon(
-                                isPlaying
-                                    ? PhosphorIconsRegular.pauseCircle
-                                    : PhosphorIconsRegular.playCircle,
-                                size: 34,
-                              ),
-                      );
-                    },
+                  _buildPlayPauseButton(
+                    iconSize: 34,
+                    spinnerSize: 24,
+                    strokeWidth: 2.4,
                   ),
                   IconButton(
                     onPressed: _next,
@@ -2739,31 +2802,10 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                           ),
                         ),
                         const SizedBox(width: 12),
-                        StreamBuilder<bool>(
-                          stream: _audio.playingStream,
-                          initialData: _audio.playing,
-                          builder: (_, snapshot) {
-                            final isPlaying = snapshot.data ?? _audio.playing;
-                            return IconButton(
-                              onPressed: _isLoadingTrack
-                                  ? null
-                                  : _togglePlayPause,
-                              icon: _isLoadingTrack
-                                  ? const SizedBox(
-                                      width: 52,
-                                      height: 52,
-                                      child: CircularProgressIndicator(
-                                        strokeWidth: 3,
-                                      ),
-                                    )
-                                  : Icon(
-                                      isPlaying
-                                          ? PhosphorIconsRegular.pauseCircle
-                                          : PhosphorIconsRegular.playCircle,
-                                      size: 64,
-                                    ),
-                            );
-                          },
+                        _buildPlayPauseButton(
+                          iconSize: 64,
+                          spinnerSize: 52,
+                          strokeWidth: 3.0,
                         ),
                         const SizedBox(width: 12),
                         IconButton(

@@ -7,7 +7,8 @@ import 'constants.dart';
 
 /// Manages seamless crossfading between audio tracks using dual [AudioPlayer] instances.
 class CrossfadePlayer {
-  CrossfadePlayer({this.crossfadeSeconds = AppConstants.crossfadeDurationSeconds}) {
+  CrossfadePlayer(
+      {this.crossfadeSeconds = AppConstants.crossfadeDurationSeconds}) {
     _activePlayer = _playerA;
     _initPlayerListeners(_playerA);
     _initPlayerListeners(_playerB);
@@ -189,6 +190,17 @@ class CrossfadePlayer {
         await incoming.setAudioSource(nextSource, preload: true);
       }
 
+      // If outgoing stopped/paused while loading:
+      if (!outgoing.playing) {
+        _fadingInPlayer = incoming;
+        _isCrossfading = true;
+        _preparedNext = false;
+        _crossfadeTriggeredForCurrent = false;
+        await incoming.pause();
+        _playingController.add(false);
+        return;
+      }
+
       // Start incoming track non-blocking
       unawaited(incoming.play());
 
@@ -265,12 +277,15 @@ class CrossfadePlayer {
   Future<void> playDirect(AudioSource source,
       {bool fadeCurrentOut = false}) async {
     _cancelFadeTimer();
-    if (_fadingInPlayer != null) {
-      _fadingInPlayer!.stop();
-      _fadingInPlayer!.setVolume(1.0);
-      _fadingInPlayer = null;
-    }
-
+    await Future.wait([
+      _playerA.stop(),
+      _playerB.stop(),
+    ]);
+    await Future.wait([
+      _playerA.setVolume(1.0),
+      _playerB.setVolume(1.0),
+    ]);
+    _fadingInPlayer = null;
     _isCrossfading = false;
     _preparedNext = false;
     _crossfadeTriggeredForCurrent = false;
@@ -305,11 +320,15 @@ class CrossfadePlayer {
 
   Future<void> setAudioSource(AudioSource source) async {
     _cancelFadeTimer();
-    if (_fadingInPlayer != null) {
-      _fadingInPlayer!.stop();
-      _fadingInPlayer!.setVolume(1.0);
-      _fadingInPlayer = null;
-    }
+    await Future.wait([
+      _playerA.stop(),
+      _playerB.stop(),
+    ]);
+    await Future.wait([
+      _playerA.setVolume(1.0),
+      _playerB.setVolume(1.0),
+    ]);
+    _fadingInPlayer = null;
     _isCrossfading = false;
     _preparedNext = false;
     _crossfadeTriggeredForCurrent = false;
@@ -329,24 +348,28 @@ class CrossfadePlayer {
     _playingController.add(true);
   }
 
+  /// Pauses BOTH players and stops the crossfade stopwatch.
+  /// Guarantees that no audio will play from either internal player instance.
   Future<void> pause() async {
     _fadeStopwatch?.stop();
-    if (_fadingInPlayer != null) {
-      await _fadingInPlayer!.pause();
-    }
-    await _activePlayer.pause();
+    await Future.wait([
+      _playerA.pause(),
+      _playerB.pause(),
+    ]);
     _playingController.add(false);
   }
 
   Future<void> stop() async {
     _cancelFadeTimer();
-    if (_fadingInPlayer != null) {
-      await _fadingInPlayer!.stop();
-      await _fadingInPlayer!.setVolume(1.0);
-      _fadingInPlayer = null;
-    }
-    await _activePlayer.stop();
-    await _activePlayer.setVolume(1.0);
+    await Future.wait([
+      _playerA.stop(),
+      _playerB.stop(),
+    ]);
+    await Future.wait([
+      _playerA.setVolume(1.0),
+      _playerB.setVolume(1.0),
+    ]);
+    _fadingInPlayer = null;
     _isCrossfading = false;
     _preparedNext = false;
     _crossfadeTriggeredForCurrent = false;
