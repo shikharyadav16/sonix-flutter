@@ -1584,16 +1584,53 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
               Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(
-                    _userProfile != null && _userProfile!.name.isNotEmpty
-                        ? 'Hello, ${_userProfile!.name.split(' ').first}'
-                        : 'Sonix',
-                    style: TextStyle(
-                      fontSize: 18,
-                      fontWeight: FontWeight.w800,
-                      fontFamily: GoogleFonts.inter().fontFamily,
+                  if (_userProfile != null && _userProfile!.name.isNotEmpty)
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          'Hello, ',
+                          style: TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.w800,
+                            fontFamily: GoogleFonts.inter().fontFamily,
+                          ),
+                        ),
+                        ShaderMask(
+                          shaderCallback: (bounds) => const LinearGradient(
+                            colors: AppConstants.userNameGradientColors,
+                          ).createShader(
+                            Rect.fromLTWH(0, 0, bounds.width, bounds.height),
+                          ),
+                          blendMode: BlendMode.srcIn,
+                          child: Text(
+                            _userProfile!.name.split(' ').first,
+                            style: TextStyle(
+                              fontSize: 18,
+                              fontWeight: FontWeight.w800,
+                              fontFamily: GoogleFonts.inter().fontFamily,
+                            ),
+                          ),
+                        ),
+                      ],
+                    )
+                  else
+                    ShaderMask(
+                      shaderCallback: (bounds) => const LinearGradient(
+                        colors: AppConstants.userNameGradientColors,
+                      ).createShader(
+                        Rect.fromLTWH(0, 0, bounds.width, bounds.height),
+                      ),
+                      blendMode: BlendMode.srcIn,
+                      child: Text(
+                        'Sonix',
+                        style: TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.w800,
+                          fontFamily: GoogleFonts.inter().fontFamily,
+                        ),
+                      ),
                     ),
-                  ),
                   Text(
                     _userProfile != null && _userProfile!.name.isNotEmpty
                         ? 'ENJOY YOUR MUSIC'
@@ -1611,18 +1648,25 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
               const Spacer(),
               GestureDetector(
                 onTap: _openUserMenu,
-                child: Container(
-                  width: 38,
-                  height: 38,
-                  decoration: BoxDecoration(
-                    color: Colors.white.withValues(alpha: .12),
-                    shape: BoxShape.circle,
-                    border: Border.all(color: Colors.white24, width: 1.2),
+                child: CustomPaint(
+                  foregroundPainter: const _GradientCircleBorderPainter(
+                    gradient: LinearGradient(
+                      colors: AppConstants.userNameGradientColors,
+                    ),
+                    strokeWidth: 1,
                   ),
-                  child: const Icon(
-                    PhosphorIconsBold.user,
-                    size: 20,
-                    color: Colors.white,
+                  child: Container(
+                    width: 38,
+                    height: 38,
+                    decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: .12),
+                      shape: BoxShape.circle,
+                    ),
+                    child: const Icon(
+                      PhosphorIconsBold.user,
+                      size: 20,
+                      color: Colors.white,
+                    ),
                   ),
                 ),
               ),
@@ -4694,3 +4738,33 @@ class _LyricsAutoScrollViewState extends State<_LyricsAutoScrollView> {
     );
   }
 }
+
+class _GradientCircleBorderPainter extends CustomPainter {
+  final Gradient gradient;
+  final double strokeWidth;
+
+  const _GradientCircleBorderPainter({
+    required this.gradient,
+    this.strokeWidth = 1.5,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final rect = Rect.fromLTWH(
+      strokeWidth / 2,
+      strokeWidth / 2,
+      size.width - strokeWidth,
+      size.height - strokeWidth,
+    );
+    final paint = Paint()
+      ..shader = gradient.createShader(rect)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = strokeWidth;
+    canvas.drawOval(rect, paint);
+  }
+
+  @override
+  bool shouldRepaint(covariant _GradientCircleBorderPainter oldDelegate) =>
+      oldDelegate.gradient != gradient || oldDelegate.strokeWidth != strokeWidth;
+}
+

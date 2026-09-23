@@ -94,4 +94,10 @@ abstract class AppConstants {
 
   /// Muted grey color for secondary text, subtitle metadata, and inactive icons.
   static const Color colorMuted = Color(0xff92929b);
+
+  /// Horizontal gradient colors for the user's name in the top navigation bar (light blue to light purple).
+  static const List<Color> userNameGradientColors = [
+    Color(0xff7dd3fc),
+    Color(0xffc4b5fd),
+  ];
 }
