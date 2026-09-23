@@ -43,9 +43,13 @@ abstract class AppConstants {
   /// or when the suggestion queue becomes exhausted.
   static const int suggestionsBatchSize = 15;
 
-  /// Maximum number of recently played songs kept in memory history for
-  /// the "Previous" song action.
-  static const int historyLimit = 5;
+  /// Maximum number of recently played songs kept in device storage and memory
+  /// for the "Previous" song action and persistent History section.
+  static const int historyLimit = 10;
+
+  /// Minimum playback duration (in seconds) required before a song is
+  /// eligible to be added to the persistent History list.
+  static const int minPlayDurationForHistorySeconds = 10;
 
   /// Maximum number of songs fetched when loading a full playlist from the API.
   static const int playlistFetchLimit = 50;

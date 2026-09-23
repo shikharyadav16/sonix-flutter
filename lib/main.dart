@@ -693,6 +693,9 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
   List<Song> _results = [];
   List<Playlist> _playlistResults = [];
   List<Song> _history = [];
+  final List<Song> _playbackHistory = [];
+  int _playbackHistoryIndex = -1;
+  bool _isNavigatingHistory = false;
 
   // ---- Queue / playback mode state ----
   PlaybackMode _playbackMode = PlaybackMode.suggestions;
@@ -727,6 +730,9 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
 
   StreamSubscription<bool>? _playingSub;
   StreamSubscription<ProcessingState>? _processingStateSub;
+  StreamSubscription<Duration>? _historyPositionSub;
+  final Stopwatch _songPlayStopwatch = Stopwatch();
+  bool _historyAddedForCurrent = false;
   final Map<String, Future<List<Color>>> _paletteFutures = {};
 
   @override
@@ -745,6 +751,7 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
       });
     }
     _loadLikedSongs();
+    _loadHistory();
     UserStorage.getSongQuality().then((q) {
       if (mounted) setState(() => _songQuality = q);
     });
@@ -754,8 +761,34 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
           seconds: AppConstants.backgroundAnimationDurationSeconds),
     )..repeat(reverse: true);
     _search.addListener(_onSearchChanged);
-    _playingSub = _audio.playingStream.listen((_) {
+    _playingSub = _audio.playingStream.listen((isPlaying) {
+      if (isPlaying) {
+        if (!_historyAddedForCurrent && _current != null) {
+          _songPlayStopwatch.start();
+        }
+      } else {
+        _songPlayStopwatch.stop();
+      }
       if (mounted) setState(() {});
+    });
+    _historyPositionSub = _audio.positionStream.listen((pos) {
+      if (!_historyAddedForCurrent && _current != null) {
+        final elapsedMs = _songPlayStopwatch.elapsedMilliseconds;
+        final dur = _audio.duration;
+        final thresholdMs =
+            AppConstants.minPlayDurationForHistorySeconds * 1000;
+        final isShortTrack = dur != null &&
+            dur.inSeconds > 0 &&
+            dur.inSeconds < AppConstants.minPlayDurationForHistorySeconds;
+        final thresholdMet = elapsedMs >= thresholdMs ||
+            (isShortTrack && pos >= dur * 0.5);
+
+        if (thresholdMet) {
+          _historyAddedForCurrent = true;
+          _onSongMeaningfullyPlayed(_current!);
+          if (mounted) setState(() {});
+        }
+      }
     });
     // Detect song completion to auto-advance and update UI on state changes.
     _processingStateSub = _audio.processingStateStream.listen((state) {
@@ -777,6 +810,8 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
     _search.removeListener(_onSearchChanged);
     _playingSub?.cancel();
     _processingStateSub?.cancel();
+    _historyPositionSub?.cancel();
+    _songPlayStopwatch.stop();
     _search.dispose();
     super.dispose();
   }
@@ -875,10 +910,11 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
 
   /// Low-level: play a single song directly on the CrossfadePlayer.
   /// Does NOT touch queues or modes — callers manage that.
-  Future<void> _play(Song song) async {
+  Future<void> _play(Song song, {bool isHistoryNavigation = false}) async {
     final request = ++_playRequest;
     _preparedSong = null;
     _preparedStreamUrl = null;
+    _isNavigatingHistory = isHistoryNavigation;
 
     // Same track -> just toggle play/pause.
     if (_current?.id == song.id && !_isLoadingTrack) {
@@ -891,6 +927,17 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
       return;
     }
 
+    // If starting a new track outside of history navigation, truncate any forward history branch
+    if (!isHistoryNavigation) {
+      if (_playbackHistoryIndex >= 0 &&
+          _playbackHistoryIndex < _playbackHistory.length - 1) {
+        _playbackHistory.removeRange(
+          _playbackHistoryIndex + 1,
+          _playbackHistory.length,
+        );
+      }
+    }
+
     // Stop previous track immediately so old audio doesn't play while new song is being fetched
     unawaited(_audio.stop());
 
@@ -900,10 +947,8 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
       _lyrics = null;
       _parsedLyrics = [];
       _lyricsOpen = false;
-      _history = [
-        song,
-        ..._history.where((item) => item.id != song.id),
-      ].take(AppConstants.historyLimit).toList();
+      _songPlayStopwatch.reset();
+      _historyAddedForCurrent = false;
     });
 
     try {
@@ -935,6 +980,9 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
         );
         await _audio.playDirect(source, fadeCurrentOut: false);
         if (!mounted || request != _playRequest) return;
+        if (_audio.playing) {
+          _songPlayStopwatch.start();
+        }
         setState(() => _isLoadingTrack = false);
       } else if (mounted && request == _playRequest) {
         setState(() => _isLoadingTrack = false);
@@ -1022,7 +1070,7 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
     if (_isLoadingTrack || _current == null) return;
     // If an active crossfade is currently transitioning, skip auto-advance.
     if (_audio.isCrossfading) return;
-    _advanceToNextSong();
+    _next();
   }
 
   /// Advance to the next song based on current playback mode.
@@ -1101,10 +1149,11 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
           setState(() {
             _current = resolved.copyWith(streamUrl: stream);
             _isLoadingTrack = false;
-            _history = [
-              resolved,
-              ..._history.where((item) => item.id != resolved.id),
-            ].take(AppConstants.historyLimit).toList();
+            _songPlayStopwatch.reset();
+            _historyAddedForCurrent = false;
+            if (_audio.playing) {
+              _songPlayStopwatch.start();
+            }
           });
 
           _preparedSong = null;
@@ -1149,6 +1198,9 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
 
   /// Peek at the next song WITHOUT removing it from the queue.
   Song? _peekNextSong() {
+    if (_playbackHistoryIndex < _playbackHistory.length - 1) {
+      return _playbackHistory[_playbackHistoryIndex + 1];
+    }
     if (_playbackMode == PlaybackMode.playlist) {
       if (_playlistQueue.isEmpty) return null;
       final nextIdx = (_playlistQueueIndex + 1) % _playlistQueue.length;
@@ -1160,6 +1212,11 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
 
   /// Consume (advance past) the next song in the queue.
   void _consumeNextSong([Song? justPlayed]) {
+    if (_playbackHistoryIndex < _playbackHistory.length - 1) {
+      _playbackHistoryIndex++;
+      setState(() {});
+      return;
+    }
     if (_playbackMode == PlaybackMode.playlist) {
       if (_playlistQueue.isEmpty) return;
       _playlistQueueIndex = (_playlistQueueIndex + 1) % _playlistQueue.length;
@@ -1180,22 +1237,78 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
 
   void _next() {
     if (_isLoadingTrack || _current == null) return;
+
+    // Traverse forward in session playback history if user navigated backward earlier
+    if (_playbackHistoryIndex < _playbackHistory.length - 1) {
+      _playbackHistoryIndex++;
+      final nextSong = _playbackHistory[_playbackHistoryIndex];
+      _play(nextSong, isHistoryNavigation: true).then((_) {
+        // If we reached the tip of playback history and queue is empty, prefetch suggestions
+        if (_playbackHistoryIndex == _playbackHistory.length - 1 &&
+            _suggestionQueue.isEmpty &&
+            mounted) {
+          unawaited(_fetchSuggestions(nextSong.id));
+        }
+      });
+      return;
+    }
+
+    // At the tip: advance to next song in queue/mode
     _advanceToNextSong();
   }
 
   void _previous() {
-    if (_history.length > 1) {
-      // Play the previous song from history.
-      final index = _history.indexWhere((song) => song.id == _current?.id);
-      if (index > 0) {
-        _play(_history[index]);
-      } else if (_history.length > 1) {
-        _play(_history[1]);
+    if (_isLoadingTrack) return;
+
+    Song? songToPlay;
+
+    // 1. Navigate backward in active session playback history
+    if (_playbackHistoryIndex > 0) {
+      _playbackHistoryIndex--;
+      songToPlay = _playbackHistory[_playbackHistoryIndex];
+    } else {
+      // 2. Fall back to persistent recently played history
+      if (_history.isNotEmpty) {
+        final currentIdx = _history.indexWhere((s) => s.id == _current?.id);
+        if (currentIdx >= 0 && currentIdx + 1 < _history.length) {
+          songToPlay = _history[currentIdx + 1];
+        } else if (_history.length > 1) {
+          songToPlay = _history[1];
+        } else if (_history.isNotEmpty && _history.first.id != _current?.id) {
+          songToPlay = _history.first;
+        }
+        if (songToPlay != null) {
+          _playbackHistory.insert(0, songToPlay);
+          _playbackHistoryIndex = 0;
+        }
       }
-    } else if (_playbackMode == PlaybackMode.playlist && _playlistQueue.isNotEmpty) {
-      _playlistQueueIndex = (_playlistQueueIndex - 1 + _playlistQueue.length) % _playlistQueue.length;
-      _play(_playlistQueue[_playlistQueueIndex]);
     }
+
+    if (songToPlay == null &&
+        _playbackMode == PlaybackMode.playlist &&
+        _playlistQueue.isNotEmpty) {
+      _playlistQueueIndex =
+          (_playlistQueueIndex - 1 + _playlistQueue.length) %
+              _playlistQueue.length;
+      songToPlay = _playlistQueue[_playlistQueueIndex];
+    }
+
+    if (songToPlay == null) return;
+
+    // CRITICAL USER REQUIREMENT:
+    // Whenever the user clicks previous button, the queue must be empty
+    // and the next 15 songs will be fetched from suggestions and put into the queue.
+    setState(() {
+      _suggestionQueue = [];
+      _playlistQueue = [];
+      _playbackMode = PlaybackMode.suggestions;
+    });
+
+    _play(songToPlay, isHistoryNavigation: true).then((_) {
+      if (mounted) {
+        unawaited(_fetchSuggestions(songToPlay!.id));
+      }
+    });
   }
 
   void _togglePlayPause() {
@@ -1570,6 +1683,7 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
       _section('Most Played', _mostPlayedSongs, horizontal: true),
       _section('Top Hits', _topHitsSongs, horizontal: true),
       _featuredPlaylistsSection(),
+      _historySection(),
       const SizedBox(height: 16),
       const Center(
         child: Text(
@@ -1758,6 +1872,68 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
       const SizedBox(height: 26),
     ],
   );
+
+  Widget _historySection() {
+    if (_history.isEmpty) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Padding(
+            padding: EdgeInsets.only(bottom: 12),
+            child: Text(
+              'History',
+              style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
+            ),
+          ),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 16),
+            decoration: BoxDecoration(
+              color: _surface,
+              borderRadius: BorderRadius.circular(9),
+            ),
+            child: const Center(
+              child: Text(
+                'No recently played songs yet',
+                style: TextStyle(color: _muted, fontSize: 13),
+              ),
+            ),
+          ),
+          const SizedBox(height: 26),
+        ],
+      );
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: const EdgeInsets.only(bottom: 12),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Text(
+                'History',
+                style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
+              ),
+              GestureDetector(
+                onTap: _clearHistory,
+                child: const Text(
+                  'Clear',
+                  style: TextStyle(
+                    color: _muted,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+        Column(children: _history.map((s) => _row(s, _history)).toList()),
+        const SizedBox(height: 26),
+      ],
+    );
+  }
 
   Widget _playlistCard(Playlist playlist) => GestureDetector(
     onTap: () => _openPlaylist(playlist),
@@ -2920,6 +3096,46 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
         setState(() => _likedSongs = loaded);
       }
     } catch (_) {}
+  }
+
+  Future<void> _loadHistory() async {
+    try {
+      final rawList = await UserStorage.getHistorySongsRaw();
+      final loaded = rawList
+          .map((item) => Song.fromJson(item))
+          .take(AppConstants.historyLimit)
+          .toList();
+      if (mounted) {
+        setState(() => _history = loaded);
+      }
+    } catch (_) {}
+  }
+
+  void _onSongMeaningfullyPlayed(Song song) {
+    // 1. Update persistent Recently Played UI list (unique, updated to top, max 10)
+    _history.removeWhere((item) => item.id == song.id);
+    _history.insert(0, song);
+    if (_history.length > AppConstants.historyLimit) {
+      _history = _history.take(AppConstants.historyLimit).toList();
+    }
+    unawaited(UserStorage.saveHistorySongsRaw(
+      _history.map((s) => s.toJson()).toList(),
+    ));
+
+    // 2. Update session playback history sequence (preserves repetitions)
+    if (!_isNavigatingHistory) {
+      _playbackHistory.add(song);
+      _playbackHistoryIndex = _playbackHistory.length - 1;
+    }
+  }
+
+  Future<void> _clearHistory() async {
+    setState(() {
+      _history = [];
+      _playbackHistory.clear();
+      _playbackHistoryIndex = -1;
+    });
+    await UserStorage.saveHistorySongsRaw([]);
   }
 
   Future<void> _toggleLike(Song song) async {

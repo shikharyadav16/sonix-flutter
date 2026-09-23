@@ -50,6 +50,7 @@ class UserStorage {
   }
 
   static const _keyLikedSongs = 'sonix_liked_songs';
+  static const _keyHistorySongs = 'sonix_history_songs';
 
   static Future<List<Map<String, dynamic>>> getLikedSongsRaw() async {
     try {
@@ -71,6 +72,30 @@ class UserStorage {
   static Future<void> saveLikedSongsRaw(List<Map<String, dynamic>> songs) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_keyLikedSongs, jsonEncode(songs));
+  }
+
+  static Future<List<Map<String, dynamic>>> getHistorySongsRaw() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final jsonStr = prefs.getString(_keyHistorySongs);
+      if (jsonStr != null && jsonStr.isNotEmpty) {
+        final decoded = jsonDecode(jsonStr);
+        if (decoded is List) {
+          return decoded
+              .whereType<Map>()
+              .map((m) => Map<String, dynamic>.from(m))
+              .toList();
+        }
+      }
+    } catch (_) {}
+    return [];
+  }
+
+  static Future<void> saveHistorySongsRaw(List<Map<String, dynamic>> songs) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_keyHistorySongs, jsonEncode(songs));
+    } catch (_) {}
   }
 
   static const _keySongQuality = 'sonix_song_quality';
@@ -115,6 +140,7 @@ class UserStorage {
     await prefs.remove(_keyUserName);
     await prefs.remove(_keyUserAge);
     await prefs.remove(_keyLikedSongs);
+    await prefs.remove(_keyHistorySongs);
     await prefs.remove(_keySongQuality);
     await prefs.remove(_keyCrossfadeSeconds);
   }
