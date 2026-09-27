@@ -4,13 +4,11 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:phosphor_icons/phosphor_icons.dart';
 
+import 'constants.dart';
 import 'user_storage.dart';
 
 class OnboardingScreen extends StatefulWidget {
-  const OnboardingScreen({
-    super.key,
-    required this.onComplete,
-  });
+  const OnboardingScreen({super.key, required this.onComplete});
 
   final ValueChanged<UserProfile> onComplete;
 
@@ -24,6 +22,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
   final _formKey = GlobalKey<FormState>();
 
   bool _isSubmitting = false;
+  String _selectedLanguage = 'English';
   String? _errorMessage;
 
   @override
@@ -50,6 +49,23 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
       return;
     }
 
+    final firstName = name.split(RegExp(r'\s+')).first;
+    if (firstName.length > AppConstants.maxFirstNameLength) {
+      setState(
+        () => _errorMessage =
+            'First name cannot exceed ${AppConstants.maxFirstNameLength} characters.',
+      );
+      return;
+    }
+
+    if (name.length > AppConstants.maxFullNameLength) {
+      setState(
+        () => _errorMessage =
+            'Name cannot exceed ${AppConstants.maxFullNameLength} characters.',
+      );
+      return;
+    }
+
     if (ageText.isEmpty) {
       setState(() => _errorMessage = 'Please enter your age.');
       return;
@@ -57,16 +73,24 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
 
     final age = int.tryParse(ageText);
     if (age == null || age < 5 || age > 120) {
-      setState(() => _errorMessage = 'Please enter a valid age between 5 and 120.');
+      setState(
+        () => _errorMessage = 'Please enter a valid age between 5 and 120.',
+      );
       return;
     }
 
     setState(() => _isSubmitting = true);
 
     try {
-      await UserStorage.saveProfile(name: name, age: age);
+      await UserStorage.saveProfile(
+        name: name,
+        age: age,
+        language: _selectedLanguage,
+      );
       if (!mounted) return;
-      widget.onComplete(UserProfile(name: name, age: age));
+      widget.onComplete(
+        UserProfile(name: name, age: age, language: _selectedLanguage),
+      );
     } catch (_) {
       if (mounted) {
         setState(() {
@@ -126,7 +150,10 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
               onTap: () => FocusScope.of(context).unfocus(),
               child: Center(
                 child: SingleChildScrollView(
-                  padding: const EdgeInsets.symmetric(horizontal: 26, vertical: 24),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 26,
+                    vertical: 24,
+                  ),
                   child: Column(
                     mainAxisAlignment: MainAxisAlignment.center,
                     crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -158,7 +185,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                             fontSize: 28,
                             fontWeight: FontWeight.w900,
                             letterSpacing: -0.5,
-                            fontFamily: GoogleFonts.inter().fontFamily,
+                            fontFamily: GoogleFonts.manrope().fontFamily,
                           ),
                         ),
                       ),
@@ -170,7 +197,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                             color: muted,
                             letterSpacing: 2.0,
                             fontWeight: FontWeight.w700,
-                            fontFamily: GoogleFonts.inter().fontFamily,
+                            fontFamily: GoogleFonts.manrope().fontFamily,
                           ),
                         ),
                       ),
@@ -202,11 +229,16 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                       // Error message if any
                       if (_errorMessage != null) ...[
                         Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 14,
+                            vertical: 10,
+                          ),
                           decoration: BoxDecoration(
                             color: Colors.redAccent.withValues(alpha: .15),
                             borderRadius: BorderRadius.circular(10),
-                            border: Border.all(color: Colors.redAccent.withValues(alpha: .3)),
+                            border: Border.all(
+                              color: Colors.redAccent.withValues(alpha: .3),
+                            ),
                           ),
                           child: Row(
                             children: [
@@ -253,6 +285,9 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                               controller: _nameController,
                               textInputAction: TextInputAction.next,
                               textCapitalization: TextCapitalization.words,
+                              inputFormatters: const [
+                                UserNameTextInputFormatter(),
+                              ],
                               style: const TextStyle(
                                 color: Colors.white,
                                 fontSize: 15,
@@ -260,7 +295,10 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                               ),
                               decoration: InputDecoration(
                                 hintText: 'Enter your name',
-                                hintStyle: const TextStyle(color: Color(0xff60606a), fontSize: 14),
+                                hintStyle: const TextStyle(
+                                  color: Color(0xff60606a),
+                                  fontSize: 14,
+                                ),
                                 prefixIcon: const Icon(
                                   PhosphorIconsRegular.user,
                                   color: muted,
@@ -274,15 +312,22 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                                 ),
                                 border: OutlineInputBorder(
                                   borderRadius: BorderRadius.circular(14),
-                                  borderSide: const BorderSide(color: Color(0x18ffffff)),
+                                  borderSide: const BorderSide(
+                                    color: Color(0x18ffffff),
+                                  ),
                                 ),
                                 enabledBorder: OutlineInputBorder(
                                   borderRadius: BorderRadius.circular(14),
-                                  borderSide: const BorderSide(color: Color(0x18ffffff)),
+                                  borderSide: const BorderSide(
+                                    color: Color(0x18ffffff),
+                                  ),
                                 ),
                                 focusedBorder: OutlineInputBorder(
                                   borderRadius: BorderRadius.circular(14),
-                                  borderSide: const BorderSide(color: Colors.white38, width: 1.4),
+                                  borderSide: const BorderSide(
+                                    color: Colors.white38,
+                                    width: 1.4,
+                                  ),
                                 ),
                               ),
                             ),
@@ -311,7 +356,10 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                               ),
                               decoration: InputDecoration(
                                 hintText: 'Enter your age',
-                                hintStyle: const TextStyle(color: Color(0xff60606a), fontSize: 14),
+                                hintStyle: const TextStyle(
+                                  color: Color(0xff60606a),
+                                  fontSize: 14,
+                                ),
                                 prefixIcon: const Icon(
                                   PhosphorIconsRegular.calendarBlank,
                                   color: muted,
@@ -325,17 +373,99 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                                 ),
                                 border: OutlineInputBorder(
                                   borderRadius: BorderRadius.circular(14),
-                                  borderSide: const BorderSide(color: Color(0x18ffffff)),
+                                  borderSide: const BorderSide(
+                                    color: Color(0x18ffffff),
+                                  ),
                                 ),
                                 enabledBorder: OutlineInputBorder(
                                   borderRadius: BorderRadius.circular(14),
-                                  borderSide: const BorderSide(color: Color(0x18ffffff)),
+                                  borderSide: const BorderSide(
+                                    color: Color(0x18ffffff),
+                                  ),
                                 ),
                                 focusedBorder: OutlineInputBorder(
                                   borderRadius: BorderRadius.circular(14),
-                                  borderSide: const BorderSide(color: Colors.white38, width: 1.4),
+                                  borderSide: const BorderSide(
+                                    color: Colors.white38,
+                                    width: 1.4,
+                                  ),
                                 ),
                               ),
+                            ),
+                            const SizedBox(height: 20),
+
+                            // Language Selection
+                            const Text(
+                              'MUSIC LANGUAGE',
+                              style: TextStyle(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w700,
+                                color: muted,
+                                letterSpacing: 1.0,
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            Row(
+                              children: [
+                                for (final lang in ['English', 'Hindi']) ...[
+                                  Expanded(
+                                    child: GestureDetector(
+                                      onTap: () => setState(
+                                        () => _selectedLanguage = lang,
+                                      ),
+                                      child: AnimatedContainer(
+                                        duration:
+                                            const Duration(milliseconds: 180),
+                                        padding: const EdgeInsets.symmetric(
+                                          vertical: 14,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color: _selectedLanguage == lang
+                                              ? Colors.white
+                                              : surface,
+                                          borderRadius:
+                                              BorderRadius.circular(14),
+                                          border: Border.all(
+                                            color: _selectedLanguage == lang
+                                                ? Colors.white
+                                                : const Color(0x18ffffff),
+                                            width: _selectedLanguage == lang
+                                                ? 1.5
+                                                : 1.0,
+                                          ),
+                                        ),
+                                        child: Center(
+                                          child: Row(
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              Icon(
+                                                PhosphorIconsRegular.translate,
+                                                size: 16,
+                                                color: _selectedLanguage == lang
+                                                    ? Colors.black
+                                                    : muted,
+                                              ),
+                                              const SizedBox(width: 8),
+                                              Text(
+                                                lang,
+                                                style: TextStyle(
+                                                  fontSize: 14,
+                                                  fontWeight: FontWeight.w700,
+                                                  color: _selectedLanguage == lang
+                                                      ? Colors.black
+                                                      : Colors.white,
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                  if (lang == 'English')
+                                    const SizedBox(width: 12),
+                                ],
+                              ],
                             ),
                           ],
                         ),
@@ -388,7 +518,10 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                       const Center(
                         child: Text(
                           'Your details are saved safely on your device.',
-                          style: TextStyle(color: Color(0xff55555e), fontSize: 11),
+                          style: TextStyle(
+                            color: Color(0xff55555e),
+                            fontSize: 11,
+                          ),
                         ),
                       ),
                     ],

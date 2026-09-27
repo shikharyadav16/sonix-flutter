@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
+import 'package:dart_des/dart_des.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:google_fonts/google_fonts.dart';
@@ -22,11 +23,63 @@ import 'user_storage.dart';
 /// Two distinct playback modes.
 enum PlaybackMode { suggestions, playlist }
 
-const _apiRoot = AppConstants.apiBaseUrl;
 const _fallbackArt = AppConstants.fallbackArtworkUrl;
 const _ink = AppConstants.colorInk;
 const _surface = AppConstants.colorSurface;
 const _muted = AppConstants.colorMuted;
+
+/* -------------------------------------------------------------------------- */
+/*                           CRYPTO & PARSING HELPERS                         */
+/* -------------------------------------------------------------------------- */
+
+/// Client-side Triple-DES / DES-ECB decryption of JioSaavn's encrypted_media_url.
+/// Key is "38346591" with PKCS7 padding.
+String? decryptMediaUrl(String? encryptedB64) {
+  if (encryptedB64 == null || encryptedB64.trim().isEmpty) return null;
+  try {
+    final key = utf8.encode('38346591');
+    final encryptedBytes = base64Decode(encryptedB64.trim());
+    final des = DES(key: key, mode: DESMode.ECB, paddingType: DESPaddingType.PKCS7);
+    final decryptedBytes = des.decrypt(encryptedBytes);
+    final url = utf8.decode(decryptedBytes).trim();
+    if (url.startsWith('http://') || url.startsWith('https://')) {
+      return url.replaceFirst('http://', 'https://');
+    }
+  } catch (_) {}
+  return null;
+}
+
+/// Generates stream URLs for all available bitrates from the decrypted base URL.
+List<Map<String, dynamic>> buildQualityUrls(String? url) {
+  if (url == null || url.isEmpty) return const [];
+  final clean = url.replaceFirst('http://', 'https://');
+  final base = clean.replaceAll(RegExp(r'_(96|160|320|48|12)\.mp4.*$'), '');
+  return [
+    {'quality': '320kbps', 'url': '${base}_320.mp4'},
+    {'quality': '160kbps', 'url': '${base}_160.mp4'},
+    {'quality': '96kbps', 'url': '${base}_96.mp4'},
+    {'quality': '48kbps', 'url': '${base}_48.mp4'},
+  ];
+}
+
+/// Decodes common HTML entities returned in JioSaavn text fields.
+String decodeHtmlEntities(String? input) {
+  if (input == null || input.isEmpty) return '';
+  return input
+      .replaceAll('&quot;', '"')
+      .replaceAll('&amp;', '&')
+      .replaceAll('&#039;', "'")
+      .replaceAll('&lt;', '<')
+      .replaceAll('&gt;', '>')
+      .replaceAll('&copy;', '©')
+      .trim();
+}
+
+/// Upgrades low-resolution JioSaavn artwork URLs to 500x500.
+String upgradeArtwork(String? url) {
+  if (url == null || url.isEmpty) return '';
+  return url.replaceAll(RegExp(r'\d+x\d+'), '500x500');
+}
 
 /* -------------------------------------------------------------------------- */
 /*                                   MODELS                                   */
@@ -50,54 +103,115 @@ class Song {
   final List<Map<String, dynamic>> downloadUrls;
 
   factory Song.fromJson(Map<String, dynamic> json) {
-    final images = (json['image'] as List? ?? const [])
-        .whereType<Map>()
-        .toList();
-    final image = images.firstWhere(
-      (item) => item['quality'] == '500x500',
-      orElse: () => images.isEmpty ? const {} : images.last,
-    );
+    final moreInfo = json['more_info'] is Map ? json['more_info'] as Map : null;
 
-    final artists = json['artists'] is Map
-        ? (json['artists']['primary'] as List? ?? const [])
-        : const [];
+    // 1. Artwork URL
+    String artworkUrl = '';
+    final rawImage = json['image'] ?? json['artwork'];
+    if (rawImage is String) {
+      artworkUrl = upgradeArtwork(rawImage);
+    } else if (rawImage is List) {
+      final images = rawImage.whereType<Map>().toList();
+      final image = images.firstWhere(
+        (item) => item['quality'] == '500x500',
+        orElse: () => images.isEmpty ? const {} : images.last,
+      );
+      artworkUrl = upgradeArtwork('${image['url'] ?? ''}');
+    }
 
-    final primaryArtistsString = artists
-        .whereType<Map>()
-        .map((a) => a['name'])
-        .where((name) => name != null && '$name'.trim().isNotEmpty)
-        .join(', ');
+    // 2. Title
+    final rawTitle = json['title'] ?? json['song'] ?? json['name'] ?? 'Unknown title';
+    final title = decodeHtmlEntities('$rawTitle');
 
-    final artist =
-        json['primaryArtists'] ??
-        json['singers'] ??
-        json['artist'] ??
-        (primaryArtistsString.isNotEmpty
-            ? primaryArtistsString
-            : (artists.isNotEmpty ? artists.first['name'] : 'Unknown artist'));
+    // 3. Artist name extraction
+    String artist = '';
+    if (moreInfo != null && moreInfo['artistMap'] is Map) {
+      final am = moreInfo['artistMap'] as Map;
+      final primary = am['primary_artists'] as List? ?? const [];
+      final primaryNames = primary
+          .whereType<Map>()
+          .map((a) => decodeHtmlEntities(a['name']?.toString()))
+          .where((n) => n.isNotEmpty)
+          .join(', ');
+      if (primaryNames.isNotEmpty) artist = primaryNames;
+    }
+    if (artist.isEmpty && json['artists'] is Map) {
+      final primary = json['artists']['primary'] as List? ?? const [];
+      final names = primary
+          .whereType<Map>()
+          .map((a) => decodeHtmlEntities(a['name']?.toString()))
+          .where((n) => n.isNotEmpty)
+          .join(', ');
+      if (names.isNotEmpty) artist = names;
+    }
+    if (artist.isEmpty) {
+      final rawArtist = json['primaryArtists'] ??
+          json['singers'] ??
+          json['artist'] ??
+          json['subtitle'] ??
+          'Unknown artist';
+      artist = decodeHtmlEntities('$rawArtist');
+    }
 
-    final urls = (json['downloadUrl'] as List? ?? const [])
-        .whereType<Map>()
-        .map((item) => Map<String, dynamic>.from(item))
-        .toList();
+    // 4. Album name
+    String albumName = '';
+    if (moreInfo != null && moreInfo['album'] != null) {
+      albumName = decodeHtmlEntities('${moreInfo['album']}');
+    } else if (json['album'] is Map) {
+      albumName = decodeHtmlEntities('${json['album']['name'] ?? ''}');
+    } else if (json['album'] != null) {
+      albumName = decodeHtmlEntities('${json['album']}');
+    }
 
-    final highestAudio = urls.firstWhere(
-      (u) => u['quality'] == '320kbps',
-      orElse: () => urls.isNotEmpty ? urls.last : const {},
-    );
-    final audioUrl =
-        json['audioUrl'] as String? ?? highestAudio['url'] as String?;
+    // 5. Duration in seconds
+    int duration = 0;
+    if (moreInfo != null && moreInfo['duration'] != null) {
+      duration = int.tryParse('${moreInfo['duration']}') ?? 0;
+    } else if (json['duration'] != null) {
+      duration = int.tryParse('${json['duration']}') ?? 0;
+    }
+
+    // 6. Audio stream and download URLs (decrypt on-the-fly if needed)
+    List<Map<String, dynamic>> urls = [];
+    final existingUrls = json['downloadUrl'] ?? json['downloadUrls'];
+    if (existingUrls is List && existingUrls.isNotEmpty) {
+      urls = existingUrls
+          .whereType<Map>()
+          .map((item) => Map<String, dynamic>.from(item))
+          .toList();
+    }
+
+    if (urls.isEmpty) {
+      final encryptedUrl = (moreInfo?['encrypted_media_url'] ??
+              moreInfo?['encrypted_media_path'] ??
+              json['encrypted_media_url']) as String?;
+      if (encryptedUrl != null && encryptedUrl.isNotEmpty) {
+        final decrypted = decryptMediaUrl(encryptedUrl);
+        if (decrypted != null) {
+          urls = buildQualityUrls(decrypted);
+        }
+      }
+    }
+
+    String? streamUrl;
+    if (urls.isNotEmpty) {
+      final highest = urls.firstWhere(
+        (u) => u['quality'] == '320kbps',
+        orElse: () => urls.first,
+      );
+      streamUrl = highest['url'] as String?;
+    } else {
+      streamUrl = json['streamUrl'] as String? ?? json['audioUrl'] as String?;
+    }
 
     return Song(
-      id: '${json['id'] ?? json['title']}',
-      title: '${json['title'] ?? json['name'] ?? 'Unknown title'}',
-      artist: '$artist',
-      album: json['album'] is Map
-          ? '${json['album']['name'] ?? ''}'
-          : '${json['album'] ?? ''}',
-      artwork: '${image['url'] ?? ''}',
-      duration: int.tryParse('${json['duration'] ?? 0}') ?? 0,
-      streamUrl: audioUrl,
+      id: '${json['id'] ?? title}',
+      title: title.isEmpty ? 'Unknown title' : title,
+      artist: artist.isEmpty ? 'Unknown artist' : artist,
+      album: albumName,
+      artwork: artworkUrl,
+      duration: duration,
+      streamUrl: streamUrl,
       downloadUrls: urls,
     );
   }
@@ -148,6 +262,7 @@ class Playlist {
     this.language = '',
     this.songCount = 0,
     this.songs = const [],
+    this.type = 'PLAYLIST',
   });
 
   final String id;
@@ -158,6 +273,7 @@ class Playlist {
   final String language;
   final int songCount;
   final List<Song> songs;
+  final String type;
 
   Playlist copyWith({
     String? id,
@@ -168,6 +284,7 @@ class Playlist {
     String? language,
     int? songCount,
     List<Song>? songs,
+    String? type,
   }) => Playlist(
     id: id ?? this.id,
     title: title ?? this.title,
@@ -177,106 +294,570 @@ class Playlist {
     language: language ?? this.language,
     songCount: songCount ?? this.songCount,
     songs: songs ?? this.songs,
+    type: type ?? this.type,
   );
 
   factory Playlist.fromJson(Map<String, dynamic> json) {
-    final images = (json['image'] as List? ?? const [])
-        .whereType<Map>()
-        .toList();
-    final image = images.firstWhere(
-      (item) => item['quality'] == '500x500',
-      orElse: () => images.isEmpty ? const {} : images.last,
-    );
+    String artworkUrl = '';
+    final rawImage = json['image'] ?? json['artwork'];
+    if (rawImage is String) {
+      artworkUrl = upgradeArtwork(rawImage);
+    } else if (rawImage is List) {
+      final images = rawImage.whereType<Map>().toList();
+      final image = images.firstWhere(
+        (item) => item['quality'] == '500x500',
+        orElse: () => images.isEmpty ? const {} : images.last,
+      );
+      artworkUrl = upgradeArtwork('${image['url'] ?? ''}');
+    }
 
-    final songsRaw = json['songs'];
+    final songsRaw = json['songs'] ?? json['list'];
     final songsList = (songsRaw is List ? songsRaw : const [])
         .whereType<Map>()
         .map((item) => Song.fromJson(Map<String, dynamic>.from(item)))
         .toList();
 
+    final count = int.tryParse(
+          '${json['songCount'] ?? json['list_count'] ?? json['more_info']?['song_count'] ?? songsList.length}',
+        ) ??
+        songsList.length;
+
     return Playlist(
-      id: '${json['id'] ?? ''}',
-      title: '${json['name'] ?? json['title'] ?? 'Playlist'}',
-      description: '${json['description'] ?? ''}',
-      artwork: '${image['url'] ?? ''}',
-      url: '${json['url'] ?? ''}',
+      id: '${json['id'] ?? json['listid'] ?? ''}',
+      title: decodeHtmlEntities(
+        '${json['title'] ?? json['name'] ?? json['listname'] ?? 'Playlist'}',
+      ),
+      description: decodeHtmlEntities(
+        '${json['description'] ?? json['subtitle'] ?? json['header_desc'] ?? ''}',
+      ),
+      artwork: artworkUrl,
+      url: '${json['url'] ?? json['permaUrl'] ?? json['perma_url'] ?? ''}',
       language: '${json['language'] ?? ''}',
-      songCount:
-          int.tryParse('${json['songCount'] ?? songsList.length}') ??
-          songsList.length,
+      songCount: count,
+      songs: songsList,
+      type: json['type']?.toString().toUpperCase() ?? 'PLAYLIST',
+    );
+  }
+}
+
+class Artist {
+  Artist({
+    required this.id,
+    required this.name,
+    this.image = '',
+    this.role = 'Artist',
+  });
+
+  final String id;
+  final String name;
+  final String image;
+  final String role;
+
+  factory Artist.fromJson(Map<String, dynamic> json) {
+    final rawImage = json['image']?.toString() ?? '';
+    final name = decodeHtmlEntities(
+      json['name']?.toString() ?? json['title']?.toString() ?? 'Artist',
+    );
+    return Artist(
+      id: '${json['id'] ?? ''}',
+      name: name.isEmpty ? 'Artist' : name,
+      image: upgradeArtwork(rawImage),
+      role: decodeHtmlEntities(json['role']?.toString() ?? 'Artist'),
+    );
+  }
+
+  Playlist toPlaylist() => Playlist(
+    id: id,
+    title: name,
+    description: role.isNotEmpty ? role : 'Artist',
+    artwork: image,
+    songCount: 0,
+    songs: const [],
+    type: 'ARTIST',
+  );
+}
+
+class Album {
+  Album({
+    required this.id,
+    required this.title,
+    this.subtitle = '',
+    this.artwork = '',
+    this.year = '',
+    this.songCount = 0,
+    this.songs = const [],
+  });
+
+  final String id;
+  final String title;
+  final String subtitle;
+  final String artwork;
+  final String year;
+  final int songCount;
+  final List<Song> songs;
+
+  factory Album.fromJson(Map<String, dynamic> json) {
+    final rawImage = json['image']?.toString() ?? json['artwork']?.toString() ?? '';
+    final title = decodeHtmlEntities(
+      json['title']?.toString() ?? json['name']?.toString() ?? 'Album',
+    );
+    final subtitle = decodeHtmlEntities(
+      json['subtitle']?.toString() ?? json['header_desc']?.toString() ?? '',
+    );
+    final count = int.tryParse(
+          '${json['songCount'] ?? json['more_info']?['song_count'] ?? json['list_count'] ?? 0}',
+        ) ??
+        0;
+    final year = json['year']?.toString() ?? '';
+
+    final songsRaw = json['songs'] ?? json['list'];
+    final songsList = (songsRaw is List ? songsRaw : const [])
+        .whereType<Map>()
+        .map((item) => Song.fromJson(Map<String, dynamic>.from(item)))
+        .toList();
+
+    return Album(
+      id: '${json['id'] ?? ''}',
+      title: title.isEmpty ? 'Album' : title,
+      subtitle: subtitle,
+      artwork: upgradeArtwork(rawImage),
+      year: year,
+      songCount: count > 0 ? count : songsList.length,
       songs: songsList,
     );
   }
+
+  Playlist toPlaylist() => Playlist(
+    id: id,
+    title: title,
+    description: subtitle.isNotEmpty ? subtitle : (year.isNotEmpty ? 'Album • $year' : 'Album'),
+    artwork: artwork,
+    songCount: songCount,
+    songs: songs,
+    type: 'ALBUM',
+  );
 }
 
 /* -------------------------------------------------------------------------- */
 /*                                    API                                     */
 /* -------------------------------------------------------------------------- */
 
-const _apiHeaders = AppConstants.apiHeaders;
-
 class Api {
-  static Future<Map<String, dynamic>> search(String query) async {
-    final response = await http.get(
-      Uri.parse(
-        '$_apiRoot/api/search?query=${Uri.encodeQueryComponent(query)}',
-      ),
-      headers: _apiHeaders,
-    );
-    if (response.statusCode >= 400) throw Exception('Search failed');
-    return jsonDecode(response.body) as Map<String, dynamic>;
-  }
-
-  static Future<Map<String, dynamic>?> details(String id) async {
-    final response = await http.get(
-      Uri.parse('$_apiRoot/api/songs/${Uri.encodeComponent(id)}'),
-      headers: _apiHeaders,
-    );
-    if (response.statusCode >= 400) return null;
-    final data = jsonDecode(response.body)['data'];
-    return data is List && data.isNotEmpty
-        ? Map<String, dynamic>.from(data.first)
-        : null;
-  }
-
-  static Future<List<Song>> suggestions(String id,
-      {int limit = AppConstants.suggestionsBatchSize}) async {
-    final response = await http.get(
-      Uri.parse(
-        '$_apiRoot/api/songs/${Uri.encodeComponent(id)}/suggestions'
-        '?id=${Uri.encodeComponent(id)}&limit=$limit',
-      ),
-      headers: _apiHeaders,
-    );
+  /// Search artists directly from JioSaavn public API.
+  static Future<List<Artist>> searchArtists(String query, {int n = 10, int page = 1}) async {
+    final uri = Uri.parse(AppConstants.saavnApiBaseUrl).replace(queryParameters: {
+      '__call': 'search.getArtistResults',
+      'q': query,
+      'p': '$page',
+      'n': '$n',
+      '_format': 'json',
+      '_marker': '0',
+      'api_version': '4',
+      'ctx': 'web6dot0',
+    });
+    final response = await http.get(uri, headers: AppConstants.saavnHeaders);
     if (response.statusCode >= 400) return [];
-    final data = jsonDecode(response.body)['data'];
-    return data is List
-        ? data
-              .whereType<Map>()
-              .map((item) => Song.fromJson(Map<String, dynamic>.from(item)))
-              .toList()
-        : [];
+    final data = jsonDecode(response.body);
+    final results = (data['results'] ?? data['artists']) as List? ?? const [];
+    return results
+        .whereType<Map>()
+        .map((item) => Artist.fromJson(Map<String, dynamic>.from(item)))
+        .toList();
   }
 
+  /// Search albums directly from JioSaavn public API.
+  static Future<List<Album>> searchAlbums(String query, {int n = 10, int page = 1}) async {
+    final uri = Uri.parse(AppConstants.saavnApiBaseUrl).replace(queryParameters: {
+      '__call': 'search.getAlbumResults',
+      'q': query,
+      'p': '$page',
+      'n': '$n',
+      '_format': 'json',
+      '_marker': '0',
+      'api_version': '4',
+      'ctx': 'web6dot0',
+    });
+    final response = await http.get(uri, headers: AppConstants.saavnHeaders);
+    if (response.statusCode >= 400) return [];
+    final data = jsonDecode(response.body);
+    final results = (data['results'] ?? data['albums']) as List? ?? const [];
+    return results
+        .whereType<Map>()
+        .map((item) => Album.fromJson(Map<String, dynamic>.from(item)))
+        .toList();
+  }
+
+  /// Search songs directly from JioSaavn public API.
+  static Future<List<Song>> searchSongs(String query, {int n = 20, int page = 1}) async {
+    final uri = Uri.parse(AppConstants.saavnApiBaseUrl).replace(queryParameters: {
+      '__call': 'search.getResults',
+      'q': query,
+      'p': '$page',
+      'n': '$n',
+      '_format': 'json',
+      '_marker': '0',
+      'api_version': '4',
+      'ctx': 'web6dot0',
+    });
+    final response = await http.get(uri, headers: AppConstants.saavnHeaders);
+    if (response.statusCode >= 400) throw Exception('Search songs failed');
+    final data = jsonDecode(response.body);
+    final results = (data['results'] ?? data['songs']) as List? ?? const [];
+    return results
+        .whereType<Map>()
+        .map((item) => Song.fromJson(Map<String, dynamic>.from(item)))
+        .toList();
+  }
+
+  /// Search playlists directly from JioSaavn public API.
+  static Future<List<Playlist>> searchPlaylists(String query, {int n = 20, int page = 1}) async {
+    final uri = Uri.parse(AppConstants.saavnApiBaseUrl).replace(queryParameters: {
+      '__call': 'search.getPlaylistResults',
+      'q': query,
+      'p': '$page',
+      'n': '$n',
+      '_format': 'json',
+      '_marker': '0',
+      'api_version': '4',
+      'ctx': 'web6dot0',
+    });
+    final response = await http.get(uri, headers: AppConstants.saavnHeaders);
+    if (response.statusCode >= 400) return [];
+    final data = jsonDecode(response.body);
+    final results = data['results'] as List? ?? const [];
+    return results
+        .whereType<Map>()
+        .map((item) => Playlist.fromJson(Map<String, dynamic>.from(item)))
+        .toList();
+  }
+
+  /// Fetch full song details and decrypted streams directly from JioSaavn.
+  static Future<Map<String, dynamic>?> details(String id) async {
+    final uri = Uri.parse(AppConstants.saavnApiBaseUrl).replace(queryParameters: {
+      '__call': 'song.getDetails',
+      'pids': id,
+      '_format': 'json',
+      '_marker': '0',
+      'api_version': '4',
+      'ctx': 'web6dot0',
+    });
+    final response = await http.get(uri, headers: AppConstants.saavnHeaders);
+    if (response.statusCode >= 400) return null;
+    final data = jsonDecode(response.body);
+    List? songs = data['songs'] as List?;
+    if (songs == null || songs.isEmpty) {
+      final fallbackUri = Uri.parse(AppConstants.saavnApiBaseUrl).replace(queryParameters: {
+        '__call': 'webapi.get',
+        'token': id,
+        'type': 'song',
+        '_format': 'json',
+        '_marker': '0',
+        'api_version': '4',
+        'ctx': 'web6dot0',
+      });
+      final fbRes = await http.get(fallbackUri, headers: AppConstants.saavnHeaders);
+      if (fbRes.statusCode < 400) {
+        final fbData = jsonDecode(fbRes.body);
+        if (fbData is Map && fbData['songs'] is List) {
+          songs = fbData['songs'] as List;
+        } else if (fbData is Map && fbData.containsKey('id')) {
+          songs = [fbData];
+        }
+      }
+    }
+    if (songs != null && songs.isNotEmpty) {
+      final rawSong = Map<String, dynamic>.from(songs.first as Map);
+      final parsedSong = Song.fromJson(rawSong);
+      return parsedSong.toJson();
+    }
+    return null;
+  }
+
+  /// Fetch related songs (Up Next) using album siblings + primary artists mix.
+  static Future<List<Song>> suggestions(String songId,
+      {int limit = AppConstants.suggestionsBatchSize}) async {
+    try {
+      final uri = Uri.parse(AppConstants.saavnApiBaseUrl).replace(queryParameters: {
+        '__call': 'song.getDetails',
+        'pids': songId,
+        '_format': 'json',
+        '_marker': '0',
+        'api_version': '4',
+        'ctx': 'web6dot0',
+      });
+      final response = await http.get(uri, headers: AppConstants.saavnHeaders);
+      if (response.statusCode >= 400) return [];
+      final data = jsonDecode(response.body);
+      final songs = data['songs'] as List?;
+      if (songs == null || songs.isEmpty) return [];
+
+      final seedSong = songs.first as Map;
+      final mi = seedSong['more_info'] is Map ? seedSong['more_info'] as Map : null;
+      final albumId = mi?['album_id']?.toString();
+      final primaryArtists = (mi?['artistMap']?['primary_artists'] as List? ?? const [])
+          .whereType<Map>()
+          .toList();
+
+      final seenIds = <String>{songId};
+      final albumPicks = <Song>[];
+      final artistPicks = <Song>[];
+
+      // 1. Album siblings
+      if (albumId != null && albumId.isNotEmpty && albumId != '0') {
+        try {
+          final albUri = Uri.parse(AppConstants.saavnApiBaseUrl).replace(queryParameters: {
+            '__call': 'content.getAlbumDetails',
+            'albumid': albumId,
+            '_format': 'json',
+            '_marker': '0',
+            'api_version': '4',
+            'ctx': 'web6dot0',
+          });
+          final albRes = await http.get(albUri, headers: AppConstants.saavnHeaders);
+          if (albRes.statusCode < 400) {
+            final albData = jsonDecode(albRes.body);
+            final list = (albData['list'] ?? albData['songs']) as List? ?? const [];
+            for (final item in list.whereType<Map>()) {
+              final s = Song.fromJson(Map<String, dynamic>.from(item));
+              if (s.id.isNotEmpty && !seenIds.contains(s.id)) {
+                seenIds.add(s.id);
+                albumPicks.add(s);
+              }
+            }
+          }
+        } catch (_) {}
+      }
+
+      // 2. Artist top tracks
+      for (final artist in primaryArtists.take(2)) {
+        final artistId = artist['id']?.toString();
+        if (artistId == null || artistId.isEmpty) continue;
+        try {
+          final artUri = Uri.parse(AppConstants.saavnApiBaseUrl).replace(queryParameters: {
+            '__call': 'artist.getArtistPageDetails',
+            'artistId': artistId,
+            'n_song': '20',
+            '_format': 'json',
+            '_marker': '0',
+            'api_version': '4',
+            'ctx': 'web6dot0',
+          });
+          final artRes = await http.get(artUri, headers: AppConstants.saavnHeaders);
+          if (artRes.statusCode < 400) {
+            final artData = jsonDecode(artRes.body);
+            final top = (artData['topSongs'] ?? artData['songs']) as List? ?? const [];
+            for (final item in top.whereType<Map>()) {
+              final s = Song.fromJson(Map<String, dynamic>.from(item));
+              if (s.id.isNotEmpty && !seenIds.contains(s.id)) {
+                seenIds.add(s.id);
+                artistPicks.add(s);
+              }
+            }
+          }
+        } catch (_) {}
+      }
+
+      // 3. Interleave recommendations
+      final merged = <Song>[];
+      final aQueue = List<Song>.from(albumPicks);
+      final bQueue = List<Song>.from(artistPicks);
+      while (aQueue.isNotEmpty || bQueue.isNotEmpty) {
+        if (aQueue.isNotEmpty) merged.add(aQueue.removeAt(0));
+        if (bQueue.isNotEmpty) merged.add(bQueue.removeAt(0));
+        if (aQueue.length > 3) merged.add(aQueue.removeAt(0));
+      }
+
+      return merged.take(limit).toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  /// Playlist details directly from JioSaavn.
   static Future<Playlist?> playlist(String id,
       {int limit = AppConstants.playlistFetchLimit}) async {
     try {
-      final response = await http.get(
-        Uri.parse(
-          '$_apiRoot/api/playlists?id=${Uri.encodeComponent(id)}&limit=$limit',
-        ),
-        headers: _apiHeaders,
-      );
-      if (response.statusCode >= 400) return null;
-      final json = jsonDecode(response.body);
-      if (json is Map && json['success'] == true && json['data'] is Map) {
-        return Playlist.fromJson(Map<String, dynamic>.from(json['data']));
+      // 1. Try playlist.getDetails with listid
+      final uri = Uri.parse(AppConstants.saavnApiBaseUrl).replace(queryParameters: {
+        '__call': 'playlist.getDetails',
+        'listid': id,
+        '_format': 'json',
+        '_marker': '0',
+        'api_version': '4',
+        'ctx': 'web6dot0',
+      });
+      final response = await http.get(uri, headers: AppConstants.saavnHeaders);
+      if (response.statusCode < 400) {
+        final data = jsonDecode(response.body);
+        if (data is Map && (data.containsKey('id') || data.containsKey('listid') || data.containsKey('songs') || data.containsKey('list'))) {
+          return Playlist.fromJson(Map<String, dynamic>.from(data));
+        }
+      }
+
+      // 2. Fallback: webapi.get with token
+      final tokenUri = Uri.parse(AppConstants.saavnApiBaseUrl).replace(queryParameters: {
+        '__call': 'webapi.get',
+        'token': id,
+        'type': 'playlist',
+        '_format': 'json',
+        '_marker': '0',
+        'api_version': '4',
+        'ctx': 'web6dot0',
+      });
+      final tokenRes = await http.get(tokenUri, headers: AppConstants.saavnHeaders);
+      if (tokenRes.statusCode < 400) {
+        final data = jsonDecode(tokenRes.body);
+        if (data is Map && (data.containsKey('id') || data.containsKey('songs') || data.containsKey('list'))) {
+          return Playlist.fromJson(Map<String, dynamic>.from(data));
+        }
       }
     } catch (_) {}
     return null;
   }
 
+  /// Album details directly from JioSaavn.
+  static Future<Playlist?> album(String id) async {
+    try {
+      final uri = Uri.parse(AppConstants.saavnApiBaseUrl).replace(queryParameters: {
+        '__call': 'content.getAlbumDetails',
+        'albumid': id,
+        '_format': 'json',
+        '_marker': '0',
+        'api_version': '4',
+        'ctx': 'web6dot0',
+      });
+      final res = await http.get(uri, headers: AppConstants.saavnHeaders);
+      if (res.statusCode < 400) {
+        final data = jsonDecode(res.body);
+        if (data is Map && (data.containsKey('id') || data.containsKey('list') || data.containsKey('songs'))) {
+          return Album.fromJson(Map<String, dynamic>.from(data)).toPlaylist();
+        }
+      }
+      final fbUri = Uri.parse(AppConstants.saavnApiBaseUrl).replace(queryParameters: {
+        '__call': 'webapi.get',
+        'token': id,
+        'type': 'album',
+        '_format': 'json',
+        '_marker': '0',
+        'api_version': '4',
+        'ctx': 'web6dot0',
+      });
+      final fbRes = await http.get(fbUri, headers: AppConstants.saavnHeaders);
+      if (fbRes.statusCode < 400) {
+        final data = jsonDecode(fbRes.body);
+        if (data is Map && (data.containsKey('id') || data.containsKey('list') || data.containsKey('songs'))) {
+          return Album.fromJson(Map<String, dynamic>.from(data)).toPlaylist();
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  /// Artist details and top songs directly from JioSaavn.
+  static Future<Playlist?> artist(String id) async {
+    try {
+      final uri = Uri.parse(AppConstants.saavnApiBaseUrl).replace(queryParameters: {
+        '__call': 'artist.getArtistPageDetails',
+        'artistId': id,
+        'n_song': '50',
+        'n_album': '10',
+        '_format': 'json',
+        '_marker': '0',
+        'api_version': '4',
+        'ctx': 'web6dot0',
+      });
+      final res = await http.get(uri, headers: AppConstants.saavnHeaders);
+      if (res.statusCode < 400) {
+        final data = jsonDecode(res.body);
+        if (data is Map) {
+          final top = (data['topSongs'] ?? data['songs']) as List? ?? const [];
+          final songs = top
+              .whereType<Map>()
+              .map((item) => Song.fromJson(Map<String, dynamic>.from(item)))
+              .toList();
+          final name = decodeHtmlEntities(data['name']?.toString() ?? 'Artist');
+          final rawImage = data['image']?.toString() ?? '';
+          return Playlist(
+            id: id,
+            title: name,
+            description: 'Top Songs by $name',
+            artwork: upgradeArtwork(rawImage),
+            songCount: songs.length,
+            songs: songs,
+            type: 'ARTIST',
+          );
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  /// Synced or plain lyrics (LRCLIB prioritized for sync timestamps, JioSaavn fallback).
   static Future<Map<String, dynamic>?> lyrics(Song song) async {
+    // 1. LRCLIB for timestamped synced lyrics
+    try {
+      final lrclibData = await _lrclibFallback(song);
+      if (lrclibData != null &&
+          ((lrclibData['syncedLyrics'] != null && '${lrclibData['syncedLyrics']}'.trim().isNotEmpty) ||
+           (lrclibData['plainLyrics'] != null && '${lrclibData['plainLyrics']}'.trim().isNotEmpty))) {
+        return lrclibData;
+      }
+    } catch (_) {}
+
+    // 2. JioSaavn lyrics fallback
+    try {
+      final uri = Uri.parse(AppConstants.saavnApiBaseUrl).replace(queryParameters: {
+        '__call': 'song.getDetails',
+        'pids': song.id,
+        '_format': 'json',
+        '_marker': '0',
+        'api_version': '4',
+        'ctx': 'web6dot0',
+      });
+      final res = await http
+          .get(uri, headers: AppConstants.saavnHeaders)
+          .timeout(const Duration(seconds: 5));
+      if (res.statusCode < 400) {
+        final data = jsonDecode(res.body);
+        final songs = data['songs'] as List?;
+        if (songs != null && songs.isNotEmpty) {
+          final s = songs.first;
+          final lyricsId = s['more_info']?['lyrics_id'];
+          if (lyricsId != null && '$lyricsId'.isNotEmpty) {
+            final lyrUri = Uri.parse(AppConstants.saavnApiBaseUrl).replace(queryParameters: {
+              '__call': 'lyrics.getLyrics',
+              'lyrics_id': '$lyricsId',
+              '_format': 'json',
+              '_marker': '0',
+              'api_version': '4',
+              'ctx': 'web6dot0',
+            });
+            final lyrRes = await http
+                .get(lyrUri, headers: AppConstants.saavnHeaders)
+                .timeout(const Duration(seconds: 5));
+            if (lyrRes.statusCode < 400) {
+              final lyrData = jsonDecode(lyrRes.body);
+              final rawLyrics = lyrData['lyrics'] ?? lyrData['lyrics_text'] ?? lyrData['data']?['lyrics'];
+              if (rawLyrics != null && '$rawLyrics'.isNotEmpty) {
+                final cleaned = decodeHtmlEntities('$rawLyrics')
+                    .replaceAll('<br>', '\n')
+                    .replaceAll('<br/>', '\n');
+                return {
+                  'syncedLyrics': null,
+                  'plainLyrics': cleaned,
+                };
+              }
+            }
+          }
+        }
+      }
+    } catch (_) {}
+
+    return null;
+  }
+
+  /// LRCLIB lookup helper for lyrics.
+  static Future<Map<String, dynamic>?> _lrclibFallback(Song song) async {
     final artist = song.artist
         .split(RegExp(r',|&|feat\.|ft\.', caseSensitive: false))
         .first
@@ -289,7 +870,9 @@ class Api {
         if (song.duration > 0) 'duration': '${song.duration}',
       },
     );
-    final response = await http.get(uri);
+    final response = await http
+        .get(uri)
+        .timeout(const Duration(seconds: 5));
     return response.statusCode == 200
         ? jsonDecode(response.body) as Map<String, dynamic>
         : null;
@@ -321,6 +904,230 @@ List<LyricLine> parseLyrics(String? source) {
 /* -------------------------------------------------------------------------- */
 /*                                 STATIC DATA                                */
 /* -------------------------------------------------------------------------- */
+
+final _speedDialSongs = <Song>[
+  // Page 1
+  Song(
+    id: '3IoDK8qI',
+    title: 'Levitating',
+    artist: 'Dua Lipa',
+    album: 'Future Nostalgia',
+    artwork:
+        'https://c.saavncdn.com/665/Future-Nostalgia-English-2020-20260306223201-500x500.jpg',
+  ),
+  Song(
+    id: 'v4xkJtw9',
+    title: 'Take Me Out',
+    artist: 'Franz Ferdinand',
+    album: 'Franz Ferdinand',
+    artwork:
+        'https://c.saavncdn.com/074/Fita-Perdida-Soul-Blues-Vol-1-Portuguese-2026-20251223100039-500x500.jpg',
+  ),
+  Song(
+    id: '8Ti1DvzG',
+    title: 'Sweater Weather',
+    artist: 'The Neighbourhood',
+    album: 'I Love You.',
+    artwork:
+        'https://c.saavncdn.com/834/I-Love-You--English-2013-20220323205211-500x500.jpg',
+  ),
+  Song(
+    id: 'Rf0Y2Hfl',
+    title: 'The Hills',
+    artist: 'The Weeknd',
+    album: 'Beauty Behind the Madness',
+    artwork:
+        'https://c.saavncdn.com/464/The-Hills-English-2015-500x500.jpg',
+  ),
+  Song(
+    id: 'CG4tAd4L',
+    title: 'Lose Yourself',
+    artist: 'Eminem',
+    album: 'Curtain Call: The Hits',
+    artwork:
+        'https://c.saavncdn.com/810/Just-Lose-It-English-2004-20190314081750-500x500.jpg',
+  ),
+  Song(
+    id: 'o008byuo',
+    title: 'Animals',
+    artist: 'Martin Garrix',
+    album: 'Gold Skies',
+    artwork:
+        'https://c.saavncdn.com/732/Now-That-s-What-I-Call-EDM-2014-2014-500x500.jpg',
+  ),
+  Song(
+    id: 'L3Sv41-x',
+    title: 'Do I Wanna Know?',
+    artist: 'Arctic Monkeys',
+    album: 'AM',
+    artwork:
+        'https://c.saavncdn.com/267/Do-I-Wanna-Know-Unknown-2013-20221004085010-500x500.jpg',
+  ),
+  Song(
+    id: '-Q6Q6kd-',
+    title: "Ain't No Sunshine",
+    artist: 'Bill Withers',
+    album: 'Just as I Am',
+    artwork:
+        'https://c.saavncdn.com/894/Love-Ballads-Vol-2-English-2015-500x500.jpg',
+  ),
+  Song(
+    id: '3-YCxCgm',
+    title: 'Uptown Funk',
+    artist: 'Mark Ronson ft. Bruno Mars',
+    album: 'Uptown Special',
+    artwork:
+        'https://c.saavncdn.com/797/Uptown-Special-English-2015-20200916193614-500x500.jpg',
+  ),
+
+  // Page 2
+  Song(
+    id: 'vFL4IlAt',
+    title: 'Teenage Dream',
+    artist: 'Katy Perry',
+    album: 'Teenage Dream',
+    artwork:
+        'https://c.saavncdn.com/349/Love-Songs-2010s-English-2026-20260923163739-500x500.jpg',
+  ),
+  Song(
+    id: 'hY3DnlHM',
+    title: 'Boulevard of Broken Dreams',
+    artist: 'Green Day',
+    album: 'American Idiot',
+    artwork:
+        'https://c.saavncdn.com/891/Boulevard-of-Broken-Dreams-English-2009-20190607050628-500x500.jpg',
+  ),
+  Song(
+    id: 'aNiYDMgM',
+    title: 'Rather Be',
+    artist: 'Clean Bandit',
+    album: 'New Eyes',
+    artwork:
+        'https://c.saavncdn.com/636/Rather-Be-feat-Jess-Glynne--English-2014-20190607044522-500x500.jpg',
+  ),
+  Song(
+    id: 'V25xkriv',
+    title: 'Earned It',
+    artist: 'The Weeknd',
+    album: 'Fifty Shades of Grey',
+    artwork:
+        'https://c.saavncdn.com/396/The-Highlights-English-2021-20240207045714-500x500.jpg',
+  ),
+  Song(
+    id: 'ddiNyJMU',
+    title: 'Counting Stars',
+    artist: 'OneRepublic',
+    album: 'Native',
+    artwork:
+        'https://c.saavncdn.com/574/Native-English-2014-20250626055252-500x500.jpg',
+  ),
+  Song(
+    id: 'd0gj_v_e',
+    title: 'Riptide',
+    artist: 'Vance Joy',
+    album: 'Dream Your Life Away',
+    artwork:
+        'https://c.saavncdn.com/653/Dream-Your-Life-Away-English-2014-20190607044515-500x500.jpg',
+  ),
+  Song(
+    id: 'qlZqBC5n',
+    title: 'The Nights',
+    artist: 'Avicii',
+    album: 'The Days / Nights',
+    artwork:
+        'https://c.saavncdn.com/148/2014-Vibes-English-2026-20260605203017-500x500.jpg',
+  ),
+  Song(
+    id: 'cst2LxFR',
+    title: 'Without Me',
+    artist: 'Eminem',
+    album: 'The Eminem Show',
+    artwork:
+        'https://c.saavncdn.com/020/The-Eminem-Show-Unknown-2007-20250826100622-500x500.jpg',
+  ),
+  Song(
+    id: 'XJ2N9gez',
+    title: 'Payphone',
+    artist: 'Maroon 5',
+    album: 'Overexposed',
+    artwork:
+        'https://c.saavncdn.com/057/Payphone-2012-500x500.jpg',
+  ),
+
+  // Page 3
+  Song(
+    id: '3g5G9QTu',
+    title: 'Demons',
+    artist: 'Imagine Dragons',
+    album: 'Night Visions',
+    artwork:
+        'https://c.saavncdn.com/210/Night-Visions-2013-500x500.jpg',
+  ),
+  Song(
+    id: 'sG5akHmg',
+    title: 'Stolen Dance',
+    artist: 'Milky Chance',
+    album: 'Sadnecessary',
+    artwork:
+        'https://c.saavncdn.com/160/Sadnecessary-English-2013-20220204225002-500x500.jpg',
+  ),
+  Song(
+    id: 'AbFGQGPX',
+    title: 'Stay With Me',
+    artist: 'Sam Smith',
+    album: 'In the Lonely Hour',
+    artwork:
+        'https://c.saavncdn.com/722/In-The-Lonely-Hour-English-2014-500x500.jpg',
+  ),
+  Song(
+    id: 'Ppq9UTh8',
+    title: 'Radioactive',
+    artist: 'Imagine Dragons',
+    album: 'Night Visions',
+    artwork:
+        'https://c.saavncdn.com/039/Radioactive-2014-500x500.jpg',
+  ),
+  Song(
+    id: '7Q9IVoty',
+    title: 'Pompeii',
+    artist: 'Bastille',
+    album: 'Bad Blood',
+    artwork:
+        'https://c.saavncdn.com/077/Best-Safe-for-Work-Songs-English-2026-20260914164525-500x500.jpg',
+  ),
+  Song(
+    id: 'jgURVd6V',
+    title: 'Wake Me Up',
+    artist: 'Avicii',
+    album: 'True',
+    artwork:
+        'https://c.saavncdn.com/466/Sport-Motivation-Booster-High-Energy-English-2026-20260605184016-500x500.jpg',
+  ),
+  Song(
+    id: 'u3b2we7c',
+    title: 'Somebody That I Used to Know',
+    artist: 'Gotye ft. Kimbra',
+    album: 'Making Mirrors',
+    artwork:
+        'https://c.saavncdn.com/856/Somebody-That-I-Used-To-Know-Remixes-2012-500x500.jpg',
+  ),
+  Song(
+    id: 'Vfs5WLX-',
+    title: 'Locked Out of Heaven',
+    artist: 'Bruno Mars',
+    album: 'Unorthodox Jukebox',
+    artwork:
+        'https://c.saavncdn.com/856/Locked-Out-Of-Heaven-English-2012-500x500.jpg',
+  ),
+  Song(
+    id: 'eCaKjCac',
+    title: 'Midnight City',
+    artist: 'M83',
+    album: "Hurry Up, We're Dreaming",
+    artwork:
+        'https://c.saavncdn.com/647/Hurry-up-We-re-Dreaming-English-2011-500x500.jpg',
+  ),
+];
 
 final _trendingSongs = <Song>[
   Song(
@@ -586,6 +1393,492 @@ final _featuredPlaylists = <Playlist>[
   ),
 ];
 
+final _hindiSpeedDialSongs = <Song>[
+  // Page 1
+  Song(
+    id: 'rjkrTnma',
+    title: 'Kesariya',
+    artist: 'Pritam',
+    album: 'Brahmastra',
+    artwork:
+        'https://c.saavncdn.com/871/Brahmastra-Original-Motion-Picture-Soundtrack-Hindi-2022-20221006155213-500x500.jpg',
+  ),
+  Song(
+    id: 'aRZbUYD7',
+    title: 'Tum Hi Ho',
+    artist: 'Mithoon',
+    album: 'Aashiqui 2',
+    artwork: 'https://c.saavncdn.com/430/Aashiqui-2-Hindi-2013-500x500.jpg',
+  ),
+  Song(
+    id: 'mPTrDSun',
+    title: 'Raataan Lambiyan',
+    artist: 'Tanishk Bagchi',
+    album: 'Shershaah',
+    artwork:
+        'https://c.saavncdn.com/238/Shershaah-Original-Motion-Picture-Soundtrack--Hindi-2021-20210815181610-500x500.jpg',
+  ),
+  Song(
+    id: 'koWi7GRH',
+    title: 'Apna Bana Le',
+    artist: 'Amitabh Bhattacharya',
+    album: 'Bhediya',
+    artwork:
+        'https://c.saavncdn.com/228/Sachin-Jigar-Bollywood-Hits-Hindi-2026-20260630213800-500x500.jpg',
+  ),
+  Song(
+    id: 'yDnFw7my',
+    title: 'Chaleya',
+    artist: 'Anirudh Ravichander',
+    album: 'Jawan',
+    artwork:
+        'https://c.saavncdn.com/179/World-Music-Day-Best-Of-Bollywood-Hits-Hindi-2026-20260622111029-500x500.jpg',
+  ),
+  Song(
+    id: 'rBltEr7X',
+    title: 'Tere Vaaste',
+    artist: 'Amitabh Bhattacharya',
+    album: 'Zara Hatke Zara Bachke',
+    artwork:
+        'https://c.saavncdn.com/336/Zara-Hatke-Zara-Bachke-Hindi-2023-20250129153124-500x500.jpg',
+  ),
+  Song(
+    id: '_rJmbKSP',
+    title: 'Shayad',
+    artist: 'Pritam',
+    album: 'Love Aaj Kal',
+    artwork:
+        'https://c.saavncdn.com/862/Love-Aaj-Kal-Hindi-2020-20200214140423-500x500.jpg',
+  ),
+  Song(
+    id: 'RgLLRnht',
+    title: 'Dil Diyan Gallan',
+    artist: 'Atif Aslam',
+    album: 'Tiger Zinda Hai',
+    artwork:
+        'https://c.saavncdn.com/893/Dil-Diyan-Gallan-From-Carry-On-Jatta-4-Punjabi-2026-20260520103640-500x500.jpg',
+  ),
+  Song(
+    id: 'TfJX33Qk',
+    title: 'Kal Ho Naa Ho',
+    artist: 'Shankar-Ehsaan-Loy',
+    album: 'Kal Ho Naa Ho',
+    artwork:
+        'https://c.saavncdn.com/587/Kal-Ho-Naa-Ho-Hindi-2003-20190516130956-500x500.jpg',
+  ),
+
+  // Page 2
+  Song(
+    id: 'AYHP28Sh',
+    title: 'Phir Aur Kya Chahiye',
+    artist: 'Amitabh Bhattacharya',
+    album: 'Zara Hatke Zara Bachke',
+    artwork:
+        'https://c.saavncdn.com/336/Zara-Hatke-Zara-Bachke-Hindi-2023-20250129153124-500x500.jpg',
+  ),
+  Song(
+    id: 'wcsDiSsA',
+    title: 'O Maahi',
+    artist: 'Pritam',
+    album: 'Dunki',
+    artwork:
+        'https://c.saavncdn.com/139/Dunki-Hindi-2023-20231220211003-500x500.jpg',
+  ),
+  Song(
+    id: 'Ni6noMmw',
+    title: 'Agar Tum Saath Ho',
+    artist: 'Alka Yagnik',
+    album: 'Tamasha',
+    artwork:
+        'https://c.saavncdn.com/994/Tamasha-Hindi-2015-500x500.jpg',
+  ),
+  Song(
+    id: 'uiEWT3kP',
+    title: 'Channa Mereya',
+    artist: 'Pritam',
+    album: 'Ae Dil Hai Mushkil',
+    artwork:
+        'https://c.saavncdn.com/257/Ae-Dil-Hai-Mushkil-Hindi-2016-500x500.jpg',
+  ),
+  Song(
+    id: 'NIidiD9g',
+    title: 'Heeriye',
+    artist: 'Jasleen Royal, Arijit Singh',
+    album: 'Heeriye',
+    artwork:
+        'https://c.saavncdn.com/022/Heeriye-feat-Arijit-Singh-Hindi-2023-20230928050405-500x500.jpg',
+  ),
+  Song(
+    id: 'OtKh5C06',
+    title: 'Bekhayali',
+    artist: 'Sachet Tandon',
+    album: 'Kabir Singh',
+    artwork:
+        'https://c.saavncdn.com/807/Kabir-Singh-Hindi-2019-20240131131003-500x500.jpg',
+  ),
+  Song(
+    id: '4NRpZd1v',
+    title: 'Hawayein',
+    artist: 'Pritam',
+    album: 'Jab Harry Met Sejal',
+    artwork:
+        'https://c.saavncdn.com/584/Jab-Harry-Met-Sejal-Hindi-2017-20170803161007-500x500.jpg',
+  ),
+  Song(
+    id: '05BTlVwi',
+    title: 'Tere Hawaale',
+    artist: 'Amitabh Bhattacharya',
+    album: 'Laal Singh Chaddha',
+    artwork:
+        'https://c.saavncdn.com/179/World-Music-Day-Best-Of-Bollywood-Hits-Hindi-2026-20260622111029-500x500.jpg',
+  ),
+  Song(
+    id: '4CI_0bzt',
+    title: 'Ilahi',
+    artist: 'Pritam',
+    album: 'Yeh Jawaani Hai Deewani',
+    artwork:
+        'https://c.saavncdn.com/440/Yeh-Jawaani-Hai-Deewani-2013-500x500.jpg',
+  ),
+
+  // Page 3
+  Song(
+    id: 'LXTWWvvX',
+    title: 'Subhanallah',
+    artist: 'Pritam',
+    album: 'Yeh Jawaani Hai Deewani',
+    artwork:
+        'https://c.saavncdn.com/440/Yeh-Jawaani-Hai-Deewani-2013-500x500.jpg',
+  ),
+  Song(
+    id: 'oqSP8nSu',
+    title: 'Zaalima',
+    artist: 'Arijit Singh',
+    album: 'Raees',
+    artwork:
+        'https://c.saavncdn.com/238/Romantic-Classics-Hits-Hindi-2026-20260529163838-500x500.jpg',
+  ),
+  Song(
+    id: 'Nu9ulzC7',
+    title: 'Kun Faya Kun',
+    artist: 'A.R. Rahman',
+    album: 'Rockstar',
+    artwork:
+        'https://c.saavncdn.com/333/A-R-Rahman-Special-Hindi-2025-20250429141118-500x500.jpg',
+  ),
+  Song(
+    id: '1e0En7YX',
+    title: 'Pehle Bhi Main',
+    artist: 'Vishal Mishra',
+    album: 'ANIMAL',
+    artwork:
+        'https://c.saavncdn.com/092/ANIMAL-Hindi-2023-20260724191152-500x500.jpg',
+  ),
+  Song(
+    id: 'LU5-HHC1',
+    title: 'Satranga',
+    artist: 'Arijit Singh',
+    album: 'ANIMAL',
+    artwork:
+        'https://c.saavncdn.com/179/World-Music-Day-Best-Of-Bollywood-Hits-Hindi-2026-20260622111029-500x500.jpg',
+  ),
+  Song(
+    id: 'Ke9TPSUf',
+    title: 'Tujhe Kitna Chahne Lage',
+    artist: 'Arijit Singh',
+    album: 'Kabir Singh',
+    artwork:
+        'https://c.saavncdn.com/807/Kabir-Singh-Hindi-2019-20240131131003-500x500.jpg',
+  ),
+  Song(
+    id: 'xJZBjDck',
+    title: 'Raabta',
+    artist: 'Arijit Singh',
+    album: 'Agent Vinod',
+    artwork:
+        'https://c.saavncdn.com/840/Best-Of-Arijit-Singh-Collection-Of-Romantic-Songs-Hindi-2025-20251203161112-500x500.jpg',
+  ),
+  Song(
+    id: 'uf2JX_12',
+    title: 'Tera Ban Jaunga',
+    artist: 'Akhil Sachdeva',
+    album: 'Kabir Singh',
+    artwork:
+        'https://c.saavncdn.com/807/Kabir-Singh-Hindi-2019-20240131131003-500x500.jpg',
+  ),
+  Song(
+    id: 'st2Dycrf',
+    title: 'Gerua',
+    artist: 'Pritam',
+    album: 'Dilwale',
+    artwork:
+        'https://c.saavncdn.com/297/Dilwale-Hindi-2015-20260120201359-500x500.jpg',
+  ),
+];
+
+final _hindiTrendingSongs = <Song>[
+  Song(
+    id: 'faloMmjX',
+    title: 'Chaleya',
+    artist: 'Anirudh Ravichander',
+    album: 'Jawan',
+    artwork:
+        'https://c.saavncdn.com/047/Jawan-Hindi-2023-20230921190854-500x500.jpg',
+  ),
+  Song(
+    id: 'koWi7GRH',
+    title: 'Apna Bana Le',
+    artist: 'Amitabh Bhattacharya',
+    album: 'Bhediya',
+    artwork:
+        'https://c.saavncdn.com/228/Sachin-Jigar-Bollywood-Hits-Hindi-2026-20260630213800-500x500.jpg',
+  ),
+  Song(
+    id: 'rBltEr7X',
+    title: 'Tere Vaaste',
+    artist: 'Amitabh Bhattacharya',
+    album: 'Zara Hatke Zara Bachke',
+    artwork:
+        'https://c.saavncdn.com/336/Zara-Hatke-Zara-Bachke-Hindi-2023-20250129153124-500x500.jpg',
+  ),
+  Song(
+    id: '4mHUvJ4u',
+    title: 'Satranga',
+    artist: 'Arijit Singh',
+    album: 'ANIMAL',
+    artwork:
+        'https://c.saavncdn.com/092/ANIMAL-Hindi-2023-20260724191152-500x500.jpg',
+  ),
+  Song(
+    id: 'wcsDiSsA',
+    title: 'O Maahi',
+    artist: 'Pritam',
+    album: 'Dunki',
+    artwork:
+        'https://c.saavncdn.com/139/Dunki-Hindi-2023-20231220211003-500x500.jpg',
+  ),
+  Song(
+    id: 'NIidiD9g',
+    title: 'Heeriye',
+    artist: 'Jasleen Royal, Arijit Singh',
+    album: 'Heeriye',
+    artwork:
+        'https://c.saavncdn.com/022/Heeriye-feat-Arijit-Singh-Hindi-2023-20230928050405-500x500.jpg',
+  ),
+];
+
+final _hindiSuggestedSongs = <Song>[
+  Song(
+    id: 'rjkrTnma',
+    title: 'Kesariya',
+    artist: 'Pritam',
+    album: 'Brahmastra',
+    artwork:
+        'https://c.saavncdn.com/871/Brahmastra-Original-Motion-Picture-Soundtrack-Hindi-2022-20221006155213-500x500.jpg',
+  ),
+  Song(
+    id: 'aRZbUYD7',
+    title: 'Tum Hi Ho',
+    artist: 'Mithoon',
+    album: 'Aashiqui 2',
+    artwork: 'https://c.saavncdn.com/430/Aashiqui-2-Hindi-2013-500x500.jpg',
+  ),
+  Song(
+    id: 'mPTrDSun',
+    title: 'Raataan Lambiyan',
+    artist: 'Tanishk Bagchi',
+    album: 'Shershaah',
+    artwork:
+        'https://c.saavncdn.com/238/Shershaah-Original-Motion-Picture-Soundtrack--Hindi-2021-20210815181610-500x500.jpg',
+  ),
+  Song(
+    id: '_rJmbKSP',
+    title: 'Shayad',
+    artist: 'Pritam',
+    album: 'Love Aaj Kal',
+    artwork:
+        'https://c.saavncdn.com/862/Love-Aaj-Kal-Hindi-2020-20200214140423-500x500.jpg',
+  ),
+  Song(
+    id: 'Ni6noMmw',
+    title: 'Agar Tum Saath Ho',
+    artist: 'Alka Yagnik',
+    album: 'Tamasha',
+    artwork:
+        'https://c.saavncdn.com/994/Tamasha-Hindi-2015-500x500.jpg',
+  ),
+  Song(
+    id: 'TfJX33Qk',
+    title: 'Kal Ho Naa Ho',
+    artist: 'Shankar-Ehsaan-Loy',
+    album: 'Kal Ho Naa Ho',
+    artwork:
+        'https://c.saavncdn.com/587/Kal-Ho-Naa-Ho-Hindi-2003-20190516130956-500x500.jpg',
+  ),
+  Song(
+    id: '4NRpZd1v',
+    title: 'Hawayein',
+    artist: 'Pritam',
+    album: 'Jab Harry Met Sejal',
+    artwork:
+        'https://c.saavncdn.com/584/Jab-Harry-Met-Sejal-Hindi-2017-20170803161007-500x500.jpg',
+  ),
+];
+
+final _hindiMostPlayedSongs = <Song>[
+  Song(
+    id: 'uiEWT3kP',
+    title: 'Channa Mereya',
+    artist: 'Pritam',
+    album: 'Ae Dil Hai Mushkil',
+    artwork:
+        'https://c.saavncdn.com/257/Ae-Dil-Hai-Mushkil-Hindi-2016-500x500.jpg',
+  ),
+  Song(
+    id: 'OtKh5C06',
+    title: 'Bekhayali',
+    artist: 'Sachet Tandon',
+    album: 'Kabir Singh',
+    artwork:
+        'https://c.saavncdn.com/807/Kabir-Singh-Hindi-2019-20240131131003-500x500.jpg',
+  ),
+  Song(
+    id: '1e0En7YX',
+    title: 'Pehle Bhi Main',
+    artist: 'Vishal Mishra',
+    album: 'ANIMAL',
+    artwork:
+        'https://c.saavncdn.com/092/ANIMAL-Hindi-2023-20260724191152-500x500.jpg',
+  ),
+  Song(
+    id: 'Ke9TPSUf',
+    title: 'Tujhe Kitna Chahne Lage',
+    artist: 'Arijit Singh',
+    album: 'Kabir Singh',
+    artwork:
+        'https://c.saavncdn.com/807/Kabir-Singh-Hindi-2019-20240131131003-500x500.jpg',
+  ),
+  Song(
+    id: '4CI_0bzt',
+    title: 'Ilahi',
+    artist: 'Pritam',
+    album: 'Yeh Jawaani Hai Deewani',
+    artwork:
+        'https://c.saavncdn.com/440/Yeh-Jawaani-Hai-Deewani-2013-500x500.jpg',
+  ),
+  Song(
+    id: 'RgLLRnht',
+    title: 'Dil Diyan Gallan',
+    artist: 'Atif Aslam',
+    album: 'Tiger Zinda Hai',
+    artwork:
+        'https://c.saavncdn.com/893/Dil-Diyan-Gallan-From-Carry-On-Jatta-4-Punjabi-2026-20260520103640-500x500.jpg',
+  ),
+];
+
+final _hindiTopHitsSongs = <Song>[
+  Song(
+    id: 'LXTWWvvX',
+    title: 'Subhanallah',
+    artist: 'Pritam',
+    album: 'Yeh Jawaani Hai Deewani',
+    artwork:
+        'https://c.saavncdn.com/440/Yeh-Jawaani-Hai-Deewani-2013-500x500.jpg',
+  ),
+  Song(
+    id: 'Ra9F5rTD',
+    title: 'Zaalima',
+    artist: 'Arijit Singh',
+    album: 'Raees',
+    artwork:
+        'https://c.saavncdn.com/334/Raees-Hindi-2016-20200430093124-500x500.jpg',
+  ),
+  Song(
+    id: 'csaEsVWV',
+    title: 'Kun Faaya Kun',
+    artist: 'A.R. Rahman',
+    album: 'Rockstar',
+    artwork:
+        'https://c.saavncdn.com/408/Rockstar-Hindi-2011-20221212023139-500x500.jpg',
+  ),
+  Song(
+    id: 'Wn_eONzu',
+    title: 'Raabta',
+    artist: 'Pritam',
+    album: 'Agent Vinod',
+    artwork:
+        'https://c.saavncdn.com/603/Agent-Vinod-2012-500x500.jpg',
+  ),
+  Song(
+    id: 'uf2JX_12',
+    title: 'Tera Ban Jaunga',
+    artist: 'Akhil Sachdeva',
+    album: 'Kabir Singh',
+    artwork:
+        'https://c.saavncdn.com/807/Kabir-Singh-Hindi-2019-20240131131003-500x500.jpg',
+  ),
+  Song(
+    id: 'st2Dycrf',
+    title: 'Gerua',
+    artist: 'Pritam',
+    album: 'Dilwale',
+    artwork:
+        'https://c.saavncdn.com/297/Dilwale-Hindi-2015-20260120201359-500x500.jpg',
+  ),
+];
+
+final _hindiFeaturedPlaylists = <Playlist>[
+  Playlist(
+    id: '1191141029',
+    title: 'Arijit Singh',
+    description: 'King of modern Bollywood romance and melodies.',
+    artwork:
+        'https://c.saavncdn.com/editorial/BestofRomanceArijitSingh_20231005095622_500x500.jpg',
+    songCount: 56,
+  ),
+  Playlist(
+    id: '5519117',
+    title: 'A.R. Rahman',
+    description: 'Masterpieces by the Mozart of Madras.',
+    artwork:
+        'https://c.saavncdn.com/editorial/Let_sPlayA-R-RahmanHindi_20240531054747_500x500.jpg',
+    songCount: 50,
+  ),
+  Playlist(
+    id: '902531265',
+    title: 'Shreya Ghoshal',
+    description: 'Soulful melodies and timeless classics.',
+    artwork:
+        'https://c.saavncdn.com/editorial/ShreyaGhoshalLoveSongsHindi_20240730105308_500x500.jpg',
+    songCount: 33,
+  ),
+  Playlist(
+    id: '109717418',
+    title: 'Pritam',
+    description: 'Chart-topping Bollywood anthems.',
+    artwork:
+        'https://c.saavncdn.com/editorial/LetsPlayPritamArijit_20250109115337_500x500.jpg',
+    songCount: 29,
+  ),
+  Playlist(
+    id: '905269229',
+    title: 'Sonu Nigam',
+    description: 'Golden voice of iconic Bollywood hits.',
+    artwork:
+        'https://c.saavncdn.com/editorial/SonuNigamLoveSongsHindi_20240318054814_500x500.jpg',
+    songCount: 32,
+  ),
+  Playlist(
+    id: '154546814',
+    title: '90s Romance',
+    description: 'Timeless love anthems and nostalgic 90s magic.',
+    artwork:
+        'https://c.saavncdn.com/editorial/90sRomanceHindi_20260302042658_500x500.jpg',
+    songCount: 40,
+  ),
+];
+
+
 late final SonixAudioHandler audioHandler;
 
 Future<void> main() async {
@@ -615,6 +1908,7 @@ class _SonixAppState extends State<SonixApp> {
   bool _checkedOnboarding = false;
   bool _isOnboarded = false;
   UserProfile? _userProfile;
+  String _themeMode = AppConstants.defaultTheme;
 
   @override
   void initState() {
@@ -623,6 +1917,7 @@ class _SonixAppState extends State<SonixApp> {
   }
 
   Future<void> _checkOnboarding() async {
+    final theme = await UserStorage.getThemeMode();
     final done = await UserStorage.isOnboardingComplete();
     UserProfile? profile;
     if (done) {
@@ -630,6 +1925,7 @@ class _SonixAppState extends State<SonixApp> {
     }
     if (mounted) {
       setState(() {
+        _themeMode = theme;
         _isOnboarded = done;
         _userProfile = profile;
         _checkedOnboarding = true;
@@ -644,31 +1940,94 @@ class _SonixAppState extends State<SonixApp> {
     });
   }
 
+  void _onThemeChanged(String mode) {
+    setState(() => _themeMode = mode);
+    UserStorage.saveThemeMode(mode);
+  }
+
+  ThemeMode get _effectiveThemeMode {
+    if (_themeMode == 'light') return ThemeMode.light;
+    if (_themeMode == 'dark') return ThemeMode.dark;
+    return ThemeMode.system;
+  }
+
   @override
-  Widget build(BuildContext context) => MaterialApp(
-    debugShowCheckedModeBanner: false,
-    title: 'Sonix',
-    theme: ThemeData(
+  Widget build(BuildContext context) {
+    final lightTheme = ThemeData(
+      brightness: Brightness.light,
+      scaffoldBackgroundColor: AppConstants.colorLightBackground,
+      colorScheme: ColorScheme.fromSeed(
+        seedColor: const Color(0xff0f172a),
+        brightness: Brightness.light,
+        surface: AppConstants.colorLightSurface,
+      ),
+      appBarTheme: const AppBarTheme(
+        backgroundColor: Colors.white,
+        foregroundColor: Color(0xff0f172a),
+        elevation: 0,
+      ),
+      cardColor: AppConstants.colorLightSurface,
+      dividerColor: const Color(0x14000000),
+      iconTheme: const IconThemeData(color: Color(0xff334155)),
+      textTheme: GoogleFonts.manropeTextTheme(
+        ThemeData(brightness: Brightness.light).textTheme.apply(
+          bodyColor: const Color(0xff0f172a),
+          displayColor: const Color(0xff0f172a),
+        ),
+      ),
+      fontFamily: GoogleFonts.manrope().fontFamily,
+    );
+
+    final darkTheme = ThemeData(
       brightness: Brightness.dark,
       scaffoldBackgroundColor: _ink,
       colorScheme: ColorScheme.fromSeed(
         seedColor: Colors.white,
         brightness: Brightness.dark,
+        surface: _surface,
       ),
-      textTheme: GoogleFonts.interTextTheme(
+      appBarTheme: const AppBarTheme(
+        backgroundColor: Color(0xee080808),
+        foregroundColor: Colors.white,
+        elevation: 0,
+      ),
+      cardColor: _surface,
+      dividerColor: Colors.white12,
+      iconTheme: const IconThemeData(color: Colors.white),
+      textTheme: GoogleFonts.manropeTextTheme(
         ThemeData(brightness: Brightness.dark).textTheme,
       ),
-      fontFamily: GoogleFonts.inter().fontFamily,
-    ),
-    home: !_checkedOnboarding
-        ? const Scaffold(
-            backgroundColor: _ink,
-            body: Center(child: CircularProgressIndicator(color: Colors.white)),
-          )
-        : (_isOnboarded
-              ? SonixHome(userProfile: _userProfile)
-              : OnboardingScreen(onComplete: _onComplete)),
-  );
+      fontFamily: GoogleFonts.manrope().fontFamily,
+    );
+
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      title: 'Sonix',
+      themeMode: _effectiveThemeMode,
+      theme: lightTheme,
+      darkTheme: darkTheme,
+      home: !_checkedOnboarding
+          ? Scaffold(
+              backgroundColor: _effectiveThemeMode == ThemeMode.light
+                  ? AppConstants.colorLightBackground
+                  : _ink,
+              body: Center(
+                child: CircularProgressIndicator(
+                  color: _effectiveThemeMode == ThemeMode.light
+                      ? const Color(0xff0f172a)
+                      : Colors.white,
+                ),
+              ),
+            )
+          : (_isOnboarded
+                ? SonixHome(
+                    userProfile: _userProfile,
+                    currentTheme: _themeMode,
+                    onAppThemeChanged: _onThemeChanged,
+                  )
+                : OnboardingScreen(onComplete: _onComplete)),
+    );
+  }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -676,9 +2035,16 @@ class _SonixAppState extends State<SonixApp> {
 /* -------------------------------------------------------------------------- */
 
 class SonixHome extends StatefulWidget {
-  const SonixHome({super.key, this.userProfile});
+  const SonixHome({
+    super.key,
+    this.userProfile,
+    this.currentTheme,
+    this.onAppThemeChanged,
+  });
 
   final UserProfile? userProfile;
+  final String? currentTheme;
+  final ValueChanged<String>? onAppThemeChanged;
 
   @override
   State<SonixHome> createState() => _SonixHomeState();
@@ -689,8 +2055,11 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
   final _search = TextEditingController();
   late final CrossfadePlayer _audio;
   late final AnimationController _gradientAnim;
+  late final AnimationController _queueAnim;
 
+  List<Artist> _artistResults = [];
   List<Song> _results = [];
+  List<Album> _albumResults = [];
   List<Playlist> _playlistResults = [];
   List<Song> _history = [];
   final List<Song> _playbackHistory = [];
@@ -709,8 +2078,47 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
   Map<String, Song> _likedSongs = {};
   bool _viewingLikedSongs = false;
   String _songQuality = '320kbps';
+  String _themeMode = AppConstants.defaultTheme;
+  String _musicLanguage = 'English';
   Timer? _sleepTimer;
   DateTime? _sleepTimerEndTime;
+  bool _eqEnabled = false;
+  String _eqPreset = 'Flat';
+  List<double> _eqBands = [0.0, 0.0, 0.0, 0.0, 0.0];
+  double _eqBassBoost = 0.0;
+  late final PageController _speedDialPageCtrl;
+  int _speedDialPage = 0;
+
+  bool get _isHindi => _musicLanguage.toLowerCase() == 'hindi';
+  List<Song> get _effectiveSpeedDialSongs =>
+      _isHindi ? _hindiSpeedDialSongs : _speedDialSongs;
+  List<Song> get _effectiveTrendingSongs =>
+      _isHindi ? _hindiTrendingSongs : _trendingSongs;
+  List<Song> get _effectiveSuggestedSongs =>
+      _isHindi ? _hindiSuggestedSongs : _suggestedSongs;
+  List<Song> get _effectiveMostPlayedSongs =>
+      _isHindi ? _hindiMostPlayedSongs : _mostPlayedSongs;
+  List<Song> get _effectiveTopHitsSongs =>
+      _isHindi ? _hindiTopHitsSongs : _topHitsSongs;
+  List<Playlist> get _effectiveFeaturedPlaylists =>
+      _isHindi ? _hindiFeaturedPlaylists : _featuredPlaylists;
+
+  bool get _isLight => Theme.of(context).brightness == Brightness.light;
+  Color get _bg => _isLight ? AppConstants.colorLightBackground : _ink;
+  Color get _cardBg => _isLight ? AppConstants.colorLightSurface : _surface;
+  Color get _sheetBg =>
+      _isLight ? AppConstants.colorLightSurface : const Color(0xff16161b);
+  Color get _headerBg =>
+      _isLight ? AppConstants.colorLightSurface : const Color(0xee080808);
+  Color get _textColor => _isLight ? const Color(0xff0f172a) : Colors.white;
+  Color get _subtextColor => _isLight ? const Color(0xff64748b) : _muted;
+  Color get _borderColor =>
+      _isLight ? const Color(0x18000000) : const Color(0x18ffffff);
+  Color get _dividerColor =>
+      _isLight ? const Color(0x12000000) : Colors.white12;
+  Color get _inputFill => _isLight
+      ? const Color(0xfff1f3f5)
+      : Colors.white.withValues(alpha: .06);
 
   Playlist? _openedPlaylist;
   bool _loadingPlaylist = false;
@@ -723,6 +2131,7 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
   bool _fullScreenLyrics = false;
   bool _lyricsOpen = false;
   bool _isLoadingTrack = false;
+  bool _isLoadingLyrics = false;
   int _playRequest = 0;
 
   Map<String, dynamic>? _lyrics;
@@ -736,8 +2145,18 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
   final Map<String, Future<List<Color>>> _paletteFutures = {};
 
   @override
+  void didUpdateWidget(covariant SonixHome oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.currentTheme != null &&
+        widget.currentTheme != oldWidget.currentTheme) {
+      _themeMode = widget.currentTheme!;
+    }
+  }
+
+  @override
   void initState() {
     super.initState();
+    _themeMode = widget.currentTheme ?? AppConstants.defaultTheme;
     _audio = audioHandler.player;
     audioHandler.onSkipNext = _next;
     audioHandler.onSkipPrevious = _previous;
@@ -745,21 +2164,43 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
     _audio.onAutoCrossfadeTriggered = _onCrossfadeTriggered;
 
     _userProfile = widget.userProfile;
+    if (_userProfile != null && _userProfile!.language.isNotEmpty) {
+      _musicLanguage = _userProfile!.language;
+    }
+    UserStorage.getLanguage().then((l) {
+      if (mounted) setState(() => _musicLanguage = l);
+    });
     if (_userProfile == null) {
       UserStorage.getProfile().then((p) {
-        if (mounted && p != null) setState(() => _userProfile = p);
+        if (mounted && p != null) {
+          setState(() {
+            _userProfile = p;
+            if (p.language.isNotEmpty) {
+              _musicLanguage = p.language;
+            }
+          });
+        }
       });
     }
     _loadLikedSongs();
     _loadHistory();
+    _loadEqualizer();
     UserStorage.getSongQuality().then((q) {
       if (mounted) setState(() => _songQuality = q);
+    });
+    UserStorage.getThemeMode().then((m) {
+      if (mounted) setState(() => _themeMode = m);
     });
     _gradientAnim = AnimationController(
       vsync: this,
       duration: const Duration(
           seconds: AppConstants.backgroundAnimationDurationSeconds),
     )..repeat(reverse: true);
+    _queueAnim = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 320),
+    );
+    _speedDialPageCtrl = PageController();
     _search.addListener(_onSearchChanged);
     _playingSub = _audio.playingStream.listen((isPlaying) {
       if (isPlaying) {
@@ -807,6 +2248,8 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
   void dispose() {
     _sleepTimer?.cancel();
     _gradientAnim.dispose();
+    _queueAnim.dispose();
+    _speedDialPageCtrl.dispose();
     _search.removeListener(_onSearchChanged);
     _playingSub?.cancel();
     _processingStateSub?.cancel();
@@ -823,6 +2266,9 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
     if (query.isEmpty) {
       setState(() {
         _homeMode = true;
+        _artistResults = [];
+        _results = [];
+        _albumResults = [];
         _playlistResults = [];
       });
       return;
@@ -834,19 +2280,22 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
       _viewingLikedSongs = false;
     });
     try {
-      final data = await Api.search(query);
-      final groups = data['data'] as Map? ?? const {};
-      final songs = (groups['songs']?['results'] as List? ?? const [])
-          .whereType<Map>()
-          .map((item) => Song.fromJson(Map<String, dynamic>.from(item)))
-          .toList();
-      final playlists = (groups['playlists']?['results'] as List? ?? const [])
-          .whereType<Map>()
-          .map((item) => Playlist.fromJson(Map<String, dynamic>.from(item)))
-          .toList();
+      // Fetch artists, songs, albums, and playlists in parallel
+      final searchResults = await Future.wait([
+        Api.searchArtists(query, n: 10),
+        Api.searchSongs(query, n: 20),
+        Api.searchAlbums(query, n: 10),
+        Api.searchPlaylists(query, n: 10),
+      ]);
+      final artists = searchResults[0] as List<Artist>;
+      final songs = searchResults[1] as List<Song>;
+      final albums = searchResults[2] as List<Album>;
+      final playlists = searchResults[3] as List<Playlist>;
       if (!mounted) return;
       setState(() {
+        _artistResults = artists;
         _results = songs;
+        _albumResults = albums;
         _playlistResults = playlists;
       });
     } catch (_) {
@@ -869,7 +2318,14 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
 
     if (playlist.songs.isEmpty) {
       try {
-        final full = await Api.playlist(playlist.id);
+        final Playlist? full;
+        if (playlist.type == 'ALBUM') {
+          full = await Api.album(playlist.id);
+        } else if (playlist.type == 'ARTIST') {
+          full = await Api.artist(playlist.id);
+        } else {
+          full = await Api.playlist(playlist.id);
+        }
         if (full != null && mounted && _openedPlaylist?.id == playlist.id) {
           setState(() {
             _openedPlaylist = full;
@@ -890,8 +2346,26 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
 
   /// Resolve a song's stream URL and full metadata via the API.
   Future<(Song, String?)?> _resolveSong(Song song) async {
-    final details = await Api.details(song.id);
-    final resolved = details == null ? song : Song.fromJson(details);
+    Map<String, dynamic>? details;
+    try {
+      details = await Api.details(song.id);
+    } catch (_) {}
+    Song resolved = details == null ? song : Song.fromJson(details);
+    if (resolved.downloadUrls.isEmpty) {
+      try {
+        final query = '${song.title} ${song.artist}';
+        final results = await Api.searchSongs(query, n: 5);
+        if (results.isNotEmpty) {
+          final first = results.first;
+          final moreDetails = await Api.details(first.id);
+          if (moreDetails != null) {
+            resolved = Song.fromJson(moreDetails);
+          } else {
+            resolved = first;
+          }
+        }
+      } catch (_) {}
+    }
     final urls = resolved.downloadUrls;
     final match = urls.where((item) => item['quality'] == _songQuality).toList();
     final stream =
@@ -938,12 +2412,25 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
       }
     }
 
+    // 1. Immediately update notification metadata with the incoming song so it never disappears
+    audioHandler.setSongItem(
+      id: song.id,
+      title: song.title,
+      artist: song.artist,
+      album: song.album,
+      artwork: song.artwork,
+      duration: song.duration > 0 ? Duration(seconds: song.duration) : null,
+    );
+    // 2. Keep the notification persistent in buffering state so Android OS does not dismiss it
+    audioHandler.setLoading(true);
+
     // Stop previous track immediately so old audio doesn't play while new song is being fetched
     unawaited(_audio.stop());
 
     setState(() {
       _current = song;
       _isLoadingTrack = true;
+      _isLoadingLyrics = true;
       _lyrics = null;
       _parsedLyrics = [];
       _lyricsOpen = false;
@@ -952,13 +2439,23 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
     });
 
     try {
-      if (!mounted || request != _playRequest) return;
+      if (!mounted || request != _playRequest) {
+        audioHandler.setLoading(false);
+        return;
+      }
 
       final result = await _resolveSong(song);
-      if (!mounted || request != _playRequest) return;
+      if (!mounted || request != _playRequest) {
+        audioHandler.setLoading(false);
+        return;
+      }
 
       if (result == null) {
-        setState(() => _isLoadingTrack = false);
+        audioHandler.setLoading(false);
+        setState(() {
+          _isLoadingTrack = false;
+          _isLoadingLyrics = false;
+        });
         return;
       }
 
@@ -978,6 +2475,7 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
               ? Duration(seconds: resolved.duration)
               : null,
         );
+        audioHandler.setLoading(false);
         await _audio.playDirect(source, fadeCurrentOut: false);
         if (!mounted || request != _playRequest) return;
         if (_audio.playing) {
@@ -985,7 +2483,11 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
         }
         setState(() => _isLoadingTrack = false);
       } else if (mounted && request == _playRequest) {
-        setState(() => _isLoadingTrack = false);
+        audioHandler.setLoading(false);
+        setState(() {
+          _isLoadingTrack = false;
+          _isLoadingLyrics = false;
+        });
       }
 
       // Fetch lyrics in background.
@@ -994,10 +2496,15 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
       setState(() {
         _lyrics = lyricData;
         _parsedLyrics = parseLyrics(lyricData?['syncedLyrics'] as String?);
+        _isLoadingLyrics = false;
       });
     } catch (_) {
+      audioHandler.setLoading(false);
       if (mounted && request == _playRequest) {
-        setState(() => _isLoadingTrack = false);
+        setState(() {
+          _isLoadingTrack = false;
+          _isLoadingLyrics = false;
+        });
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('This track could not be loaded.')),
         );
@@ -1151,6 +2658,9 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
             _isLoadingTrack = false;
             _songPlayStopwatch.reset();
             _historyAddedForCurrent = false;
+            _lyrics = null;
+            _parsedLyrics = [];
+            _isLoadingLyrics = true;
             if (_audio.playing) {
               _songPlayStopwatch.start();
             }
@@ -1171,13 +2681,20 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
           );
 
           Api.lyrics(resolved).then((lyricData) {
-            if (mounted) {
+            if (mounted && _current?.id == resolved.id) {
               setState(() {
                 _lyrics = lyricData;
                 _parsedLyrics = parseLyrics(lyricData?['syncedLyrics'] as String?);
+                _isLoadingLyrics = false;
               });
             }
-          }).catchError((_) {});
+          }).catchError((_) {
+            if (mounted && _current?.id == resolved.id) {
+              setState(() {
+                _isLoadingLyrics = false;
+              });
+            }
+          });
         },
       );
     }
@@ -1330,7 +2847,10 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
     required double iconSize,
     required double spinnerSize,
     required double strokeWidth,
+    Color? color,
   }) {
+    final effectiveColor =
+        color ?? (_isLight ? const Color(0xff0f172a) : Colors.white);
     return StreamBuilder<bool>(
       stream: _audio.playingStream,
       initialData: _audio.playing,
@@ -1353,7 +2873,7 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                       height: spinnerSize,
                       child: CircularProgressIndicator(
                         strokeWidth: strokeWidth,
-                        color: Colors.white,
+                        color: effectiveColor,
                       ),
                     )
                   : Icon(
@@ -1361,6 +2881,7 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                           ? PhosphorIconsRegular.pauseCircle
                           : PhosphorIconsRegular.playCircle,
                       size: iconSize,
+                      color: effectiveColor,
                     ),
             );
           },
@@ -1497,6 +3018,7 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
         }
       },
       child: Scaffold(
+        backgroundColor: _bg,
         body: Stack(
           children: [
             SafeArea(
@@ -1542,7 +3064,9 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
 
   void _openFullScreen() {
     if (_current == null) return;
+    _queueAnim.value = 0.0;
     setState(() {
+      _lyricsOpen = false;
       _fullScreenLyrics = false;
       _fullScreen = true;
     });
@@ -1552,9 +3076,9 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
 
   Widget _header() => Container(
     padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
-    decoration: const BoxDecoration(
-      color: Color(0xee080808),
-      border: Border(bottom: BorderSide(color: Color(0x18ffffff))),
+    decoration: BoxDecoration(
+      color: _headerBg,
+      border: Border(bottom: BorderSide(color: _borderColor)),
     ),
     child: Column(
       mainAxisSize: MainAxisSize.min,
@@ -1566,6 +3090,9 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
               _homeMode = true;
               _openedPlaylist = null;
               _viewingLikedSongs = false;
+              _artistResults = [];
+              _results = [];
+              _albumResults = [];
               _playlistResults = [];
             });
           },
@@ -1575,10 +3102,15 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                 width: 38,
                 height: 38,
                 decoration: BoxDecoration(
-                  color: Colors.white.withValues(alpha: .1),
+                  color: _isLight
+                      ? const Color(0xfff1f3f5)
+                      : Colors.white.withValues(alpha: .1),
                   borderRadius: BorderRadius.circular(9),
                 ),
-                child: const Icon(PhosphorIconsRegular.musicNote),
+                child: Icon(
+                  PhosphorIconsRegular.musicNote,
+                  color: _textColor,
+                ),
               ),
               const SizedBox(width: 10),
               Column(
@@ -1592,8 +3124,9 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                           'Hello, ',
                           style: TextStyle(
                             fontSize: 18,
-                            fontWeight: FontWeight.w800,
-                            fontFamily: GoogleFonts.inter().fontFamily,
+                            fontWeight: FontWeight.w900,
+                            color: _textColor,
+                            fontFamily: GoogleFonts.manrope().fontFamily,
                           ),
                         ),
                         ShaderMask(
@@ -1604,11 +3137,24 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                           ),
                           blendMode: BlendMode.srcIn,
                           child: Text(
-                            _userProfile!.name.split(' ').first,
+                            () {
+                              final first = _userProfile!.name
+                                  .trim()
+                                  .split(RegExp(r'\s+'))
+                                  .first;
+                              if (first.length >
+                                  AppConstants.maxFirstNameLength) {
+                                return first.substring(
+                                  0,
+                                  AppConstants.maxFirstNameLength,
+                                );
+                              }
+                              return first;
+                            }(),
                             style: TextStyle(
                               fontSize: 18,
-                              fontWeight: FontWeight.w800,
-                              fontFamily: GoogleFonts.inter().fontFamily,
+                              fontWeight: FontWeight.w900,
+                              fontFamily: GoogleFonts.manrope().fontFamily,
                             ),
                           ),
                         ),
@@ -1627,7 +3173,7 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                         style: TextStyle(
                           fontSize: 18,
                           fontWeight: FontWeight.w800,
-                          fontFamily: GoogleFonts.inter().fontFamily,
+                          fontFamily: GoogleFonts.manrope().fontFamily,
                         ),
                       ),
                     ),
@@ -1637,15 +3183,53 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                         : 'SONG PLAYER',
                     style: TextStyle(
                       fontSize: 9,
-                      color: _muted,
+                      color: _subtextColor,
                       letterSpacing: 1.2,
                       fontWeight: FontWeight.w600,
-                      fontFamily: GoogleFonts.inter().fontFamily,
+                      fontFamily: GoogleFonts.manrope().fontFamily,
                     ),
                   ),
                 ],
               ),
               const Spacer(),
+              GestureDetector(
+                onTap: _openEqualizerSheet,
+                child: Container(
+                  width: 38,
+                  height: 38,
+                  margin: const EdgeInsets.only(right: 10),
+                  decoration: BoxDecoration(
+                    color: _isLight
+                        ? const Color(0xfff1f3f5)
+                        : Colors.white.withValues(alpha: .12),
+                    shape: BoxShape.circle,
+                  ),
+                  child: Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      Icon(
+                        PhosphorIconsRegular.slidersHorizontal,
+                        size: 20,
+                        color:
+                            _eqEnabled ? const Color(0xff3B82F6) : _textColor,
+                      ),
+                      if (_eqEnabled)
+                        Positioned(
+                          top: 7,
+                          right: 7,
+                          child: Container(
+                            width: 6,
+                            height: 6,
+                            decoration: const BoxDecoration(
+                              color: Color(0xff3B82F6),
+                              shape: BoxShape.circle,
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
               GestureDetector(
                 onTap: _openUserMenu,
                 child: CustomPaint(
@@ -1659,13 +3243,15 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                     width: 38,
                     height: 38,
                     decoration: BoxDecoration(
-                      color: Colors.white.withValues(alpha: .12),
+                      color: _isLight
+                          ? const Color(0xfff1f3f5)
+                          : Colors.white.withValues(alpha: .12),
                       shape: BoxShape.circle,
                     ),
-                    child: const Icon(
+                    child: Icon(
                       PhosphorIconsBold.user,
                       size: 20,
-                      color: Colors.white,
+                      color: _textColor,
                     ),
                   ),
                 ),
@@ -1678,33 +3264,45 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
           controller: _search,
           textInputAction: TextInputAction.search,
           onSubmitted: _runSearch,
-          style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+          style: TextStyle(
+            fontSize: 14,
+            fontWeight: FontWeight.w500,
+            color: _textColor,
+          ),
           decoration: InputDecoration(
             hintText: 'Search songs, artists, albums...',
-            hintStyle: const TextStyle(
-              color: _muted,
+            hintStyle: TextStyle(
+              color: _subtextColor,
               fontWeight: FontWeight.w400,
             ),
-            prefixIcon: const Icon(
+            prefixIcon: Icon(
               PhosphorIconsRegular.magnifyingGlass,
               size: 19,
+              color: _subtextColor,
             ),
             suffixIcon: _search.text.isEmpty
                 ? null
                 : IconButton(
-                    icon: const Icon(PhosphorIconsRegular.x, size: 17),
+                    icon: Icon(
+                      PhosphorIconsRegular.x,
+                      size: 17,
+                      color: _subtextColor,
+                    ),
                     onPressed: () {
                       _search.clear();
                       setState(() {
                         _homeMode = true;
                         _openedPlaylist = null;
                         _viewingLikedSongs = false;
+                        _artistResults = [];
+                        _results = [];
+                        _albumResults = [];
                         _playlistResults = [];
                       });
                     },
                   ),
             filled: true,
-            fillColor: Colors.white.withValues(alpha: .06),
+            fillColor: _inputFill,
             border: OutlineInputBorder(
               borderRadius: BorderRadius.circular(30),
               borderSide: BorderSide.none,
@@ -1722,24 +3320,30 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
     padding: const EdgeInsets.fromLTRB(14, 18, 14, 120),
     children: [
       if (_noticeVisible) _notice(),
-      _section('Trending', _trendingSongs, horizontal: true),
-      _section('Suggested for You', _suggestedSongs),
-      _section('Most Played', _mostPlayedSongs, horizontal: true),
-      _section('Top Hits', _topHitsSongs, horizontal: true),
+      _speedDialSection(),
+      _section('Trending', _effectiveTrendingSongs, horizontal: true),
+      _section('Suggested for You', _effectiveSuggestedSongs),
+      _section('Most Played', _effectiveMostPlayedSongs, horizontal: true),
+      _section('Top Hits', _effectiveTopHitsSongs, horizontal: true),
       _featuredPlaylistsSection(),
       _historySection(),
       const SizedBox(height: 16),
-      const Center(
+      Center(
         child: Text(
           'Next-generation music streaming experience',
-          style: TextStyle(color: _muted, fontSize: 12),
+          style: TextStyle(color: _subtextColor, fontSize: 12),
         ),
       ),
       const SizedBox(height: 6),
-      const Center(
+      Center(
         child: Text(
           '© 2026 Sonix Music Streaming Inc.',
-          style: TextStyle(color: Color(0xff57575d), fontSize: 11),
+          style: TextStyle(
+            color: _isLight
+                ? const Color(0xff94a3b8)
+                : const Color(0xff57575d),
+            fontSize: 11,
+          ),
         ),
       ),
     ],
@@ -1749,39 +3353,302 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
     margin: const EdgeInsets.only(bottom: 22),
     padding: const EdgeInsets.all(13),
     decoration: BoxDecoration(
-      color: const Color(0xff211c0b),
-      border: Border.all(color: const Color(0xff816b22)),
+      color: _isLight ? const Color(0xfffefce8) : const Color(0xff211c0b),
+      border: Border.all(
+        color: _isLight ? const Color(0xfffef08a) : const Color(0xff816b22),
+      ),
       borderRadius: BorderRadius.circular(10),
     ),
     child: Row(
       children: [
-        const Icon(PhosphorIconsRegular.info, color: Color(0xffeab308)),
+        Icon(
+          PhosphorIconsRegular.info,
+          color: _isLight ? const Color(0xffca8a04) : const Color(0xffeab308),
+        ),
         const SizedBox(width: 11),
-        const Expanded(
+        Expanded(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
                 'Notice',
                 style: TextStyle(
-                  color: Color(0xffffd95c),
+                  color: _isLight
+                      ? const Color(0xff854d0e)
+                      : const Color(0xffffd95c),
                   fontWeight: FontWeight.bold,
                 ),
               ),
               Text(
                 "We can't add new artists or songs here right now.",
-                style: TextStyle(fontSize: 12, color: Color(0xffd8cfa5)),
+                style: TextStyle(
+                  fontSize: 12,
+                  color: _isLight
+                      ? const Color(0xffa16207)
+                      : const Color(0xffd8cfa5),
+                ),
               ),
             ],
           ),
         ),
         IconButton(
           onPressed: () => setState(() => _noticeVisible = false),
-          icon: const Icon(PhosphorIconsRegular.x, size: 17, color: _muted),
+          icon: Icon(
+            PhosphorIconsRegular.x,
+            size: 17,
+            color: _isLight ? const Color(0xff854d0e) : _muted,
+          ),
         ),
       ],
     ),
   );
+
+  Widget _speedDialSection() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        // Header & Note
+        Padding(
+          padding: const EdgeInsets.only(bottom: 10),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Speed Dial',
+                style: TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.w800,
+                  color: _textColor,
+                ),
+              ),
+              if (AppConstants.speedDialNoteText.trim().isNotEmpty) ...[
+                const SizedBox(height: 3),
+                Text(
+                  AppConstants.speedDialNoteText.trim(),
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w500,
+                    color: _subtextColor,
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+
+        // 3x3 Grid across 3 Horizontally Swipeable Pages
+        LayoutBuilder(
+          builder: (context, constraints) {
+            final totalWidth = constraints.maxWidth;
+            const crossAxisSpacing = 6.0;
+            const mainAxisSpacing = 6.0;
+            const crossAxisCount = 3;
+            final cardWidth =
+                (totalWidth - (crossAxisSpacing * (crossAxisCount - 1))) /
+                    crossAxisCount;
+            final cardHeight = cardWidth + 23.0;
+            final gridHeight = (cardHeight * 3) + (mainAxisSpacing * 2);
+
+            return SizedBox(
+              height: gridHeight,
+              child: PageView.builder(
+                controller: _speedDialPageCtrl,
+                itemCount: 3,
+                onPageChanged: (page) => setState(() => _speedDialPage = page),
+                itemBuilder: (context, pageIndex) {
+                  final songsList = _effectiveSpeedDialSongs;
+                  final startIndex = pageIndex * 9;
+                  final endIndex =
+                      math.min(startIndex + 9, songsList.length);
+                  final pageSongs = songsList.sublist(
+                    startIndex.clamp(0, songsList.length),
+                    endIndex.clamp(0, songsList.length),
+                  );
+
+                  return Column(
+                    children: [
+                      for (int row = 0; row < 3; row++) ...[
+                        if (row > 0) const SizedBox(height: mainAxisSpacing),
+                        Row(
+                          children: [
+                            for (int col = 0; col < 3; col++) ...[
+                              if (col > 0)
+                                const SizedBox(width: crossAxisSpacing),
+                              Expanded(
+                                child: (row * 3 + col < pageSongs.length)
+                                    ? _speedDialCard(
+                                        pageSongs[row * 3 + col],
+                                        cardWidth,
+                                      )
+                                    : const SizedBox(),
+                              ),
+                            ],
+                          ],
+                        ),
+                      ],
+                    ],
+                  );
+                },
+              ),
+            );
+          },
+        ),
+
+        const SizedBox(height: 12),
+
+        // Pagination Dots Indicator
+        Center(
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: List.generate(3, (index) {
+              final isActive = _speedDialPage == index;
+              return GestureDetector(
+                onTap: () {
+                  _speedDialPageCtrl.animateToPage(
+                    index,
+                    duration: const Duration(milliseconds: 300),
+                    curve: Curves.easeInOut,
+                  );
+                },
+                behavior: HitTestBehavior.opaque,
+                child: Padding(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 3, vertical: 4),
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 240),
+                    curve: Curves.easeOutCubic,
+                    width: isActive ? 18 : 6,
+                    height: 6,
+                    decoration: BoxDecoration(
+                      color: isActive
+                          ? const Color(0xff3B82F6)
+                          : (_isLight
+                              ? const Color(0x28000000)
+                              : Colors.white.withValues(alpha: 0.2)),
+                      borderRadius: BorderRadius.circular(3),
+                    ),
+                  ),
+                ),
+              );
+            }),
+          ),
+        ),
+
+        const SizedBox(height: 26),
+      ],
+    );
+  }
+
+  Widget _speedDialCard(Song song, double size) {
+    final isCurrent = _current != null &&
+        (_current!.id == song.id ||
+            (_current!.title.toLowerCase() == song.title.toLowerCase()));
+    final isPlaying = isCurrent && _audio.playing;
+
+    return GestureDetector(
+      onTap: () => _playSongForSuggestionMode(song),
+      behavior: HitTestBehavior.opaque,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // Square album artwork with rounded corners
+          AspectRatio(
+            aspectRatio: 1.0,
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(10),
+                  child: _art(song.artwork, width: size, height: size),
+                ),
+                // Active playing border
+                if (isCurrent)
+                  Container(
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(
+                        color: const Color(0xff3B82F6),
+                        width: 1.5,
+                      ),
+                    ),
+                  ),
+                // Active playing badge
+                if (isCurrent)
+                  Positioned(
+                    top: 5,
+                    right: 5,
+                    child: Container(
+                      width: 20,
+                      height: 20,
+                      decoration: const BoxDecoration(
+                        color: Color(0xff3B82F6),
+                        shape: BoxShape.circle,
+                      ),
+                      child: Center(
+                        child: Icon(
+                          isPlaying
+                              ? PhosphorIconsFill.pause
+                              : PhosphorIconsFill.play,
+                          size: 10,
+                          color: Colors.white,
+                        ),
+                      ),
+                    ),
+                  ),
+                // Subtle progress indicator for the currently playing song
+                if (isCurrent)
+                  Positioned(
+                    bottom: 0,
+                    left: 0,
+                    right: 0,
+                    child: StreamBuilder<Duration>(
+                      stream: _audio.positionStream,
+                      builder: (context, snapshot) {
+                        final pos = snapshot.data ?? Duration.zero;
+                        final dur = _audio.duration ?? Duration.zero;
+                        final progress = (dur.inMilliseconds > 0)
+                            ? (pos.inMilliseconds / dur.inMilliseconds)
+                                .clamp(0.0, 1.0)
+                            : 0.0;
+                        return ClipRRect(
+                          borderRadius: const BorderRadius.vertical(
+                            bottom: Radius.circular(9),
+                          ),
+                          child: Container(
+                            height: 3.5,
+                            color: Colors.black54,
+                            child: FractionallySizedBox(
+                              alignment: Alignment.centerLeft,
+                              widthFactor: progress,
+                              child: Container(
+                                color: const Color(0xff3B82F6),
+                              ),
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 4),
+          // Song title at the bottom with ellipsis
+          Text(
+            song.title,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: GoogleFonts.poppins(
+              fontSize: 11.5,
+              fontWeight: isCurrent ? FontWeight.w700 : FontWeight.w500,
+              color: isCurrent ? const Color(0xff3B82F6) : _textColor,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 
   Widget _section(String title, List<Song> songs, {bool horizontal = false}) =>
       Column(
@@ -1791,7 +3658,11 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
             padding: const EdgeInsets.only(bottom: 12),
             child: Text(
               title,
-              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
+              style: TextStyle(
+                fontSize: 20,
+                fontWeight: FontWeight.w800,
+                color: _textColor,
+              ),
             ),
           ),
           if (horizontal)
@@ -1868,8 +3739,8 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
               song.artist.toUpperCase(),
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
-              style: const TextStyle(
-                color: _muted,
+              style: TextStyle(
+                color: _subtextColor,
                 fontSize: 10,
                 fontWeight: FontWeight.w600,
                 letterSpacing: .7,
@@ -1880,7 +3751,11 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
               song.title,
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
-              style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w700),
+              style: TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.w700,
+                color: _textColor,
+              ),
             ),
           ],
         ),
@@ -1891,15 +3766,19 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
   Widget _featuredPlaylistsSection() => Column(
     crossAxisAlignment: CrossAxisAlignment.start,
     children: [
-      const Padding(
-        padding: EdgeInsets.only(bottom: 12),
+      Padding(
+        padding: const EdgeInsets.only(bottom: 12),
         child: Row(
           children: [
-            Icon(PhosphorIconsRegular.playlist, size: 22, color: Colors.white),
-            SizedBox(width: 8),
+            Icon(PhosphorIconsRegular.playlist, size: 22, color: _textColor),
+            const SizedBox(width: 8),
             Text(
               'Featured Playlists',
-              style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
+              style: TextStyle(
+                fontSize: 20,
+                fontWeight: FontWeight.w800,
+                color: _textColor,
+              ),
             ),
           ],
         ),
@@ -1908,9 +3787,9 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
         height: 240,
         child: ListView.separated(
           scrollDirection: Axis.horizontal,
-          itemCount: _featuredPlaylists.length,
+          itemCount: _effectiveFeaturedPlaylists.length,
           separatorBuilder: (_, _) => const SizedBox(width: 14),
-          itemBuilder: (_, i) => _playlistCard(_featuredPlaylists[i]),
+          itemBuilder: (_, i) => _playlistCard(_effectiveFeaturedPlaylists[i]),
         ),
       ),
       const SizedBox(height: 26),
@@ -1922,24 +3801,29 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
       return Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Padding(
-            padding: EdgeInsets.only(bottom: 12),
+          Padding(
+            padding: const EdgeInsets.only(bottom: 12),
             child: Text(
-              'History',
-              style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
+              'Recently Played',
+              style: TextStyle(
+                fontSize: 20,
+                fontWeight: FontWeight.w800,
+                color: _textColor,
+              ),
             ),
           ),
           Container(
             width: double.infinity,
             padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 16),
             decoration: BoxDecoration(
-              color: _surface,
+              color: _cardBg,
               borderRadius: BorderRadius.circular(9),
+              border: _isLight ? Border.all(color: _borderColor) : null,
             ),
-            child: const Center(
+            child: Center(
               child: Text(
                 'No recently played songs yet',
-                style: TextStyle(color: _muted, fontSize: 13),
+                style: TextStyle(color: _subtextColor, fontSize: 13),
               ),
             ),
           ),
@@ -1955,16 +3839,20 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
           child: Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              const Text(
-                'History',
-                style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
+              Text(
+                'Recently Played',
+                style: TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.w800,
+                  color: _textColor,
+                ),
               ),
               GestureDetector(
                 onTap: _clearHistory,
-                child: const Text(
+                child: Text(
                   'Clear',
                   style: TextStyle(
-                    color: _muted,
+                    color: _subtextColor,
                     fontSize: 13,
                     fontWeight: FontWeight.w600,
                   ),
@@ -2046,9 +3934,10 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
             playlist.title,
             maxLines: 2,
             overflow: TextOverflow.ellipsis,
-            style: const TextStyle(
+            style: TextStyle(
               fontSize: 13,
               fontWeight: FontWeight.w700,
+              color: _textColor,
               height: 1.25,
             ),
           ),
@@ -2058,8 +3947,8 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
               playlist.description,
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
-              style: const TextStyle(
-                color: _muted,
+              style: TextStyle(
+                color: _subtextColor,
                 fontSize: 11,
                 fontWeight: FontWeight.w500,
               ),
@@ -2079,12 +3968,22 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
         margin: const EdgeInsets.only(bottom: 8),
         padding: const EdgeInsets.all(7),
         decoration: BoxDecoration(
-          color: isCurrent ? Colors.white.withValues(alpha: .1) : _surface,
+          color: isCurrent
+              ? (_isLight
+                  ? const Color(0xffe2e8f0)
+                  : Colors.white.withValues(alpha: .1))
+              : _cardBg,
           borderRadius: BorderRadius.circular(9),
+          border: _isLight ? Border.all(color: _borderColor) : null,
         ),
         child: Row(
           children: [
-            _art(song.artwork, width: 55, height: 55),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(
+                AppConstants.songRowThumbnailRadius,
+              ),
+              child: _art(song.artwork, width: 55, height: 55),
+            ),
             const SizedBox(width: 12),
             Expanded(
               child: Column(
@@ -2094,8 +3993,8 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                     song.artist,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      color: _muted,
+                    style: TextStyle(
+                      color: _subtextColor,
                       fontSize: 11,
                       fontWeight: FontWeight.w500,
                     ),
@@ -2105,7 +4004,10 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                     song.title,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(fontWeight: FontWeight.w700),
+                    style: TextStyle(
+                      fontWeight: FontWeight.w700,
+                      color: _textColor,
+                    ),
                   ),
                 ],
               ),
@@ -2114,16 +4016,17 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
               onPressed: () => _toggleLike(song),
               icon: Icon(
                 isLiked ? PhosphorIconsFill.heart : PhosphorIconsRegular.heart,
-                color: isLiked ? Colors.redAccent : _muted,
+                color: isLiked ? Colors.redAccent : _subtextColor,
                 size: 20,
               ),
               tooltip: isLiked ? 'Unlike' : 'Like',
             ),
             IconButton(
               onPressed: () => _showSongOptions(song, contextQueue),
-              icon: const Icon(
+              icon: Icon(
                 PhosphorIconsRegular.dotsThreeVertical,
                 size: 20,
+                color: _subtextColor,
               ),
               tooltip: 'More options',
             ),
@@ -2149,14 +4052,182 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
         errorBuilder: (_, _, _) => Container(
           width: width,
           height: height,
-          color: _surface,
-          child: const Icon(PhosphorIconsRegular.musicNote, color: _muted),
+          color: _cardBg,
+          child: Icon(PhosphorIconsRegular.musicNote, color: _subtextColor),
         ),
       ),
     );
   }
 
   /* ----------------------------- SEARCH RESULT ---------------------------- */
+
+  Widget _searchSectionHeader(String title, IconData icon, [int? count]) => Padding(
+    padding: const EdgeInsets.only(bottom: 12),
+    child: Row(
+      children: [
+        Icon(icon, size: 20, color: _textColor),
+        const SizedBox(width: 8),
+        Text(
+          count != null && count > 0 ? '$title ($count)' : title,
+          style: TextStyle(
+            fontSize: 20,
+            fontWeight: FontWeight.w800,
+            color: _textColor,
+          ),
+        ),
+      ],
+    ),
+  );
+
+  Widget _artistCard(Artist artist) => GestureDetector(
+    onTap: () => _openPlaylist(artist.toPlaylist()),
+    child: SizedBox(
+      width: 130,
+      child: Column(
+        children: [
+          Container(
+            width: 120,
+            height: 120,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              border: Border.all(
+                color: _isLight ? const Color(0x18000000) : Colors.white24,
+                width: 2.0,
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color: _isLight
+                      ? Colors.black.withValues(alpha: .08)
+                      : Colors.black.withValues(alpha: .5),
+                  blurRadius: 10,
+                  offset: const Offset(0, 4),
+                ),
+              ],
+            ),
+            child: ClipOval(
+              child: _art(artist.image, width: 120, height: 120),
+            ),
+          ),
+          const SizedBox(height: 10),
+          Text(
+            artist.name,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              fontSize: 13.5,
+              fontWeight: FontWeight.w700,
+              color: _textColor,
+            ),
+          ),
+          const SizedBox(height: 3),
+          Text(
+            artist.role.isNotEmpty ? artist.role : 'Artist',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              fontSize: 11.5,
+              color: _subtextColor,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ],
+      ),
+    ),
+  );
+
+  Widget _albumCard(Album album) => GestureDetector(
+    onTap: () => _openPlaylist(album.toPlaylist()),
+    child: SizedBox(
+      width: 142,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Stack(
+            children: [
+              ClipRRect(
+                borderRadius: BorderRadius.circular(10),
+                child: _art(album.artwork, width: 142, height: 142),
+              ),
+              if (album.year.isNotEmpty)
+                Positioned(
+                  bottom: 8,
+                  left: 8,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 6,
+                      vertical: 2,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withValues(alpha: .75),
+                      borderRadius: BorderRadius.circular(5),
+                      border: Border.all(color: Colors.white12),
+                    ),
+                    child: Text(
+                      album.year,
+                      style: const TextStyle(
+                        fontSize: 9,
+                        fontWeight: FontWeight.w600,
+                        color: Colors.white70,
+                      ),
+                    ),
+                  ),
+                ),
+              Positioned(
+                right: 8,
+                bottom: 8,
+                child: Container(
+                  width: 32,
+                  height: 32,
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    shape: BoxShape.circle,
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withValues(alpha: .4),
+                        blurRadius: 6,
+                        offset: const Offset(0, 2),
+                      ),
+                    ],
+                  ),
+                  child: const Icon(
+                    PhosphorIconsFill.play,
+                    size: 14,
+                    color: Colors.black,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            album.title,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w700,
+              color: _textColor,
+            ),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            album.subtitle.isNotEmpty
+                ? album.subtitle
+                : (album.songCount > 0 ? '${album.songCount} songs' : 'Album'),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              fontSize: 11,
+              color: _subtextColor,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ],
+      ),
+    ),
+  );
 
   Widget _searchResults() {
     if (_searching) {
@@ -2171,7 +4242,12 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
         ),
       );
     }
-    if (_results.isEmpty && _playlistResults.isEmpty) {
+    final hasAny = _artistResults.isNotEmpty ||
+        _results.isNotEmpty ||
+        _albumResults.isNotEmpty ||
+        _playlistResults.isNotEmpty;
+
+    if (!hasAny) {
       return const Center(
         child: Text(
           'Discover any song, artist, album, or playlist',
@@ -2182,26 +4258,63 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
     return ListView(
       padding: const EdgeInsets.fromLTRB(14, 22, 14, 120),
       children: [
-        if (_playlistResults.isNotEmpty) ...[
-          Padding(
-            padding: const EdgeInsets.only(bottom: 12),
-            child: Row(
-              children: [
-                const Icon(
-                  PhosphorIconsRegular.playlist,
-                  size: 20,
-                  color: Colors.white,
-                ),
-                const SizedBox(width: 8),
-                Text(
-                  'Playlists (${_playlistResults.length})',
-                  style: const TextStyle(
-                    fontSize: 20,
-                    fontWeight: FontWeight.w800,
-                  ),
-                ),
-              ],
+        // 1. First row: Artists section (cards)
+        if (_artistResults.isNotEmpty) ...[
+          _searchSectionHeader(
+            'Artists',
+            PhosphorIconsRegular.userCircle,
+            _artistResults.length,
+          ),
+          SizedBox(
+            height: 188,
+            child: ListView.separated(
+              scrollDirection: Axis.horizontal,
+              itemCount: _artistResults.length,
+              separatorBuilder: (_, _) => const SizedBox(width: 14),
+              itemBuilder: (_, i) => _artistCard(_artistResults[i]),
             ),
+          ),
+          const SizedBox(height: 26),
+        ],
+
+        // 2. Second section: Songs list (top 10 songs only)
+        if (_results.isNotEmpty) ...[
+          _searchSectionHeader(
+            'Songs',
+            PhosphorIconsRegular.musicNotes,
+            math.min(10, _results.length),
+          ),
+          ..._results.take(10).toList().asMap().entries.map(
+            (entry) => _searchRow(entry.key, entry.value),
+          ),
+          const SizedBox(height: 26),
+        ],
+
+        // 3. Third section: Albums (cards)
+        if (_albumResults.isNotEmpty) ...[
+          _searchSectionHeader(
+            'Albums',
+            PhosphorIconsRegular.disc,
+            _albumResults.length,
+          ),
+          SizedBox(
+            height: 205,
+            child: ListView.separated(
+              scrollDirection: Axis.horizontal,
+              itemCount: _albumResults.length,
+              separatorBuilder: (_, _) => const SizedBox(width: 14),
+              itemBuilder: (_, i) => _albumCard(_albumResults[i]),
+            ),
+          ),
+          const SizedBox(height: 26),
+        ],
+
+        // 4. Fourth section: Playlists (cards)
+        if (_playlistResults.isNotEmpty) ...[
+          _searchSectionHeader(
+            'Playlists',
+            PhosphorIconsRegular.playlist,
+            _playlistResults.length,
           ),
           SizedBox(
             height: 235,
@@ -2212,17 +4325,6 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
               itemBuilder: (_, i) => _playlistCard(_playlistResults[i]),
             ),
           ),
-          const SizedBox(height: 24),
-        ],
-        if (_results.isNotEmpty) ...[
-          const Text(
-            'Songs',
-            style: TextStyle(fontSize: 21, fontWeight: FontWeight.w800),
-          ),
-          const SizedBox(height: 12),
-          ..._results.asMap().entries.map(
-            (entry) => _searchRow(entry.key, entry.value),
-          ),
         ],
       ],
     );
@@ -2232,14 +4334,14 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
 
   Widget _playlistHeader() => Container(
     padding: const EdgeInsets.fromLTRB(10, 10, 16, 10),
-    decoration: const BoxDecoration(
-      color: Color(0xee080808),
-      border: Border(bottom: BorderSide(color: Color(0x18ffffff))),
+    decoration: BoxDecoration(
+      color: _headerBg,
+      border: Border(bottom: BorderSide(color: _borderColor)),
     ),
     child: Row(
       children: [
         IconButton(
-          icon: const Icon(PhosphorIconsRegular.arrowLeft, size: 22),
+          icon: Icon(PhosphorIconsRegular.arrowLeft, size: 22, color: _textColor),
           onPressed: () => setState(() => _openedPlaylist = null),
         ),
         const SizedBox(width: 4),
@@ -2248,7 +4350,11 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
             _openedPlaylist?.title ?? 'Playlist',
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
-            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+            style: TextStyle(
+              fontSize: 16,
+              fontWeight: FontWeight.w700,
+              color: _textColor,
+            ),
           ),
         ),
       ],
@@ -2278,16 +4384,18 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                       vertical: 3,
                     ),
                     decoration: BoxDecoration(
-                      color: Colors.white.withValues(alpha: .12),
+                      color: _isLight
+                          ? const Color(0xff0f172a).withValues(alpha: .08)
+                          : Colors.white.withValues(alpha: .12),
                       borderRadius: BorderRadius.circular(5),
                     ),
-                    child: const Text(
-                      'PLAYLIST',
+                    child: Text(
+                      playlist.type.toUpperCase(),
                       style: TextStyle(
                         fontSize: 9,
                         letterSpacing: 1.1,
                         fontWeight: FontWeight.w700,
-                        color: Colors.white,
+                        color: _textColor,
                       ),
                     ),
                   ),
@@ -2296,10 +4404,11 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                     playlist.title,
                     maxLines: 2,
                     overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
+                    style: TextStyle(
                       fontSize: 18,
                       fontWeight: FontWeight.w800,
                       height: 1.2,
+                      color: _textColor,
                     ),
                   ),
                   if (playlist.description.isNotEmpty) ...[
@@ -2308,14 +4417,14 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                       playlist.description,
                       maxLines: 2,
                       overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(color: _muted, fontSize: 11),
+                      style: TextStyle(color: _subtextColor, fontSize: 11),
                     ),
                   ],
                   const SizedBox(height: 8),
                   Text(
                     '${playlist.songs.isNotEmpty ? playlist.songs.length : (playlist.songCount > 0 ? playlist.songCount : 0)} Songs',
-                    style: const TextStyle(
-                      color: _muted,
+                    style: TextStyle(
+                      color: _subtextColor,
                       fontSize: 12,
                       fontWeight: FontWeight.w600,
                     ),
@@ -2333,21 +4442,21 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                 onPressed: playlist.songs.isEmpty
                     ? null
                     : () => _playPlaylist(playlist.songs),
-                icon: const Icon(
+                icon: Icon(
                   PhosphorIconsFill.play,
                   size: 18,
-                  color: Colors.black,
+                  color: _isLight ? Colors.white : Colors.black,
                 ),
-                label: const Text(
+                label: Text(
                   'Play All',
                   style: TextStyle(
-                    color: Colors.black,
+                    color: _isLight ? Colors.white : Colors.black,
                     fontWeight: FontWeight.w800,
                     fontSize: 14,
                   ),
                 ),
                 style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.white,
+                  backgroundColor: _isLight ? const Color(0xff0f172a) : Colors.white,
                   padding: const EdgeInsets.symmetric(vertical: 13),
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(30),
@@ -2365,21 +4474,21 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                         final shuffled = [...playlist.songs]..shuffle();
                         _playPlaylist(shuffled);
                       },
-                icon: const Icon(
+                icon: Icon(
                   PhosphorIconsRegular.shuffle,
                   size: 18,
-                  color: Colors.white,
+                  color: _textColor,
                 ),
-                label: const Text(
+                label: Text(
                   'Shuffle',
                   style: TextStyle(
-                    color: Colors.white,
+                    color: _textColor,
                     fontWeight: FontWeight.w700,
                     fontSize: 14,
                   ),
                 ),
                 style: OutlinedButton.styleFrom(
-                  side: const BorderSide(color: Colors.white24),
+                  side: BorderSide(color: _borderColor),
                   padding: const EdgeInsets.symmetric(vertical: 13),
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(30),
@@ -2392,30 +4501,34 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
         const SizedBox(height: 24),
         if (_loadingPlaylist) ...[
           const SizedBox(height: 40),
-          const Center(
+          Center(
             child: Column(
               children: [
-                CircularProgressIndicator(),
-                SizedBox(height: 16),
+                const CircularProgressIndicator(),
+                const SizedBox(height: 16),
                 Text(
                   'Loading playlist songs...',
-                  style: TextStyle(color: _muted),
+                  style: TextStyle(color: _subtextColor),
                 ),
               ],
             ),
           ),
         ] else if (playlist.songs.isEmpty) ...[
           const SizedBox(height: 40),
-          const Center(
+          Center(
             child: Text(
               'No songs available in this playlist',
-              style: TextStyle(color: _muted),
+              style: TextStyle(color: _subtextColor),
             ),
           ),
         ] else ...[
           Text(
             'Tracks (${playlist.songs.length})',
-            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
+            style: TextStyle(
+              fontSize: 16,
+              fontWeight: FontWeight.w800,
+              color: _textColor,
+            ),
           ),
           const SizedBox(height: 10),
           ...playlist.songs.asMap().entries.map(
@@ -2435,18 +4548,30 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
         padding: const EdgeInsets.symmetric(vertical: 7),
         child: Row(
           children: [
-            SizedBox(
+            Container(
               width: 28,
-              child: Text(
-                isCurrent && _audio.playing ? '▶' : '${index + 1}',
-                style: TextStyle(
-                  color: isCurrent ? Colors.white : _muted,
-                  fontWeight: isCurrent ? FontWeight.bold : FontWeight.normal,
-                ),
-              ),
+              alignment: Alignment.centerLeft,
+              child: isCurrent && _audio.playing
+                  ? Icon(
+                      PhosphorIconsFill.play,
+                      size: 14,
+                      color: _isLight
+                          ? const Color(0xff0f172a)
+                          : Colors.white,
+                    )
+                  : Text(
+                      '${index + 1}',
+                      style: TextStyle(
+                        color: isCurrent ? _textColor : _subtextColor,
+                        fontWeight:
+                            isCurrent ? FontWeight.bold : FontWeight.normal,
+                      ),
+                    ),
             ),
             ClipRRect(
-              borderRadius: BorderRadius.circular(6),
+              borderRadius: BorderRadius.circular(
+                AppConstants.songRowThumbnailRadius,
+              ),
               child: _art(song.artwork, width: 48, height: 48),
             ),
             const SizedBox(width: 12),
@@ -2462,8 +4587,8 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                       fontWeight: FontWeight.w700,
                       fontSize: 14,
                       color: isCurrent
-                          ? Colors.white
-                          : Colors.white.withValues(alpha: .9),
+                          ? _textColor
+                          : _textColor.withValues(alpha: .9),
                     ),
                   ),
                   const SizedBox(height: 3),
@@ -2471,8 +4596,8 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                     song.artist,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      color: _muted,
+                    style: TextStyle(
+                      color: _subtextColor,
                       fontSize: 12,
                       fontWeight: FontWeight.w500,
                     ),
@@ -2485,23 +4610,24 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                 padding: const EdgeInsets.only(right: 6),
                 child: Text(
                   _time(Duration(seconds: song.duration)),
-                  style: const TextStyle(color: _muted, fontSize: 11),
+                  style: TextStyle(color: _subtextColor, fontSize: 11),
                 ),
               ),
             IconButton(
               onPressed: () => _toggleLike(song),
               icon: Icon(
                 isLiked ? PhosphorIconsFill.heart : PhosphorIconsRegular.heart,
-                color: isLiked ? Colors.redAccent : _muted,
+                color: isLiked ? Colors.redAccent : _subtextColor,
                 size: 20,
               ),
               tooltip: isLiked ? 'Unlike' : 'Like',
             ),
             IconButton(
               onPressed: () => _showSongOptions(song, playlist.songs),
-              icon: const Icon(
+              icon: Icon(
                 PhosphorIconsRegular.dotsThreeVertical,
                 size: 20,
+                color: _subtextColor,
               ),
               tooltip: 'More options',
             ),
@@ -2520,14 +4646,32 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
         padding: const EdgeInsets.symmetric(vertical: 7),
         child: Row(
           children: [
-            SizedBox(
+            Container(
               width: 28,
-              child: Text(
-                isCurrent && _audio.playing ? '▶' : '${index + 1}',
-                style: const TextStyle(color: _muted),
-              ),
+              alignment: Alignment.centerLeft,
+              child: isCurrent && _audio.playing
+                  ? Icon(
+                      PhosphorIconsFill.play,
+                      size: 14,
+                      color: _isLight
+                          ? const Color(0xff0f172a)
+                          : Colors.white,
+                    )
+                  : Text(
+                      '${index + 1}',
+                      style: TextStyle(
+                        color: isCurrent ? _textColor : _subtextColor,
+                        fontWeight:
+                            isCurrent ? FontWeight.bold : FontWeight.normal,
+                      ),
+                    ),
             ),
-            _art(song.artwork, width: 53, height: 53),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(
+                AppConstants.songRowThumbnailRadius,
+              ),
+              child: _art(song.artwork, width: 53, height: 53),
+            ),
             const SizedBox(width: 12),
             Expanded(
               child: Column(
@@ -2537,15 +4681,18 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                     song.title,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(fontWeight: FontWeight.w700),
+                    style: TextStyle(
+                      fontWeight: FontWeight.w700,
+                      color: _textColor,
+                    ),
                   ),
                   const SizedBox(height: 4),
                   Text(
                     song.artist,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      color: _muted,
+                    style: TextStyle(
+                      color: _subtextColor,
                       fontSize: 12,
                       fontWeight: FontWeight.w500,
                     ),
@@ -2557,16 +4704,17 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
               onPressed: () => _toggleLike(song),
               icon: Icon(
                 isLiked ? PhosphorIconsFill.heart : PhosphorIconsRegular.heart,
-                color: isLiked ? Colors.redAccent : _muted,
+                color: isLiked ? Colors.redAccent : _subtextColor,
                 size: 20,
               ),
               tooltip: isLiked ? 'Unlike' : 'Like',
             ),
             IconButton(
               onPressed: () => _showSongOptions(song, _results),
-              icon: const Icon(
+              icon: Icon(
                 PhosphorIconsRegular.dotsThreeVertical,
                 size: 20,
+                color: _subtextColor,
               ),
               tooltip: 'More options',
             ),
@@ -2581,9 +4729,18 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
   Widget _playerBar() {
     final track = _current!;
     return Container(
-      decoration: const BoxDecoration(
-        color: _surface,
-        border: Border(top: BorderSide(color: Color(0x22ffffff))),
+      decoration: BoxDecoration(
+        color: _isLight ? Colors.white : _surface,
+        border: Border(top: BorderSide(color: _borderColor)),
+        boxShadow: _isLight
+            ? [
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: .06),
+                  blurRadius: 10,
+                  offset: const Offset(0, -3),
+                ),
+              ]
+            : null,
       ),
       child: GestureDetector(
         behavior: HitTestBehavior.opaque,
@@ -2612,17 +4769,18 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                                 track.title,
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
+                                style: TextStyle(
                                   fontWeight: FontWeight.w700,
                                   fontSize: 13,
+                                  color: _textColor,
                                 ),
                               ),
                               Text(
                                 track.artist,
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                  color: _muted,
+                                style: TextStyle(
+                                  color: _subtextColor,
                                   fontWeight: FontWeight.w500,
                                   fontSize: 11,
                                 ),
@@ -2642,7 +4800,7 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                       size: 20,
                       color: _likedSongs.containsKey(track.id)
                           ? Colors.redAccent
-                          : _muted,
+                          : _subtextColor,
                     ),
                     tooltip: _likedSongs.containsKey(track.id)
                         ? 'Unlike'
@@ -2653,24 +4811,32 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                     icon: Icon(
                       PhosphorIconsRegular.textAa,
                       size: 20,
-                      color: _lyricsOpen ? Colors.white : _muted,
+                      color: _lyricsOpen
+                          ? (_isLight ? const Color(0xff0f172a) : Colors.white)
+                          : _subtextColor,
                     ),
                     tooltip: 'Lyrics',
                   ),
                   IconButton(
                     onPressed: _previous,
-                    icon: const Icon(PhosphorIconsRegular.skipBack, size: 20),
+                    icon: Icon(
+                      PhosphorIconsRegular.skipBack,
+                      size: 20,
+                      color: _textColor,
+                    ),
                   ),
                   _buildPlayPauseButton(
                     iconSize: 34,
                     spinnerSize: 24,
                     strokeWidth: 2.4,
+                    color: _textColor,
                   ),
                   IconButton(
                     onPressed: _next,
-                    icon: const Icon(
+                    icon: Icon(
                       PhosphorIconsRegular.skipForward,
                       size: 20,
+                      color: _textColor,
                     ),
                   ),
                 ],
@@ -2711,7 +4877,9 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
             value: value,
             minHeight: minHeight,
             backgroundColor: Colors.transparent,
-            valueColor: const AlwaysStoppedAnimation(Colors.white),
+            valueColor: AlwaysStoppedAnimation(
+              _isLight ? const Color(0xff0f172a) : Colors.white,
+            ),
           );
         },
       );
@@ -2720,41 +4888,60 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
 
   /* -------------------------------- LYRICS -------------------------------- */
 
-  Widget _lyricsSheet() => DraggableScrollableSheet(
-    expand: false,
-    initialChildSize: .78,
-    maxChildSize: .94,
-    minChildSize: .45,
-    builder: (context, controller) => Container(
-      decoration: const BoxDecoration(
-        color: Color(0xff18181d),
-        borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
-      ),
-      child: SafeArea(
-        top: false,
-        child: Column(
-          children: [
-            const SizedBox(height: 10),
-            Container(
-              width: 42,
-              height: 4,
-              decoration: BoxDecoration(
-                color: Colors.white24,
-                borderRadius: BorderRadius.circular(2),
+  Widget _lyricsSheet() => Align(
+    alignment: Alignment.bottomCenter,
+    child: FractionallySizedBox(
+      heightFactor: 0.82,
+      child: GestureDetector(
+        onVerticalDragEnd: (details) {
+          if (details.primaryVelocity != null &&
+              details.primaryVelocity! > 250) {
+            setState(() => _lyricsOpen = false);
+          }
+        },
+        child: Container(
+          decoration: BoxDecoration(
+            color: _sheetBg,
+            borderRadius: const BorderRadius.vertical(top: Radius.circular(22)),
+            border: Border(top: BorderSide(color: _borderColor)),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withValues(alpha: 0.45),
+                blurRadius: 24,
+                offset: const Offset(0, -6),
               ),
+            ],
+          ),
+          child: SafeArea(
+            top: false,
+            child: Column(
+              children: [
+                const SizedBox(height: 10),
+                Container(
+                  width: 42,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: _isLight ? const Color(0x20000000) : Colors.white24,
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+                ListTile(
+                  title: Text(
+                    'Lyrics',
+                    style: TextStyle(
+                      fontWeight: FontWeight.bold,
+                      color: _textColor,
+                    ),
+                  ),
+                  trailing: IconButton(
+                    onPressed: () => setState(() => _lyricsOpen = false),
+                    icon: Icon(PhosphorIconsRegular.x, color: _textColor),
+                  ),
+                ),
+                Expanded(child: _lyricsBody()),
+              ],
             ),
-            ListTile(
-              title: const Text(
-                'Lyrics',
-                style: TextStyle(fontWeight: FontWeight.bold),
-              ),
-              trailing: IconButton(
-                onPressed: () => setState(() => _lyricsOpen = false),
-                icon: const Icon(PhosphorIconsRegular.x),
-              ),
-            ),
-            Expanded(child: _lyricsBody(controller)),
-          ],
+          ),
         ),
       ),
     ),
@@ -2764,289 +4951,361 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
     return _LyricsAutoScrollView(
       lyrics: _lyrics,
       parsedLyrics: _parsedLyrics,
+      isLoading: _isLoadingLyrics,
       positionStream: _audio.positionStream,
+      initialPosition: _audio.position,
       onSeek: _seek,
       controller: controller,
     );
   }
 
   /* ------------------------------ FULL SCREEN ----------------------------- */
+Widget _fullScreenView() {
+  final track = _current!;
+  final screenHeight = MediaQuery.sizeOf(context).height;
+  final bottomPadding = MediaQuery.paddingOf(context).bottom;
+  final collapsedHeight = 54.0 + bottomPadding;
+  final maxSheetHeight = screenHeight * 0.78;
 
-  Widget _fullScreenView() {
-    final track = _current!;
-    return FutureBuilder<List<Color>>(
-      future: _paletteFor(track),
-      builder: (context, paletteSnapshot) {
-        final colors = _paletteOrDefault(paletteSnapshot);
-        final artworkColor = colors.first;
-        final secondaryColor = colors.length > 1 ? colors[1] : artworkColor;
-        final tertiaryColor = colors.length > 2 ? colors[2] : secondaryColor;
-        return Material(
-          color: _ink,
-          child: Stack(
-            children: [
-              Container(color: const ui.Color(0xff080808)),
-              // Animated multi-blob gradient background.
-              AnimatedBuilder(
-                animation: _gradientAnim,
-                builder: (context, child) {
-                  final ease = Curves.easeInOutCubic.transform(
-                    _gradientAnim.value,
-                  );
-                  final breath = math.sin(ease * math.pi);
-                  final shift = ease * 2.0 - 1.0;
-                  return ImageFiltered(
-                    imageFilter: ui.ImageFilter.blur(sigmaX: 100, sigmaY: 100),
-                    child: Stack(
-                      children: [
-                        // Primary orb — top area (anchored behind album artwork & title).
-                        Positioned.fill(
-                          child: Container(
-                            decoration: BoxDecoration(
-                              gradient: RadialGradient(
-                                center: Alignment(
-                                  -0.05 + shift * 0.08,
-                                  -0.42 + breath * 0.07,
-                                ),
-                                radius: 1.05 + breath * 0.18,
-                                colors: [
-                                  artworkColor.withValues(alpha: 0.6),
-                                  artworkColor.withValues(alpha: 0.6),
-                                  Colors.transparent,
-                                ],
-                                stops: const [0.0, 0.42, 1.0],
-                              ),
-                            ),
-                          ),
-                        ),
-                        // Secondary orb — right side (anchored mid-right).
-                        Positioned.fill(
-                          child: Container(
-                            decoration: BoxDecoration(
-                              gradient: RadialGradient(
-                                center: Alignment(
-                                  0.50 - breath * 0.09,
-                                  0.05 + shift * 0.10,
-                                ),
-                                radius: 0.92 + (1.0 - breath) * 0.16,
-                                colors: [
-                                  secondaryColor.withValues(alpha: 0.92),
-                                  secondaryColor.withValues(alpha: 0.45),
-                                  Colors.transparent,
-                                ],
-                                stops: const [0.0, 0.38, 1.0],
-                              ),
-                            ),
-                          ),
-                        ),
-                        // Tertiary orb — bottom (anchored around playback controls).
-                        Positioned.fill(
-                          child: Container(
-                            decoration: BoxDecoration(
-                              gradient: RadialGradient(
-                                center: Alignment(
-                                  -0.32 + shift * 0.08,
-                                  0.62 - breath * 0.08,
-                                ),
-                                radius: 0.98 + breath * 0.16,
-                                colors: [
-                                  tertiaryColor.withValues(alpha: 0.28),
-                                  tertiaryColor.withValues(alpha: 0.38),
-                                  Colors.transparent,
-                                ],
-                                stops: const [0.0, 0.4, 1.0],
-                              ),
-                            ),
-                          ),
-                        ),
+  return FutureBuilder<List<Color>>(
+    future: _paletteFor(track),
+    builder: (context, paletteSnapshot) {
+      final colors = _paletteOrDefault(paletteSnapshot);
+      final artworkColor = colors.first;
+      final secondaryColor = colors.length > 1 ? colors[1] : artworkColor;
+      final tertiaryColor = colors.length > 2 ? colors[2] : secondaryColor;
+      return Material(
+        color: _bg,
+        child: Stack(
+          children: [
+            Container(
+              color: _isLight
+                  ? const Color(0xfff8f9fa)
+                  : const ui.Color(0xff080808),
+            ),
+            // YouTube Music-style vertical gradient background.
+            AnimatedBuilder(
+              animation: _gradientAnim,
+              builder: (context, child) {
+                // Very subtle "breathing" drift so the background feels alive.
+                final t = Curves.easeInOut.transform(_gradientAnim.value);
+                final drift = (t - 0.5) * 0.06;
+
+                // Top = artwork color, blended toward the base surface.
+                final topColor = _isLight
+                    ? Color.lerp(artworkColor, Colors.white, 0.25)!
+                    : Color.lerp(artworkColor, Colors.black, 0.10)!;
+
+                // Middle = artwork color heavily darkened.
+                final midColor = _isLight
+                    ? Color.lerp(secondaryColor, Colors.white, 0.55)!
+                    : Color.lerp(artworkColor, Colors.black, 0.62)!;
+
+                // Lower-mid = near-surface tone.
+                final lowColor = _isLight
+                    ? const Color(0xffeef1f5)
+                    : Color.lerp(tertiaryColor, Colors.black, 0.88)!;
+
+                return Container(
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.topCenter,
+                      end: Alignment.bottomCenter,
+                      colors: _isLight
+                          ? [topColor, midColor, lowColor, lowColor]
+                          : [
+                              topColor,
+                              midColor,
+                              lowColor,
+                              const ui.Color(0xff080808),
+                            ],
+                      stops: [
+                        0.0,
+                        0.34 + drift,
+                        0.72 + drift,
+                        1.0,
                       ],
                     ),
-                  );
-                },
-              ),
-              // Subtle darkening overlay for readability.
-              Container(
-                decoration: const BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.topCenter,
-                    end: Alignment.bottomCenter,
-                    colors: [
-                      ui.Color(0x10000000),
-                      ui.Color(0x30000000),
-                      ui.Color(0x70000000),
-                    ],
-                    stops: [0.0, 0.55, 1.0],
                   ),
-                ),
-              ),
-              SafeArea(
-                child: Column(
-                  children: [
-                    Padding(
-                      padding: const EdgeInsets.fromLTRB(18, 12, 12, 6),
-                      child: Row(
-                        children: [
-                          const Icon(PhosphorIconsRegular.musicNote, size: 19),
-                          const SizedBox(width: 8),
-                          const Expanded(
-                            child: Text(
-                              'Now Playing',
-                              style: TextStyle(fontWeight: FontWeight.w700),
-                            ),
-                          ),
-                          IconButton(
-                            onPressed: () => _toggleLike(track),
-                            icon: Icon(
-                              _likedSongs.containsKey(track.id)
-                                  ? PhosphorIconsFill.heart
-                                  : PhosphorIconsRegular.heart,
-                              color: _likedSongs.containsKey(track.id)
-                                  ? Colors.redAccent
-                                  : Colors.white,
-                              size: 22,
-                            ),
-                            tooltip: _likedSongs.containsKey(track.id)
-                                ? 'Unlike'
-                                : 'Like',
-                          ),
-                          IconButton(
-                            onPressed: () => _showSongOptions(track),
-                            icon: const Icon(
-                              PhosphorIconsRegular.dotsThreeVertical,
-                              size: 22,
-                            ),
-                            tooltip: 'Options',
-                          ),
-                          IconButton(
-                            onPressed: () =>
-                                setState(() => _fullScreen = false),
-                            icon: const Icon(PhosphorIconsRegular.caretDown),
-                            tooltip: 'Minimize player',
-                          ),
-                        ],
-                      ),
-                    ),
-                    Container(
-                      margin: const EdgeInsets.symmetric(horizontal: 18),
-                      padding: const EdgeInsets.all(4),
-                      decoration: BoxDecoration(
-                        color: Colors.white.withValues(alpha: .08),
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: Row(
-                        children: [
-                          Expanded(
-                            child: _fullScreenTab(
-                              icon: PhosphorIconsRegular.disc,
-                              label: 'Player',
-                              active: !_fullScreenLyrics,
-                              onTap: () =>
-                                  setState(() => _fullScreenLyrics = false),
-                            ),
-                          ),
-                          Expanded(
-                            child: _fullScreenTab(
-                              icon: PhosphorIconsRegular.textAa,
-                              label: 'Lyrics',
-                              active: _fullScreenLyrics,
-                              onTap: () =>
-                                  setState(() => _fullScreenLyrics = true),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    Expanded(
-                      child: _fullScreenLyrics
-                          ? _lyricsBody()
-                          : SingleChildScrollView(
-                              child: Column(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  const SizedBox(height: 24),
-                                  ClipRRect(
-                                    borderRadius: BorderRadius.circular(14),
-                                    child: _art(
-                                      track.artwork,
-                                      width: 280,
-                                      height: 280,
-                                    ),
-                                  ),
-                                  const SizedBox(height: 28),
-                                  Padding(
-                                    padding: const EdgeInsets.symmetric(
-                                      horizontal: 24,
-                                    ),
-                                    child: Text(
-                                      track.title,
-                                      textAlign: TextAlign.center,
-                                      maxLines: 2,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: const TextStyle(
-                                        fontSize: 24,
-                                        fontWeight: FontWeight.w700,
-                                      ),
-                                    ),
-                                  ),
-                                  const SizedBox(height: 7),
-                                  Padding(
-                                    padding: const EdgeInsets.symmetric(
-                                      horizontal: 24,
-                                    ),
-                                    child: Text(
-                                      track.artist,
-                                      textAlign: TextAlign.center,
-                                      maxLines: 2,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: const TextStyle(
-                                        color: _muted,
-                                        fontSize: 16,
-                                      ),
-                                    ),
-                                  ),
-                                  const SizedBox(height: 24),
-                                ],
-                              ),
-                            ),
-                    ),
-                    _fullScreenSlider(),
-                    const SizedBox(height: 4),
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
+                );
+              },
+            ),
+            SafeArea(
+              bottom: false,
+              child: Column(
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(18, 12, 12, 6),
+                    child: Row(
                       children: [
-                        IconButton(
-                          onPressed: _previous,
-                          icon: const Icon(
-                            PhosphorIconsRegular.skipBack,
-                            size: 32,
+                        Icon(
+                          PhosphorIconsRegular.musicNote,
+                          size: 19,
+                          color: _textColor,
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            'Now Playing',
+                            style: TextStyle(
+                              fontWeight: FontWeight.w700,
+                              color: _textColor,
+                            ),
                           ),
                         ),
-                        const SizedBox(width: 12),
-                        _buildPlayPauseButton(
-                          iconSize: 64,
-                          spinnerSize: 52,
-                          strokeWidth: 3.0,
-                        ),
-                        const SizedBox(width: 12),
                         IconButton(
-                          onPressed: _next,
-                          icon: const Icon(
-                            PhosphorIconsRegular.skipForward,
-                            size: 32,
+                          onPressed: () => _toggleLike(track),
+                          icon: Icon(
+                            _likedSongs.containsKey(track.id)
+                                ? PhosphorIconsFill.heart
+                                : PhosphorIconsRegular.heart,
+                            color: _likedSongs.containsKey(track.id)
+                                ? Colors.redAccent
+                                : _textColor,
+                            size: 22,
+                          ),
+                          tooltip: _likedSongs.containsKey(track.id)
+                              ? 'Unlike'
+                              : 'Like',
+                        ),
+                        IconButton(
+                          onPressed: () => _showSongOptions(track),
+                          icon: Icon(
+                            PhosphorIconsRegular.dotsThreeVertical,
+                            size: 22,
+                            color: _textColor,
+                          ),
+                          tooltip: 'Options',
+                        ),
+                        IconButton(
+                          onPressed: () {
+                            _queueAnim.value = 0.0;
+                            setState(() => _fullScreen = false);
+                          },
+                          icon: Icon(
+                            PhosphorIconsRegular.caretDown,
+                            color: _textColor,
+                          ),
+                          tooltip: 'Minimize player',
+                        ),
+                      ],
+                    ),
+                  ),
+                  Container(
+                    margin: const EdgeInsets.symmetric(horizontal: 18),
+                    padding: const EdgeInsets.all(4),
+                    decoration: BoxDecoration(
+                      color: _isLight
+                          ? Colors.black.withValues(alpha: .06)
+                          : Colors.white.withValues(alpha: .08),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: _fullScreenTab(
+                            icon: PhosphorIconsRegular.disc,
+                            label: 'Player',
+                            active: !_fullScreenLyrics,
+                            onTap: () =>
+                                setState(() => _fullScreenLyrics = false),
+                          ),
+                        ),
+                        Expanded(
+                          child: _fullScreenTab(
+                            icon: PhosphorIconsRegular.textAa,
+                            label: 'Lyrics',
+                            active: _fullScreenLyrics,
+                            onTap: () =>
+                                setState(() => _fullScreenLyrics = true),
                           ),
                         ),
                       ],
                     ),
-                    const SizedBox(height: 12),
-                  ],
-                ),
+                  ),
+                  Expanded(
+                    child: _fullScreenLyrics
+                        ? Column(
+                            children: [
+                              Expanded(child: _lyricsBody()),
+                              const SizedBox(height: 22),
+                              _fullScreenSlider(),
+                              _fullScreenControls(),
+                              const SizedBox(height: 12),
+                              SizedBox(height: collapsedHeight + 14),
+                            ],
+                          )
+                        : LayoutBuilder(
+                            builder: (context, constraints) {
+                              final availableHeight = constraints.maxHeight;
+                              final artSize = (availableHeight * 0.36)
+                                  .clamp(160.0, 240.0);
+
+                              return SingleChildScrollView(
+                                physics: const BouncingScrollPhysics(),
+                                child: ConstrainedBox(
+                                  constraints: BoxConstraints(
+                                      minHeight: availableHeight),
+                                  child: Column(
+                                    mainAxisAlignment: MainAxisAlignment.center,
+                                    children: [
+                                      SizedBox(height: (availableHeight * 0.01).clamp(16.0, 32.0)),
+                                      Center(
+                                        child: Container(
+                                          decoration: BoxDecoration(
+                                            borderRadius:
+                                                BorderRadius.circular(16),
+                                            boxShadow: [
+                                              BoxShadow(
+                                                color: _isLight
+                                                    ? artworkColor
+                                                        .withValues(alpha: 0.3)
+                                                    : Colors.black
+                                                        .withValues(alpha: 0.5),
+                                                blurRadius: 28,
+                                                offset:
+                                                    const Offset(0, 10),
+                                              ),
+                                            ],
+                                          ),
+                                          child: ClipRRect(
+                                            borderRadius:
+                                                BorderRadius.circular(16),
+                                            child: _art(
+                                              track.artwork,
+                                              width: artSize,
+                                              height: artSize,
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                      const SizedBox(height: 18),
+                                      Padding(
+                                        padding: const EdgeInsets
+                                            .symmetric(horizontal: 24),
+                                        child: Text(
+                                          track.title,
+                                          textAlign: TextAlign.center,
+                                          maxLines: 2,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: TextStyle(
+                                            fontSize: 22,
+                                            fontWeight: FontWeight.w700,
+                                            color: _textColor,
+                                          ),
+                                        ),
+                                      ),
+                                      const SizedBox(height: 6),
+                                      Padding(
+                                        padding: const EdgeInsets
+                                            .symmetric(horizontal: 24),
+                                        child: Text(
+                                          track.artist,
+                                          textAlign: TextAlign.center,
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: TextStyle(
+                                            color: _subtextColor,
+                                            fontSize: 15,
+                                          ),
+                                        ),
+                                      ),
+                                      const SizedBox(height: 22),
+                                      // Progress bar slider directly below Title & Artist
+                                      _fullScreenSlider(),
+                                      // const SizedBox(height: 2),
+                                      // Player buttons (prev, play, next) directly below slider
+                                      _fullScreenControls(),
+                                      const SizedBox(height: 12),
+                                      // Space above the Up Next bottom bar
+                                      SizedBox(height: collapsedHeight + 14),
+                                    ],
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
+                  ),
+                ],
               ),
-            ],
-          ),
-        );
-      },
-    );
-  }
+            ),
+            // Bottom-to-top Queue Scroller (YT Music style)
+            AnimatedBuilder(
+              animation: _queueAnim,
+              builder: (context, _) {
+                final t = Curves.easeOutCubic.transform(_queueAnim.value);
+                final currentHeight =
+                    ui.lerpDouble(collapsedHeight, maxSheetHeight, t)!;
+                final isExpanded = _queueAnim.value > 0.05;
+
+                return Stack(
+                  children: [
+                    if (isExpanded)
+                      Positioned.fill(
+                        child: GestureDetector(
+                          onTap: () => _queueAnim.animateTo(
+                            0.0,
+                            curve: Curves.easeOutCubic,
+                          ),
+                          child: Container(
+                            color: Colors.black.withValues(alpha: 0.48 * t),
+                          ),
+                        ),
+                      ),
+                    Positioned(
+                      left: 0,
+                      right: 0,
+                      bottom: 0,
+                      height: currentHeight,
+                      child: _buildUpNextSheet(
+                        track: track,
+                        artworkColor: artworkColor,
+                        t: t,
+                        collapsedHeight: collapsedHeight,
+                        maxHeight: maxSheetHeight,
+                        bottomPadding: bottomPadding,
+                      ),
+                    ),
+                  ],
+                );
+              },
+            ),
+          ],
+        ),
+      );
+    },
+  );
+}
+
+  Widget _fullScreenControls() => Row(
+    mainAxisAlignment: MainAxisAlignment.center,
+    children: [
+      IconButton(
+        onPressed: _previous,
+        icon: Icon(
+          PhosphorIconsRegular.skipBack,
+          size: 30,
+          color: _textColor,
+        ),
+      ),
+      const SizedBox(width: 16),
+      _buildPlayPauseButton(
+        iconSize: 62,
+        spinnerSize: 50,
+        strokeWidth: 3.0,
+        color: _textColor,
+      ),
+      const SizedBox(width: 16),
+      IconButton(
+        onPressed: _next,
+        icon: Icon(
+          PhosphorIconsRegular.skipForward,
+          size: 30,
+          color: _textColor,
+        ),
+      ),
+    ],
+  );
 
   Widget _fullScreenSlider() => StreamBuilder<Duration?>(
     stream: _audio.durationStream,
@@ -3072,16 +5331,48 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
             padding: const EdgeInsets.symmetric(horizontal: 24),
             child: Column(
               children: [
-                Slider(
-                  value: value,
-                  max: maxMs <= 0 ? 1 : maxMs,
-                  onChanged: maxMs <= 0
-                      ? null
-                      : (v) => _audio.seek(Duration(milliseconds: v.round())),
+                SliderTheme(
+                  data: SliderTheme.of(context).copyWith(
+                    activeTrackColor:
+                        _isLight ? const Color(0xff0f172a) : Colors.white,
+                    inactiveTrackColor: _isLight
+                        ? Colors.black.withValues(alpha: 0.12)
+                        : Colors.white.withValues(alpha: 0.24),
+                    thumbColor:
+                        _isLight ? const Color(0xff0f172a) : Colors.white,
+                    overlayColor: _isLight
+                        ? const Color(0x1a0f172a)
+                        : const Color(0x26ffffff),
+                    trackHeight: 3.5,
+                  ),
+                  child: Slider(
+                    value: value,
+                    max: maxMs <= 0 ? 1 : maxMs,
+                    onChanged: maxMs <= 0
+                        ? null
+                        : (v) => _audio.seek(Duration(milliseconds: v.round())),
+                  ),
                 ),
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [Text(_time(position)), Text(_time(duration!))],
+                  children: [
+                    Text(
+                      _time(position),
+                      style: TextStyle(
+                        color: _subtextColor,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    Text(
+                      _time(duration!),
+                      style: TextStyle(
+                        color: _subtextColor,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
                 ),
               ],
             ),
@@ -3102,18 +5393,37 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
     child: Container(
       padding: const EdgeInsets.symmetric(vertical: 10),
       decoration: BoxDecoration(
-        color: active ? Colors.white : Colors.transparent,
+        color: active
+            ? (_isLight ? Colors.white : Colors.white)
+            : Colors.transparent,
         borderRadius: BorderRadius.circular(9),
+        boxShadow: active && _isLight
+            ? [
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: 0.08),
+                  blurRadius: 4,
+                  offset: const Offset(0, 1),
+                ),
+              ]
+            : null,
       ),
       child: Row(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          Icon(icon, size: 17, color: active ? _ink : Colors.white),
+          Icon(
+            icon,
+            size: 17,
+            color: active
+                ? (_isLight ? const Color(0xff0f172a) : _ink)
+                : (_isLight ? const Color(0xff64748b) : Colors.white70),
+          ),
           const SizedBox(width: 7),
           Text(
             label,
             style: TextStyle(
-              color: active ? _ink : Colors.white,
+              color: active
+                  ? (_isLight ? const Color(0xff0f172a) : _ink)
+                  : (_isLight ? const Color(0xff64748b) : Colors.white70),
               fontWeight: FontWeight.w700,
               fontSize: 13,
             ),
@@ -3125,6 +5435,654 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
 
   String _time(Duration value) =>
       '${value.inMinutes}:${(value.inSeconds % 60).toString().padLeft(2, '0')}';
+
+  /* --------------------------- UP NEXT QUEUE (YT MUSIC STYLE) ---------------- */
+
+  List<Song> get _upcomingQueue {
+    final list = <Song>[];
+    if (_playbackHistoryIndex >= 0 &&
+        _playbackHistoryIndex < _playbackHistory.length - 1) {
+      list.addAll(_playbackHistory.sublist(_playbackHistoryIndex + 1));
+    }
+    if (_playbackMode == PlaybackMode.playlist) {
+      if (_playlistQueue.isNotEmpty) {
+        for (int i = 1; i < _playlistQueue.length; i++) {
+          final idx = (_playlistQueueIndex + i) % _playlistQueue.length;
+          list.add(_playlistQueue[idx]);
+        }
+      }
+    } else {
+      list.addAll(_suggestionQueue);
+    }
+    return list;
+  }
+
+  void _playFromQueue(int targetIdx) {
+    if (_playbackHistoryIndex >= 0 &&
+        _playbackHistoryIndex < _playbackHistory.length - 1) {
+      final historyForwardCount =
+          _playbackHistory.length - 1 - _playbackHistoryIndex;
+      if (targetIdx < historyForwardCount) {
+        _playbackHistoryIndex += (targetIdx + 1);
+        _play(_playbackHistory[_playbackHistoryIndex],
+            isHistoryNavigation: true);
+        return;
+      }
+      targetIdx -= historyForwardCount;
+    }
+
+    if (_playbackMode == PlaybackMode.playlist) {
+      if (_playlistQueue.isNotEmpty) {
+        _playlistQueueIndex =
+            (_playlistQueueIndex + 1 + targetIdx) % _playlistQueue.length;
+        _play(_playlistQueue[_playlistQueueIndex]);
+      }
+    } else {
+      if (targetIdx >= 0 && targetIdx < _suggestionQueue.length) {
+        final songToPlay = _suggestionQueue[targetIdx];
+        _suggestionQueue.removeRange(0, targetIdx + 1);
+        _play(songToPlay);
+        if (_suggestionQueue.isEmpty) {
+          unawaited(_fetchSuggestions(songToPlay.id));
+        }
+      }
+    }
+  }
+
+  void _shuffleQueue() {
+    if (_playbackMode == PlaybackMode.playlist) {
+      if (_playlistQueue.length > 2) {
+        final currentSong = _playlistQueue[_playlistQueueIndex];
+        final remaining = <Song>[];
+        for (int i = 0; i < _playlistQueue.length; i++) {
+          if (i != _playlistQueueIndex) remaining.add(_playlistQueue[i]);
+        }
+        remaining.shuffle();
+        _playlistQueue = [currentSong, ...remaining];
+        _playlistQueueIndex = 0;
+        setState(() {});
+      }
+    } else {
+      if (_suggestionQueue.length > 1) {
+        _suggestionQueue.shuffle();
+        setState(() {});
+      }
+    }
+  }
+
+  void _reorderQueueItem(int oldIndex, int newIndex) {
+    if (oldIndex == newIndex) return;
+    final currentUpcoming = List<Song>.from(_upcomingQueue);
+    if (oldIndex < 0 || oldIndex >= currentUpcoming.length) return;
+    if (newIndex < 0 || newIndex >= currentUpcoming.length) return;
+
+    final movedSong = currentUpcoming.removeAt(oldIndex);
+    currentUpcoming.insert(newIndex, movedSong);
+
+    setState(() {
+      _preparedSong = null;
+      _preparedStreamUrl = null;
+
+      if (_playbackHistoryIndex >= 0 &&
+          _playbackHistoryIndex < _playbackHistory.length - 1) {
+        _playbackHistory.removeRange(
+          _playbackHistoryIndex + 1,
+          _playbackHistory.length,
+        );
+      }
+
+      if (_playbackMode == PlaybackMode.playlist) {
+        if (_current != null) {
+          _playlistQueue = [_current!, ...currentUpcoming];
+          _playlistQueueIndex = 0;
+        } else {
+          _playlistQueue = currentUpcoming;
+          _playlistQueueIndex = -1;
+        }
+      } else {
+        _suggestionQueue = currentUpcoming;
+      }
+    });
+  }
+
+  void _onQueueDragUpdate(DragUpdateDetails details, double maxHeight) {
+    if (maxHeight <= 0) return;
+    final delta = details.primaryDelta ?? 0.0;
+    _queueAnim.value = (_queueAnim.value - (delta / maxHeight)).clamp(0.0, 1.0);
+  }
+
+  void _onQueueDragEnd(DragEndDetails details) {
+    final velocity = details.primaryVelocity ?? 0.0;
+    if (velocity < -250) {
+      _queueAnim.animateTo(1.0, curve: Curves.easeOutCubic);
+    } else if (velocity > 250) {
+      _queueAnim.animateTo(0.0, curve: Curves.easeOutCubic);
+    } else if (_queueAnim.value >= 0.4) {
+      _queueAnim.animateTo(1.0, curve: Curves.easeOutCubic);
+    } else {
+      _queueAnim.animateTo(0.0, curve: Curves.easeOutCubic);
+    }
+  }
+
+  Widget _buildUpNextSheet({
+    required Song track,
+    required Color artworkColor,
+    required double t,
+    required double collapsedHeight,
+    required double maxHeight,
+    required double bottomPadding,
+  }) {
+    final queue = _upcomingQueue;
+    final isExpanded = t > 0.18;
+
+    return Container(
+      decoration: BoxDecoration(
+        color: _isLight ? Colors.white : const Color(0xff18181c),
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(22)),
+        border: Border(
+          top: BorderSide(
+            color: _isLight
+                ? const Color(0x20000000)
+                : Colors.white.withValues(alpha: 0.18),
+            width: 1.0,
+          ),
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.38),
+            blurRadius: 22,
+            offset: const Offset(0, -6),
+          ),
+        ],
+      ),
+      child: isExpanded
+          ? Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onVerticalDragUpdate: (details) =>
+                      _onQueueDragUpdate(details, maxHeight),
+                  onVerticalDragEnd: _onQueueDragEnd,
+                  child: Column(
+                    children: [
+                      const SizedBox(height: 8),
+                      Container(
+                        width: 38,
+                        height: 4.5,
+                        decoration: BoxDecoration(
+                          color: _isLight
+                              ? const Color(0x32000000)
+                              : Colors.white24,
+                          borderRadius: BorderRadius.circular(2),
+                        ),
+                      ),
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(18, 8, 10, 8),
+                        child: Row(
+                          children: [
+                            Icon(
+                              PhosphorIconsRegular.playlist,
+                              size: 20,
+                              color: _textColor,
+                            ),
+                            const SizedBox(width: 8),
+                            Text(
+                              'Up Next',
+                              style: TextStyle(
+                                fontSize: 17,
+                                fontWeight: FontWeight.w800,
+                                color: _textColor,
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 8,
+                                vertical: 2,
+                              ),
+                              decoration: BoxDecoration(
+                                color: _isLight
+                                    ? Colors.black.withValues(alpha: 0.06)
+                                    : Colors.white.withValues(alpha: 0.12),
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                              child: Text(
+                                '${queue.length} ${queue.length == 1 ? 'song' : 'songs'}',
+                                style: TextStyle(
+                                  fontSize: 11.5,
+                                  fontWeight: FontWeight.w700,
+                                  color: _textColor,
+                                ),
+                              ),
+                            ),
+                            const Spacer(),
+                            if (queue.length > 1)
+                              IconButton(
+                                onPressed: _shuffleQueue,
+                                icon: Icon(
+                                  PhosphorIconsRegular.shuffle,
+                                  size: 19,
+                                  color: _textColor,
+                                ),
+                                tooltip: 'Shuffle queue',
+                              ),
+                            IconButton(
+                              onPressed: () => _queueAnim.animateTo(
+                                0.0,
+                                curve: Curves.easeOutCubic,
+                              ),
+                              icon: Icon(
+                                PhosphorIconsRegular.caretDown,
+                                size: 20,
+                                color: _textColor,
+                              ),
+                              tooltip: 'Collapse',
+                            ),
+                          ],
+                        ),
+                      ),
+                      Divider(color: _borderColor, height: 1),
+                    ],
+                  ),
+                ),
+                Expanded(
+                  child: _buildQueueList(track, queue),
+                ),
+              ],
+            )
+          : GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: () =>
+                  _queueAnim.animateTo(1.0, curve: Curves.easeOutCubic),
+              onVerticalDragUpdate: (details) =>
+                  _onQueueDragUpdate(details, maxHeight),
+              onVerticalDragEnd: _onQueueDragEnd,
+              child: SafeArea(
+                top: false,
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 6, 16, 0),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Container(
+                        width: 36,
+                        height: 4,
+                        decoration: BoxDecoration(
+                          color: _isLight
+                              ? const Color(0x30000000)
+                              : Colors.white24,
+                          borderRadius: BorderRadius.circular(2),
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Row(
+                        children: [
+                          Icon(
+                            PhosphorIconsRegular.playlist,
+                            size: 17,
+                            color: _textColor,
+                          ),
+                          const SizedBox(width: 8),
+                          Text(
+                            'UP NEXT',
+                            style: TextStyle(
+                              fontSize: 12.5,
+                              fontWeight: FontWeight.w800,
+                              letterSpacing: 0.8,
+                              color: _textColor,
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 6,
+                              vertical: 2,
+                            ),
+                            decoration: BoxDecoration(
+                              color: _isLight
+                                  ? Colors.black.withValues(alpha: 0.08)
+                                  : Colors.white.withValues(alpha: 0.12),
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                            child: Text(
+                              '${queue.length}',
+                              style: TextStyle(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w700,
+                                color: _textColor,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          if (queue.isNotEmpty)
+                            Expanded(
+                              child: Text(
+                                'Next: ${queue.first.title}',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                textAlign: TextAlign.end,
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: _subtextColor,
+                                  fontWeight: FontWeight.w500,
+                                ),
+                              ),
+                            ),
+                          const SizedBox(width: 6),
+                          Icon(
+                            PhosphorIconsRegular.caretUp,
+                            size: 16,
+                            color: _subtextColor,
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+    );
+  }
+
+  Widget _buildQueueNowPlayingCard(Song currentSong) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: const EdgeInsets.only(bottom: 6),
+          child: Text(
+            'NOW PLAYING',
+            style: TextStyle(
+              fontSize: 11,
+              fontWeight: FontWeight.w800,
+              letterSpacing: 1.0,
+              color: _subtextColor,
+            ),
+          ),
+        ),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          decoration: BoxDecoration(
+            color: _isLight
+                ? const Color(0xff0f172a).withValues(alpha: 0.05)
+                : Colors.white.withValues(alpha: 0.08),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(
+              color: _isLight
+                  ? const Color(0x18000000)
+                  : Colors.white.withValues(alpha: 0.15),
+            ),
+          ),
+          child: Row(
+            children: [
+              ClipRRect(
+                borderRadius: BorderRadius.circular(8),
+                child: _art(currentSong.artwork, width: 44, height: 44),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      currentSong.title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w700,
+                        color: _textColor,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      currentSong.artist,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: _subtextColor,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 8),
+              Icon(
+                PhosphorIconsRegular.waveform,
+                size: 20,
+                color: _isLight ? const Color(0xff0f172a) : Colors.white,
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildQueueList(Song currentSong, List<Song> queue) {
+    if (queue.isEmpty) {
+      return ListView(
+        padding: EdgeInsets.fromLTRB(
+          16,
+          10,
+          16,
+          math.max(MediaQuery.paddingOf(context).bottom, 16.0) + 12.0,
+        ),
+        children: [
+          _buildQueueNowPlayingCard(currentSong),
+          const SizedBox(height: 16),
+          Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: Text(
+              'UP NEXT',
+              style: TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w800,
+                letterSpacing: 1.0,
+                color: _subtextColor,
+              ),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 36),
+            child: Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    PhosphorIconsRegular.musicNotes,
+                    size: 36,
+                    color: _subtextColor.withValues(alpha: 0.6),
+                  ),
+                  const SizedBox(height: 10),
+                  Text(
+                    'No more tracks in queue',
+                    style: TextStyle(
+                      fontSize: 15,
+                      fontWeight: FontWeight.w600,
+                      color: _textColor,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Suggestions will be added automatically as playback continues.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontSize: 12.5,
+                      color: _subtextColor,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      );
+    }
+
+    return ReorderableListView.builder(
+      padding: EdgeInsets.fromLTRB(
+        16,
+        10,
+        16,
+        math.max(MediaQuery.paddingOf(context).bottom, 16.0) + 16.0,
+      ),
+      header: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _buildQueueNowPlayingCard(currentSong),
+          const SizedBox(height: 16),
+          Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(
+                  'UP NEXT',
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: 1.0,
+                    color: _subtextColor,
+                  ),
+                ),
+                Text(
+                  'Hold or drag to reorder',
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    color: _subtextColor.withValues(alpha: 0.7),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+      itemCount: queue.length,
+      buildDefaultDragHandles: false,
+      proxyDecorator: (child, index, animation) {
+        return AnimatedBuilder(
+          animation: animation,
+          builder: (context, _) {
+            final t = Curves.easeInOut.transform(animation.value);
+            return Material(
+              elevation: 10.0 * t,
+              color: _isLight
+                  ? Colors.white
+                  : const Color(0xff22222a),
+              shadowColor: Colors.black.withValues(alpha: 0.5 * t),
+              borderRadius: BorderRadius.circular(12),
+              child: child,
+            );
+          },
+        );
+      },
+      itemBuilder: (context, i) {
+        final song = queue[i];
+        return ReorderableDelayedDragStartListener(
+          key: ValueKey('queue_song_${song.id}_${identityHashCode(song)}'),
+          index: i,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _buildQueueItem(song, i),
+              if (i < queue.length - 1)
+                Divider(
+                  color: _borderColor,
+                  height: 1,
+                  indent: 56,
+                ),
+            ],
+          ),
+        );
+      },
+      onReorderItem: _reorderQueueItem,
+    );
+  }
+
+  Widget _buildQueueItem(Song song, int index) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(10),
+      onTap: () => _playFromQueue(index),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
+        child: Row(
+          children: [
+            SizedBox(
+              width: 22,
+              child: Text(
+                '${index + 1}',
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                  color: _subtextColor,
+                ),
+              ),
+            ),
+            const SizedBox(width: 6),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(8),
+              child: _art(song.artwork, width: 44, height: 44),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    song.title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 13.5,
+                      fontWeight: FontWeight.w600,
+                      color: _textColor,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    song.artist,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: _subtextColor,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            if (song.duration > 0)
+              Padding(
+                padding: const EdgeInsets.only(left: 8),
+                child: Text(
+                  _time(Duration(seconds: song.duration)),
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: _subtextColor,
+                  ),
+                ),
+              ),
+            const SizedBox(width: 6),
+            ReorderableDragStartListener(
+              index: index,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                child: Icon(
+                  PhosphorIconsRegular.dotsSixVertical,
+                  size: 20,
+                  color: _subtextColor.withValues(alpha: 0.75),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 
   /* -------------------------- LIKED SONGS & SETTINGS ----------------------- */
 
@@ -3153,6 +6111,47 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
         setState(() => _history = loaded);
       }
     } catch (_) {}
+  }
+
+  Future<void> _loadEqualizer() async {
+    final en = await UserStorage.getEqualizerEnabled();
+    final p = await UserStorage.getEqualizerPreset();
+    final b = await UserStorage.getEqualizerBands();
+    final bb = await UserStorage.getEqualizerBassBoost();
+    if (mounted) {
+      setState(() {
+        _eqEnabled = en;
+        _eqPreset = p;
+        _eqBands = b;
+        _eqBassBoost = bb;
+      });
+    }
+    await _audio.setEqualizerEnabled(en);
+    await _audio.setAllEqualizerBands(b);
+    await _audio.setBassBoost(bb);
+  }
+
+  void _openEqualizerSheet() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
+      builder: (ctx) => _EqualizerBottomSheet(
+        audio: _audio,
+        initialEnabled: _eqEnabled,
+        initialPreset: _eqPreset,
+        initialBands: List<double>.from(_eqBands),
+        initialBassBoost: _eqBassBoost,
+        onChanged: (enabled, preset, bands, bassBoost) {
+          setState(() {
+            _eqEnabled = enabled;
+            _eqPreset = preset;
+            _eqBands = List<double>.from(bands);
+            _eqBassBoost = bassBoost;
+          });
+        },
+      ),
+    );
   }
 
   void _onSongMeaningfullyPlayed(Song song) {
@@ -3196,8 +6195,8 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
     await UserStorage.saveLikedSongsRaw(rawList);
   }
 
-  void _openUserMenu() {
-    showModalBottomSheet(
+  Future<void> _openUserMenu() async {
+    final choice = await showModalBottomSheet<String>(
       context: context,
       backgroundColor: Colors.transparent,
       isScrollControlled: true,
@@ -3210,10 +6209,10 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
             20,
             16 + MediaQuery.paddingOf(ctx).bottom,
           ),
-          decoration: const BoxDecoration(
-            color: Color(0xff16161b),
-            borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-            border: Border(top: BorderSide(color: Colors.white12)),
+          decoration: BoxDecoration(
+            color: _sheetBg,
+            borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+            border: Border(top: BorderSide(color: _borderColor)),
           ),
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -3222,7 +6221,7 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                 width: 40,
                 height: 4,
                 decoration: BoxDecoration(
-                  color: Colors.white24,
+                  color: _isLight ? const Color(0x20000000) : Colors.white24,
                   borderRadius: BorderRadius.circular(2),
                 ),
               ),
@@ -3256,30 +6255,25 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                     size: 22,
                   ),
                 ),
-                title: const Text(
+                title: Text(
                   'Liked Songs',
                   style: TextStyle(
                     fontSize: 16,
                     fontWeight: FontWeight.w700,
-                    color: Colors.white,
+                    color: _textColor,
                   ),
                 ),
                 subtitle: Text(
                   '${_likedSongs.length} ${_likedSongs.length == 1 ? 'track' : 'tracks'}',
-                  style: const TextStyle(fontSize: 12, color: _muted),
+                  style: TextStyle(fontSize: 12, color: _subtextColor),
                 ),
-                trailing: const Icon(
+                trailing: Icon(
                   PhosphorIconsRegular.caretRight,
-                  color: _muted,
+                  color: _subtextColor,
                   size: 20,
                 ),
                 onTap: () {
-                  Navigator.of(ctx).pop();
-                  setState(() {
-                    _viewingLikedSongs = true;
-                    _openedPlaylist = null;
-                    _homeMode = false;
-                  });
+                  Navigator.of(ctx).pop('liked');
                 },
               ),
               ListTile(
@@ -3291,36 +6285,79 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                   width: 44,
                   height: 44,
                   decoration: BoxDecoration(
-                    color: Colors.white.withValues(alpha: .08),
+                    color: _isLight
+                        ? const Color(0xfff1f5f9)
+                        : Colors.white.withValues(alpha: .08),
                     borderRadius: BorderRadius.circular(12),
-                    border: Border.all(color: Colors.white12),
+                    border: Border.all(color: _borderColor),
                   ),
-                  child: const Icon(
-                    PhosphorIconsRegular.gearSix,
-                    color: Colors.white,
+                  child: Icon(
+                    PhosphorIconsRegular.slidersHorizontal,
+                    color: _eqEnabled ? const Color(0xff3B82F6) : _textColor,
                     size: 22,
                   ),
                 ),
-                title: const Text(
+                title: Text(
+                  'Equalizer',
+                  style: TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.w700,
+                    color: _textColor,
+                  ),
+                ),
+                subtitle: Text(
+                  _eqEnabled ? 'Active · $_eqPreset' : 'Off (Original Audio)',
+                  style: TextStyle(fontSize: 12, color: _subtextColor),
+                ),
+                trailing: Icon(
+                  PhosphorIconsRegular.caretRight,
+                  color: _subtextColor,
+                  size: 20,
+                ),
+                onTap: () {
+                  Navigator.of(ctx).pop('equalizer');
+                },
+              ),
+              ListTile(
+                contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 4,
+                  vertical: 4,
+                ),
+                leading: Container(
+                  width: 44,
+                  height: 44,
+                  decoration: BoxDecoration(
+                    color: _isLight
+                        ? const Color(0xfff1f5f9)
+                        : Colors.white.withValues(alpha: .08),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: _borderColor),
+                  ),
+                  child: Icon(
+                    PhosphorIconsRegular.gearSix,
+                    color: _textColor,
+                    size: 22,
+                  ),
+                ),
+                title: Text(
                   'Settings',
                   style: TextStyle(
                     fontSize: 16,
                     fontWeight: FontWeight.w700,
-                    color: Colors.white,
+                    color: _textColor,
                   ),
                 ),
-                subtitle: const Text(
-                  'Audio quality & profile preferences',
-                  style: TextStyle(fontSize: 12, color: _muted),
+                subtitle: Text(
+                  'Audio quality, theme & profile preferences',
+                  style: TextStyle(fontSize: 12, color: _subtextColor),
                 ),
-                trailing: const Icon(
+                trailing: Icon(
                   PhosphorIconsRegular.caretRight,
-                  color: _muted,
+                  color: _subtextColor,
                   size: 20,
                 ),
                 onTap: () {
-                  Navigator.of(ctx).pop();
-                  _openSettings();
+                  Navigator.of(ctx).pop('settings');
                 },
               ),
             ],
@@ -3328,6 +6365,19 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
         ),
       ),
     );
+
+    if (!mounted) return;
+    if (choice == 'settings') {
+      _openSettings();
+    } else if (choice == 'equalizer') {
+      _openEqualizerSheet();
+    } else if (choice == 'liked') {
+      setState(() {
+        _viewingLikedSongs = true;
+        _openedPlaylist = null;
+        _homeMode = false;
+      });
+    }
   }
 
   Duration? get _sleepTimerRemaining {
@@ -3392,692 +6442,62 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
   }
 
   void _openSettings() {
-    final nameCtrl = TextEditingController(text: _userProfile?.name ?? '');
-    final ageCtrl = TextEditingController(
-      text: _userProfile?.age != null ? '${_userProfile!.age}' : '',
-    );
-    final hoursCtrl = TextEditingController(text: '0');
-    final minutesCtrl = TextEditingController(text: '30');
-    String selectedQuality = _songQuality;
-    Timer? liveTicker;
-
-    final qualityOptions = [
-      {
-        'value': '320kbps',
-        'label': 'Very High (320 kbps)',
-        'desc': 'Best sound quality, higher data usage',
-      },
-      {
-        'value': '160kbps',
-        'label': 'High (160 kbps)',
-        'desc': 'Great sound, balanced data usage',
-      },
-      {
-        'value': '96kbps',
-        'label': 'Medium (96 kbps)',
-        'desc': 'Good quality, data saver',
-      },
-      {
-        'value': '48kbps',
-        'label': 'Low (48 kbps)',
-        'desc': 'Minimal data, best for slow networks',
-      },
-    ];
-
     showModalBottomSheet(
       context: context,
       backgroundColor: Colors.transparent,
       isScrollControlled: true,
-      builder: (ctx) => StatefulBuilder(
-        builder: (_, setModalState) {
-          liveTicker ??= Timer.periodic(const Duration(seconds: 1), (_) {
-            if (_sleepTimerEndTime != null && ctx.mounted) {
-              setModalState(() {});
-            }
-          });
-          return SafeArea(
-            top: false,
-            child: Padding(
-              padding: EdgeInsets.only(
-                bottom: MediaQuery.of(ctx).viewInsets.bottom,
-              ),
-              child: Container(
-                constraints: BoxConstraints(
-                  maxHeight: MediaQuery.of(ctx).size.height * 0.85,
-                ),
-                padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
-                decoration: const BoxDecoration(
-                  color: Color(0xff16161b),
-                  borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-                  border: Border(top: BorderSide(color: Colors.white12)),
-                ),
-                child: SingleChildScrollView(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Center(
-                        child: Container(
-                          width: 40,
-                          height: 4,
-                          decoration: BoxDecoration(
-                            color: Colors.white24,
-                            borderRadius: BorderRadius.circular(2),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 18),
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          const Text(
-                            'Settings',
-                            style: TextStyle(
-                              fontSize: 20,
-                              fontWeight: FontWeight.w800,
-                              color: Colors.white,
-                            ),
-                          ),
-                          IconButton(
-                            icon: const Icon(
-                              PhosphorIconsRegular.x,
-                              size: 20,
-                              color: _muted,
-                            ),
-                            onPressed: () => Navigator.of(ctx).pop(),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 16),
-                      const Text(
-                        'Song Audio Quality',
-                        style: TextStyle(
-                          fontSize: 13,
-                          fontWeight: FontWeight.w700,
-                          color: _muted,
-                          letterSpacing: 0.5,
-                        ),
-                      ),
-                      const SizedBox(height: 10),
-                      ...qualityOptions.map((opt) {
-                        final isSelected = selectedQuality == opt['value'];
-                        return Container(
-                          margin: const EdgeInsets.only(bottom: 8),
-                          decoration: BoxDecoration(
-                            color: isSelected
-                                ? Colors.white.withValues(alpha: .1)
-                                : Colors.white.withValues(alpha: .04),
-                            borderRadius: BorderRadius.circular(12),
-                            border: Border.all(
-                              color: isSelected
-                                  ? Colors.white70
-                                  : Colors.white10,
-                              width: isSelected ? 1.2 : 1,
-                            ),
-                          ),
-                          child: InkWell(
-                            borderRadius: BorderRadius.circular(12),
-                            onTap: () async {
-                              setModalState(
-                                () => selectedQuality = opt['value']!,
-                              );
-                              setState(() => _songQuality = opt['value']!);
-                              await UserStorage.saveSongQuality(opt['value']!);
-                            },
-                            child: Padding(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 14,
-                                vertical: 12,
-                              ),
-                              child: Row(
-                                children: [
-                                  Icon(
-                                    isSelected
-                                        ? PhosphorIconsFill.checkCircle
-                                        : PhosphorIconsRegular.circle,
-                                    color: isSelected ? Colors.white : _muted,
-                                    size: 20,
-                                  ),
-                                  const SizedBox(width: 12),
-                                  Expanded(
-                                    child: Column(
-                                      crossAxisAlignment:
-                                          CrossAxisAlignment.start,
-                                      children: [
-                                        Text(
-                                          opt['label']!,
-                                          style: TextStyle(
-                                            fontSize: 14,
-                                            fontWeight: isSelected
-                                                ? FontWeight.w700
-                                                : FontWeight.w500,
-                                            color: Colors.white,
-                                          ),
-                                        ),
-                                        const SizedBox(height: 2),
-                                        Text(
-                                          opt['desc']!,
-                                          style: const TextStyle(
-                                            fontSize: 11,
-                                            color: _muted,
-                                          ),
-                                        ),
-                                      ],
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
-                        );
-                      }),
-                      const SizedBox(height: 20),
-                      const Divider(color: Colors.white12, height: 1),
-                      const SizedBox(height: 18),
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          const Row(
-                            children: [
-                              Icon(
-                                PhosphorIconsRegular.moonStars,
-                                color: Colors.white,
-                                size: 18,
-                              ),
-                              SizedBox(width: 8),
-                              Text(
-                                'Sleep Timer',
-                                style: TextStyle(
-                                  fontSize: 13,
-                                  fontWeight: FontWeight.w700,
-                                  color: _muted,
-                                  letterSpacing: 0.5,
-                                ),
-                              ),
-                            ],
-                          ),
-                          if (_sleepTimerEndTime != null)
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 9,
-                                vertical: 4,
-                              ),
-                              decoration: BoxDecoration(
-                                color: Colors.indigoAccent.withValues(
-                                  alpha: .2,
-                                ),
-                                borderRadius: BorderRadius.circular(10),
-                                border: Border.all(
-                                  color: Colors.indigoAccent.withValues(
-                                    alpha: .4,
-                                  ),
-                                ),
-                              ),
-                              child: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Container(
-                                    width: 6,
-                                    height: 6,
-                                    decoration: const BoxDecoration(
-                                      color: Colors.indigoAccent,
-                                      shape: BoxShape.circle,
-                                    ),
-                                  ),
-                                  const SizedBox(width: 6),
-                                  Text(
-                                    () {
-                                      final rem =
-                                          _sleepTimerRemaining ?? Duration.zero;
-                                      final h = rem.inHours;
-                                      final m = rem.inMinutes % 60;
-                                      final s = rem.inSeconds % 60;
-                                      if (h > 0) {
-                                        return '${h}h ${m}m ${s}s left';
-                                      }
-                                      return '${m}m ${s}s left';
-                                    }(),
-                                    style: const TextStyle(
-                                      fontSize: 11,
-                                      fontWeight: FontWeight.w700,
-                                      color: Colors.white,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                        ],
-                      ),
-                      const SizedBox(height: 12),
-                      if (_sleepTimerEndTime != null) ...[
-                        Container(
-                          padding: const EdgeInsets.all(14),
-                          decoration: BoxDecoration(
-                            color: Colors.white.withValues(alpha: .04),
-                            borderRadius: BorderRadius.circular(14),
-                            border: Border.all(color: Colors.white12),
-                          ),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Row(
-                                children: [
-                                  Container(
-                                    padding: const EdgeInsets.all(8),
-                                    decoration: BoxDecoration(
-                                      color: Colors.indigoAccent.withValues(
-                                        alpha: .2,
-                                      ),
-                                      borderRadius: BorderRadius.circular(8),
-                                    ),
-                                    child: const Icon(
-                                      PhosphorIconsRegular.clockCountdown,
-                                      color: Colors.indigoAccent,
-                                      size: 20,
-                                    ),
-                                  ),
-                                  const SizedBox(width: 12),
-                                  const Expanded(
-                                    child: Column(
-                                      crossAxisAlignment:
-                                          CrossAxisAlignment.start,
-                                      children: [
-                                        Text(
-                                          'Sleep Timer is Active',
-                                          style: TextStyle(
-                                            fontSize: 14,
-                                            fontWeight: FontWeight.w700,
-                                            color: Colors.white,
-                                          ),
-                                        ),
-                                        SizedBox(height: 2),
-                                        Text(
-                                          'Playback will stop automatically',
-                                          style: TextStyle(
-                                            fontSize: 12,
-                                            color: _muted,
-                                          ),
-                                        ),
-                                      ],
-                                    ),
-                                  ),
-                                ],
-                              ),
-                              const SizedBox(height: 12),
-                              SizedBox(
-                                width: double.infinity,
-                                height: 40,
-                                child: OutlinedButton.icon(
-                                  onPressed: () {
-                                    _cancelSleepTimer();
-                                    setModalState(() {});
-                                    ScaffoldMessenger.of(context).showSnackBar(
-                                      SnackBar(
-                                        content: const Text(
-                                          'Sleep timer turned off',
-                                        ),
-                                        behavior: SnackBarBehavior.floating,
-                                        shape: RoundedRectangleBorder(
-                                          borderRadius: BorderRadius.circular(
-                                            10,
-                                          ),
-                                        ),
-                                        duration: const Duration(seconds: 2),
-                                      ),
-                                    );
-                                  },
-                                  icon: const Icon(
-                                    PhosphorIconsRegular.xCircle,
-                                    size: 18,
-                                    color: Colors.redAccent,
-                                  ),
-                                  label: const Text(
-                                    'Turn Off Sleep Timer',
-                                    style: TextStyle(
-                                      color: Colors.redAccent,
-                                      fontWeight: FontWeight.w700,
-                                      fontSize: 13,
-                                    ),
-                                  ),
-                                  style: OutlinedButton.styleFrom(
-                                    side: BorderSide(
-                                      color: Colors.redAccent.withValues(
-                                        alpha: .5,
-                                      ),
-                                    ),
-                                    shape: RoundedRectangleBorder(
-                                      borderRadius: BorderRadius.circular(10),
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ] else ...[
-                        Row(
-                          children: [
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  const Text(
-                                    'Hours',
-                                    style: TextStyle(
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.w600,
-                                      color: _muted,
-                                    ),
-                                  ),
-                                  const SizedBox(height: 6),
-                                  TextField(
-                                    controller: hoursCtrl,
-                                    keyboardType: TextInputType.number,
-                                    style: const TextStyle(
-                                      color: Colors.white,
-                                      fontSize: 16,
-                                      fontWeight: FontWeight.w700,
-                                    ),
-                                    textAlign: TextAlign.center,
-                                    decoration: InputDecoration(
-                                      hintText: '0',
-                                      hintStyle: const TextStyle(color: _muted),
-                                      filled: true,
-                                      fillColor: Colors.white.withValues(
-                                        alpha: .06,
-                                      ),
-                                      contentPadding:
-                                          const EdgeInsets.symmetric(
-                                            vertical: 12,
-                                          ),
-                                      border: OutlineInputBorder(
-                                        borderRadius: BorderRadius.circular(12),
-                                        borderSide: BorderSide.none,
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                            const SizedBox(width: 14),
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  const Text(
-                                    'Minutes',
-                                    style: TextStyle(
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.w600,
-                                      color: _muted,
-                                    ),
-                                  ),
-                                  const SizedBox(height: 6),
-                                  TextField(
-                                    controller: minutesCtrl,
-                                    keyboardType: TextInputType.number,
-                                    style: const TextStyle(
-                                      color: Colors.white,
-                                      fontSize: 16,
-                                      fontWeight: FontWeight.w700,
-                                    ),
-                                    textAlign: TextAlign.center,
-                                    decoration: InputDecoration(
-                                      hintText: '30',
-                                      hintStyle: const TextStyle(color: _muted),
-                                      filled: true,
-                                      fillColor: Colors.white.withValues(
-                                        alpha: .06,
-                                      ),
-                                      contentPadding:
-                                          const EdgeInsets.symmetric(
-                                            vertical: 12,
-                                          ),
-                                      border: OutlineInputBorder(
-                                        borderRadius: BorderRadius.circular(12),
-                                        borderSide: BorderSide.none,
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ],
-                        ),
-                        const SizedBox(height: 10),
-                        Wrap(
-                          spacing: 8,
-                          runSpacing: 8,
-                          children: [
-                            for (final preset in [
-                              {'label': '15 min', 'h': '0', 'm': '15'},
-                              {'label': '30 min', 'h': '0', 'm': '30'},
-                              {'label': '45 min', 'h': '0', 'm': '45'},
-                              {'label': '1 hr', 'h': '1', 'm': '0'},
-                              {'label': '2 hrs', 'h': '2', 'm': '0'},
-                            ])
-                              GestureDetector(
-                                onTap: () {
-                                  setModalState(() {
-                                    hoursCtrl.text = preset['h']!;
-                                    minutesCtrl.text = preset['m']!;
-                                  });
-                                },
-                                child: Container(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 11,
-                                    vertical: 5,
-                                  ),
-                                  decoration: BoxDecoration(
-                                    color: Colors.white.withValues(alpha: .07),
-                                    borderRadius: BorderRadius.circular(20),
-                                    border: Border.all(color: Colors.white12),
-                                  ),
-                                  child: Text(
-                                    preset['label']!,
-                                    style: const TextStyle(
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.w600,
-                                      color: Colors.white,
-                                    ),
-                                  ),
-                                ),
-                              ),
-                          ],
-                        ),
-                        const SizedBox(height: 14),
-                        SizedBox(
-                          width: double.infinity,
-                          height: 42,
-                          child: ElevatedButton.icon(
-                            onPressed: () {
-                              final h =
-                                  int.tryParse(hoursCtrl.text.trim()) ?? 0;
-                              final m =
-                                  int.tryParse(minutesCtrl.text.trim()) ?? 0;
-                              final totalSeconds = (h * 3600) + (m * 60);
-                              if (totalSeconds <= 0) {
-                                ScaffoldMessenger.of(context).showSnackBar(
-                                  SnackBar(
-                                    content: const Text(
-                                      'Please enter a duration greater than 0 minutes',
-                                    ),
-                                    behavior: SnackBarBehavior.floating,
-                                    shape: RoundedRectangleBorder(
-                                      borderRadius: BorderRadius.circular(10),
-                                    ),
-                                    duration: const Duration(seconds: 2),
-                                  ),
-                                );
-                                return;
-                              }
-                              _setSleepTimer(Duration(seconds: totalSeconds));
-                              setModalState(() {});
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(
-                                  content: Text(
-                                    h > 0
-                                        ? 'Sleep timer set for $h hour${h > 1 ? 's' : ''} $m minute${m != 1 ? 's' : ''}'
-                                        : 'Sleep timer set for $m minute${m != 1 ? 's' : ''}',
-                                  ),
-                                  behavior: SnackBarBehavior.floating,
-                                  shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(10),
-                                  ),
-                                  duration: const Duration(seconds: 2),
-                                ),
-                              );
-                            },
-                            icon: const Icon(
-                              PhosphorIconsRegular.timer,
-                              size: 18,
-                            ),
-                            label: const Text(
-                              'Start Sleep Timer',
-                              style: TextStyle(
-                                fontWeight: FontWeight.w700,
-                                fontSize: 14,
-                              ),
-                            ),
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: Colors.white.withValues(
-                                alpha: .15,
-                              ),
-                              foregroundColor: Colors.white,
-                              shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(12),
-                              ),
-                              elevation: 0,
-                            ),
-                          ),
-                        ),
-                      ],
-                      const SizedBox(height: 20),
-                      const Divider(color: Colors.white12, height: 1),
-                      const SizedBox(height: 18),
-                      const Text(
-                        'Edit Profile',
-                        style: TextStyle(
-                          fontSize: 13,
-                          fontWeight: FontWeight.w700,
-                          color: _muted,
-                          letterSpacing: 0.5,
-                        ),
-                      ),
-                      const SizedBox(height: 12),
-                      TextField(
-                        controller: nameCtrl,
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 15,
-                        ),
-                        decoration: InputDecoration(
-                          labelText: 'Your Name',
-                          labelStyle: const TextStyle(color: _muted),
-                          prefixIcon: const Icon(
-                            PhosphorIconsRegular.user,
-                            color: _muted,
-                            size: 20,
-                          ),
-                          filled: true,
-                          fillColor: Colors.white.withValues(alpha: .06),
-                          border: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(14),
-                            borderSide: BorderSide.none,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 14),
-                      TextField(
-                        controller: ageCtrl,
-                        keyboardType: TextInputType.number,
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 15,
-                        ),
-                        decoration: InputDecoration(
-                          labelText: 'Your Age',
-                          labelStyle: const TextStyle(color: _muted),
-                          prefixIcon: const Icon(
-                            PhosphorIconsRegular.calendar,
-                            color: _muted,
-                            size: 20,
-                          ),
-                          filled: true,
-                          fillColor: Colors.white.withValues(alpha: .06),
-                          border: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(14),
-                            borderSide: BorderSide.none,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 22),
-                      SizedBox(
-                        width: double.infinity,
-                        height: 48,
-                        child: ElevatedButton(
-                          onPressed: () async {
-                            final name = nameCtrl.text.trim();
-                            final age = int.tryParse(ageCtrl.text.trim());
-                            if (name.isNotEmpty && age != null && age > 0) {
-                              final updated = UserProfile(name: name, age: age);
-                              await UserStorage.saveProfile(
-                                name: name,
-                                age: age,
-                              );
-                              if (mounted) {
-                                setState(() => _userProfile = updated);
-                              }
-                              if (ctx.mounted) {
-                                Navigator.of(ctx).pop();
-                              }
-                              if (mounted) {
-                                ScaffoldMessenger.of(context).showSnackBar(
-                                  SnackBar(
-                                    content: const Text(
-                                      'Profile updated successfully',
-                                    ),
-                                    behavior: SnackBarBehavior.floating,
-                                    shape: RoundedRectangleBorder(
-                                      borderRadius: BorderRadius.circular(10),
-                                    ),
-                                    duration: const Duration(seconds: 2),
-                                  ),
-                                );
-                              }
-                            }
-                          },
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: Colors.white,
-                            foregroundColor: Colors.black,
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(14),
-                            ),
-                            elevation: 0,
-                          ),
-                          child: const Text(
-                            'Save Changes',
-                            style: TextStyle(
-                              fontSize: 15,
-                              fontWeight: FontWeight.w700,
-                            ),
-                          ),
-                        ),
-                      ),
-                      SizedBox(
-                        height:
-                            math.max(MediaQuery.paddingOf(ctx).bottom, 24.0) +
-                            16.0,
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
+      builder: (ctx) => _SettingsBottomSheet(
+        userProfile: _userProfile,
+        currentQuality: _songQuality,
+        currentTheme: _themeMode,
+        currentLanguage: _musicLanguage,
+        sleepTimerEndTime: _sleepTimerEndTime,
+        getSleepTimerRemaining: () => _sleepTimerRemaining,
+        onSaveProfile: (name, age) async {
+          final updated = UserProfile(
+            name: name,
+            age: age,
+            language: _musicLanguage,
           );
+          await UserStorage.saveProfile(
+            name: name,
+            age: age,
+            language: _musicLanguage,
+          );
+          if (mounted) {
+            setState(() => _userProfile = updated);
+          }
+        },
+        onSetSleepTimer: (duration) {
+          _setSleepTimer(duration);
+        },
+        onCancelSleepTimer: () {
+          _cancelSleepTimer();
+        },
+        onThemeChanged: (theme) async {
+          if (mounted) {
+            setState(() => _themeMode = theme);
+          }
+          widget.onAppThemeChanged?.call(theme);
+          await UserStorage.saveThemeMode(theme);
+        },
+        onQualityChanged: (quality) async {
+          if (mounted) {
+            setState(() => _songQuality = quality);
+          }
+          await UserStorage.saveSongQuality(quality);
+        },
+        onLanguageChanged: (lang) async {
+          if (mounted) {
+            setState(() => _musicLanguage = lang);
+          }
+          await UserStorage.saveLanguage(lang);
+          if (_userProfile != null) {
+            _userProfile = _userProfile!.copyWith(language: lang);
+          }
         },
       ),
-    ).whenComplete(() => liveTicker?.cancel());
+    );
   }
 
   void _showSongOptions(Song song, [List<Song>? contextQueue]) {
@@ -4088,10 +6508,10 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
       isScrollControlled: true,
       builder: (ctx) => Container(
         padding: const EdgeInsets.fromLTRB(20, 16, 20, 32),
-        decoration: const BoxDecoration(
-          color: Color(0xff16161b),
-          borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-          border: Border(top: BorderSide(color: Colors.white12)),
+        decoration: BoxDecoration(
+          color: _sheetBg,
+          borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+          border: Border(top: BorderSide(color: _borderColor)),
         ),
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -4100,7 +6520,7 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
               width: 40,
               height: 4,
               decoration: BoxDecoration(
-                color: Colors.white24,
+                color: _isLight ? const Color(0x20000000) : Colors.white24,
                 borderRadius: BorderRadius.circular(2),
               ),
             ),
@@ -4120,10 +6540,10 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                         song.title,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
+                        style: TextStyle(
                           fontSize: 16,
                           fontWeight: FontWeight.w700,
-                          color: Colors.white,
+                          color: _textColor,
                         ),
                       ),
                       const SizedBox(height: 4),
@@ -4131,7 +6551,7 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                         song.artist,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(fontSize: 13, color: _muted),
+                        style: TextStyle(fontSize: 13, color: _subtextColor),
                       ),
                     ],
                   ),
@@ -4139,13 +6559,13 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
               ],
             ),
             const SizedBox(height: 20),
-            const Divider(color: Colors.white12, height: 1),
+            Divider(color: _dividerColor, height: 1),
             const SizedBox(height: 10),
             ListTile(
               contentPadding: const EdgeInsets.symmetric(horizontal: 4),
               leading: Icon(
                 isLiked ? PhosphorIconsFill.heart : PhosphorIconsRegular.heart,
-                color: isLiked ? Colors.redAccent : Colors.white,
+                color: isLiked ? Colors.redAccent : _textColor,
                 size: 24,
               ),
               title: Text(
@@ -4153,7 +6573,7 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                 style: TextStyle(
                   fontSize: 15,
                   fontWeight: FontWeight.w600,
-                  color: isLiked ? Colors.redAccent : Colors.white,
+                  color: isLiked ? Colors.redAccent : _textColor,
                 ),
               ),
               onTap: () {
@@ -4163,17 +6583,17 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
             ),
             ListTile(
               contentPadding: const EdgeInsets.symmetric(horizontal: 4),
-              leading: const Icon(
+              leading: Icon(
                 PhosphorIconsBold.play,
-                color: Colors.white,
+                color: _textColor,
                 size: 24,
               ),
-              title: const Text(
+              title: Text(
                 'Play Song',
                 style: TextStyle(
                   fontSize: 15,
                   fontWeight: FontWeight.w600,
-                  color: Colors.white,
+                  color: _textColor,
                 ),
               ),
               onTap: () {
@@ -4183,26 +6603,55 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
             ),
             ListTile(
               contentPadding: const EdgeInsets.symmetric(horizontal: 4),
-              leading: const Icon(
+              leading: Icon(
                 PhosphorIconsBold.downloadSimple,
-                color: Colors.white,
+                color: _textColor,
                 size: 24,
               ),
-              title: const Text(
+              title: Text(
                 'Download',
                 style: TextStyle(
                   fontSize: 15,
                   fontWeight: FontWeight.w600,
-                  color: Colors.white,
+                  color: _textColor,
                 ),
               ),
               subtitle: Text(
                 'Get audio in $_songQuality',
-                style: const TextStyle(fontSize: 12, color: _muted),
+                style: TextStyle(fontSize: 12, color: _subtextColor),
               ),
               onTap: () {
                 Navigator.of(ctx).pop();
                 _download(song);
+              },
+            ),
+            ListTile(
+              contentPadding: const EdgeInsets.symmetric(horizontal: 4),
+              leading: Icon(
+                PhosphorIconsRegular.slidersHorizontal,
+                color: _textColor,
+                size: 24,
+              ),
+              title: Text(
+                'Equalizer',
+                style: TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w600,
+                  color: _textColor,
+                ),
+              ),
+              subtitle: Text(
+                _eqEnabled ? 'Active · $_eqPreset' : 'Off (Original Audio)',
+                style: TextStyle(fontSize: 12, color: _subtextColor),
+              ),
+              trailing: Icon(
+                PhosphorIconsRegular.caretRight,
+                size: 18,
+                color: _subtextColor,
+              ),
+              onTap: () {
+                Navigator.of(ctx).pop();
+                _openEqualizerSheet();
               },
             ),
           ],
@@ -4215,23 +6664,27 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
 
   Widget _likedSongsHeader() => Container(
     padding: const EdgeInsets.fromLTRB(10, 10, 16, 10),
-    decoration: const BoxDecoration(
-      color: Color(0xee080808),
-      border: Border(bottom: BorderSide(color: Color(0x18ffffff))),
+    decoration: BoxDecoration(
+      color: _headerBg,
+      border: Border(bottom: BorderSide(color: _borderColor)),
     ),
     child: Row(
       children: [
         IconButton(
-          icon: const Icon(PhosphorIconsRegular.arrowLeft, size: 22),
+          icon: Icon(PhosphorIconsRegular.arrowLeft, size: 22, color: _textColor),
           onPressed: () => setState(() => _viewingLikedSongs = false),
         ),
         const SizedBox(width: 4),
-        const Expanded(
+        Expanded(
           child: Text(
             'Liked Songs',
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
-            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+            style: TextStyle(
+              fontSize: 16,
+              fontWeight: FontWeight.w700,
+              color: _textColor,
+            ),
           ),
         ),
       ],
@@ -4277,24 +6730,28 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text(
+                  Text(
                     'Liked Songs',
-                    style: TextStyle(fontSize: 22, fontWeight: FontWeight.w800),
+                    style: TextStyle(
+                      fontSize: 22,
+                      fontWeight: FontWeight.w800,
+                      color: _textColor,
+                    ),
                   ),
                   const SizedBox(height: 6),
                   Text(
                     _userProfile != null && _userProfile!.name.isNotEmpty
                         ? 'Curated by ${_userProfile!.name}'
                         : 'Your personal collection',
-                    style: const TextStyle(color: _muted, fontSize: 13),
+                    style: TextStyle(color: _subtextColor, fontSize: 13),
                   ),
                   const SizedBox(height: 8),
                   Text(
                     '${songs.length} ${songs.length == 1 ? 'song' : 'songs'}',
-                    style: const TextStyle(
+                    style: TextStyle(
                       fontSize: 12,
                       fontWeight: FontWeight.w600,
-                      color: Colors.white70,
+                      color: _subtextColor,
                     ),
                   ),
                   const SizedBox(height: 14),
@@ -4305,21 +6762,22 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                           onPressed: () {
                             _playPlaylist(songs);
                           },
-                          icon: const Icon(
+                          icon: Icon(
                             PhosphorIconsBold.play,
                             size: 16,
-                            color: Colors.black,
+                            color: _isLight ? Colors.white : Colors.black,
                           ),
-                          label: const Text(
+                          label: Text(
                             'Play All',
                             style: TextStyle(
                               fontSize: 13,
                               fontWeight: FontWeight.w700,
-                              color: Colors.black,
+                              color: _isLight ? Colors.white : Colors.black,
                             ),
                           ),
                           style: ElevatedButton.styleFrom(
-                            backgroundColor: Colors.white,
+                            backgroundColor:
+                                _isLight ? const Color(0xff0f172a) : Colors.white,
                             padding: const EdgeInsets.symmetric(
                               horizontal: 14,
                               vertical: 8,
@@ -4336,14 +6794,16 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                             final shuffled = [...songs]..shuffle();
                             _playPlaylist(shuffled);
                           },
-                          icon: const Icon(
+                          icon: Icon(
                             PhosphorIconsRegular.shuffle,
                             size: 20,
-                            color: Colors.white,
+                            color: _textColor,
                           ),
                           tooltip: 'Shuffle',
                           style: IconButton.styleFrom(
-                            backgroundColor: Colors.white.withValues(alpha: .1),
+                            backgroundColor: _isLight
+                                ? const Color(0xff0f172a).withValues(alpha: .07)
+                                : Colors.white.withValues(alpha: .1),
                             shape: const CircleBorder(),
                           ),
                         ),
@@ -4363,26 +6823,36 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                 Icon(
                   PhosphorIconsRegular.heart,
                   size: 56,
-                  color: Colors.white.withValues(alpha: .2),
+                  color: _isLight
+                      ? const Color(0x30000000)
+                      : Colors.white.withValues(alpha: .2),
                 ),
                 const SizedBox(height: 16),
-                const Text(
+                Text(
                   'No Liked Songs Yet',
-                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+                  style: TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.w700,
+                    color: _textColor,
+                  ),
                 ),
                 const SizedBox(height: 8),
-                const Text(
+                Text(
                   'Tap the heart icon on any song to save it here permanently.',
                   textAlign: TextAlign.center,
-                  style: TextStyle(color: _muted, fontSize: 13),
+                  style: TextStyle(color: _subtextColor, fontSize: 13),
                 ),
               ],
             ),
           )
         else ...[
-          const Text(
+          Text(
             'Tracks',
-            style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+            style: TextStyle(
+              fontSize: 18,
+              fontWeight: FontWeight.w700,
+              color: _textColor,
+            ),
           ),
           const SizedBox(height: 12),
           ...songs.asMap().entries.map(
@@ -4402,18 +6872,30 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
         padding: const EdgeInsets.symmetric(vertical: 7),
         child: Row(
           children: [
-            SizedBox(
+            Container(
               width: 28,
-              child: Text(
-                isCurrent && _audio.playing ? '▶' : '${index + 1}',
-                style: TextStyle(
-                  color: isCurrent ? Colors.white : _muted,
-                  fontWeight: isCurrent ? FontWeight.bold : FontWeight.normal,
-                ),
-              ),
+              alignment: Alignment.centerLeft,
+              child: isCurrent && _audio.playing
+                  ? Icon(
+                      PhosphorIconsFill.play,
+                      size: 14,
+                      color: _isLight
+                          ? const Color(0xff0f172a)
+                          : Colors.white,
+                    )
+                  : Text(
+                      '${index + 1}',
+                      style: TextStyle(
+                        color: isCurrent ? _textColor : _subtextColor,
+                        fontWeight:
+                            isCurrent ? FontWeight.bold : FontWeight.normal,
+                      ),
+                    ),
             ),
             ClipRRect(
-              borderRadius: BorderRadius.circular(6),
+              borderRadius: BorderRadius.circular(
+                AppConstants.songRowThumbnailRadius,
+              ),
               child: _art(song.artwork, width: 48, height: 48),
             ),
             const SizedBox(width: 12),
@@ -4429,8 +6911,8 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                       fontWeight: FontWeight.w700,
                       fontSize: 14,
                       color: isCurrent
-                          ? Colors.white
-                          : Colors.white.withValues(alpha: .9),
+                          ? _textColor
+                          : _textColor.withValues(alpha: .9),
                     ),
                   ),
                   const SizedBox(height: 3),
@@ -4438,8 +6920,8 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                     song.artist,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      color: _muted,
+                    style: TextStyle(
+                      color: _subtextColor,
                       fontSize: 12,
                       fontWeight: FontWeight.w500,
                     ),
@@ -4452,23 +6934,24 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                 padding: const EdgeInsets.only(right: 6),
                 child: Text(
                   _time(Duration(seconds: song.duration)),
-                  style: const TextStyle(color: _muted, fontSize: 11),
+                  style: TextStyle(color: _subtextColor, fontSize: 11),
                 ),
               ),
             IconButton(
               onPressed: () => _toggleLike(song),
               icon: Icon(
                 isLiked ? PhosphorIconsFill.heart : PhosphorIconsRegular.heart,
-                color: isLiked ? Colors.redAccent : _muted,
+                color: isLiked ? Colors.redAccent : _subtextColor,
                 size: 20,
               ),
               tooltip: isLiked ? 'Unlike' : 'Like',
             ),
             IconButton(
               onPressed: () => _showSongOptions(song, likedList),
-              icon: const Icon(
+              icon: Icon(
                 PhosphorIconsRegular.dotsThreeVertical,
                 size: 20,
+                color: _subtextColor,
               ),
               tooltip: 'More options',
             ),
@@ -4485,14 +6968,18 @@ class _LyricsAutoScrollView extends StatefulWidget {
   const _LyricsAutoScrollView({
     required this.lyrics,
     required this.parsedLyrics,
+    this.isLoading = false,
     required this.positionStream,
+    this.initialPosition,
     required this.onSeek,
     this.controller,
   });
 
   final Map<String, dynamic>? lyrics;
   final List<LyricLine> parsedLyrics;
+  final bool isLoading;
   final Stream<Duration> positionStream;
+  final Duration? initialPosition;
   final ValueChanged<double> onSeek;
   final ScrollController? controller;
 
@@ -4505,25 +6992,48 @@ class _LyricsAutoScrollViewState extends State<_LyricsAutoScrollView> {
   final Map<int, GlobalKey> _itemKeys = {};
   int _lastActiveIndex = -1;
   bool _userInteracting = false;
+  bool _hasInitialScrolled = false;
   Timer? _userResumeTimer;
 
   ScrollController get _effectiveController =>
       widget.controller ?? _internalController;
 
+  GlobalKey _getKey(int index) =>
+      _itemKeys.putIfAbsent(index, () => GlobalKey());
+
   @override
   void initState() {
     super.initState();
     _internalController = ScrollController();
+    _computeInitialActiveIndex();
+  }
+
+  void _computeInitialActiveIndex() {
+    final pos = widget.initialPosition;
+    if (pos == null || widget.parsedLyrics.isEmpty) return;
+    final time = pos.inMilliseconds;
+    var active = -1;
+    for (var i = 0; i < widget.parsedLyrics.length; i++) {
+      if (time >= widget.parsedLyrics[i].time * 1000) {
+        active = i;
+      }
+    }
+    if (active >= 0) {
+      _lastActiveIndex = active;
+    }
   }
 
   @override
   void didUpdateWidget(covariant _LyricsAutoScrollView oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (widget.parsedLyrics != oldWidget.parsedLyrics) {
-      _itemKeys.clear();
+    if (widget.parsedLyrics != oldWidget.parsedLyrics ||
+        (oldWidget.isLoading && !widget.isLoading)) {
       _lastActiveIndex = -1;
       _userInteracting = false;
+      _hasInitialScrolled = false;
       _userResumeTimer?.cancel();
+      _itemKeys.clear();
+      _computeInitialActiveIndex();
     }
   }
 
@@ -4534,67 +7044,202 @@ class _LyricsAutoScrollViewState extends State<_LyricsAutoScrollView> {
     super.dispose();
   }
 
-  GlobalKey _keyForIndex(int index) =>
-      _itemKeys.putIfAbsent(index, () => GlobalKey());
-
-  void _scrollToIndex(int index) {
+  void _scrollToIndex(
+    int index, {
+    Duration duration = const Duration(milliseconds: 350),
+    Curve curve = Curves.easeOutCubic,
+  }) {
     if (index < 0 || index >= widget.parsedLyrics.length) return;
-    final targetContext = _itemKeys[index]?.currentContext;
-    if (targetContext != null) {
+    if (!mounted || !_effectiveController.hasClients) return;
+
+    final key = _getKey(index);
+    final itemContext = key.currentContext;
+
+    if (itemContext != null && itemContext.mounted) {
       Scrollable.ensureVisible(
-        targetContext,
-        alignment: 0.35,
-        duration: const Duration(milliseconds: 380),
-        curve: Curves.easeOutCubic,
+        itemContext,
+        alignment: 0.5,
+        duration: duration,
+        curve: curve,
       );
-    } else if (_effectiveController.hasClients) {
-      final maxScroll = _effectiveController.position.maxScrollExtent;
-      final estimatedOffset = (index * 56.0).clamp(0.0, maxScroll);
-      _effectiveController
-          .animateTo(
-            estimatedOffset,
-            duration: const Duration(milliseconds: 300),
-            curve: Curves.easeOutCubic,
-          )
-          .then((_) {
-            WidgetsBinding.instance.addPostFrameCallback((_) {
-              final ctx = _itemKeys[index]?.currentContext;
-              if (ctx != null && mounted) {
-                Scrollable.ensureVisible(
-                  ctx,
-                  alignment: 0.35,
-                  duration: const Duration(milliseconds: 220),
-                  curve: Curves.easeOutCubic,
-                );
-              }
-            });
-          });
+    } else {
+      // If layout has not finished yet, retry on next frame
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _effectiveController.hasClients) {
+          final retryContext = _getKey(index).currentContext;
+          if (retryContext != null && retryContext.mounted) {
+            Scrollable.ensureVisible(
+              retryContext,
+              alignment: 0.5,
+              duration: duration,
+              curve: curve,
+            );
+          }
+        }
+      });
     }
+  }
+
+  void _triggerInitialScroll(int active) {
+    if (_hasInitialScrolled) return;
+    _hasInitialScrolled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && !_userInteracting) {
+        final targetIndex = active >= 0 ? active : _lastActiveIndex;
+        if (targetIndex >= 0) {
+          _scrollToIndex(
+            targetIndex,
+            duration: const Duration(milliseconds: 650),
+            curve: Curves.easeOutCubic,
+          );
+        }
+      }
+    });
+  }
+
+  Widget _buildLyricItem(int i, bool isCurrent, bool isLight) {
+    return InkWell(
+      key: _getKey(i),
+      borderRadius: BorderRadius.circular(12),
+      onTap: () {
+        widget.onSeek(widget.parsedLyrics[i].time);
+        _userResumeTimer?.cancel();
+        setState(() => _userInteracting = false);
+        _scrollToIndex(
+          i,
+          duration: const Duration(milliseconds: 400),
+          curve: Curves.easeOutCubic,
+        );
+      },
+      child: Padding(
+        padding: const EdgeInsets.symmetric(
+          vertical: 10,
+          horizontal: 8,
+        ),
+        child: AnimatedDefaultTextStyle(
+          duration: const Duration(milliseconds: 250),
+          curve: Curves.easeOut,
+          style: TextStyle(
+            fontSize: AppConstants.lyricsFontSize,
+            fontWeight: AppConstants.lyricsFontWeight,
+            color: isCurrent
+                ? (isLight
+                    ? const Color(0xff0f172a)
+                    : Colors.white)
+                : (isLight
+                    ? const Color(0x660f172a)
+                    : const Color(0x66ffffff)),
+            height: AppConstants.lyricsLineHeight,
+          ),
+          child: Text(widget.parsedLyrics[i].text),
+        ),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
-    if (widget.lyrics == null) {
-      return const Center(child: CircularProgressIndicator());
+    final isLight = Theme.of(context).brightness == Brightness.light;
+
+    if (widget.isLoading) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SizedBox(
+              width: 26,
+              height: 26,
+              child: CircularProgressIndicator(
+                strokeWidth: 2.4,
+                color: isLight ? const Color(0xff0f172a) : Colors.white,
+              ),
+            ),
+            const SizedBox(height: 14),
+            Text(
+              'Loading lyrics...',
+              style: TextStyle(
+                fontSize: 14,
+                color: isLight ? const Color(0xff64748b) : _muted,
+              ),
+            ),
+          ],
+        ),
+      );
     }
 
-    final plain = widget.lyrics!['plainLyrics'] as String?;
+    final plain = widget.lyrics?['plainLyrics'] as String?;
+    final hasPlain = plain != null && plain.trim().isNotEmpty;
 
     if (widget.parsedLyrics.isEmpty) {
-      return SingleChildScrollView(
-        controller: _effectiveController,
-        padding: const EdgeInsets.all(24),
-        child: Text(
-          plain ?? 'No lyrics found for this track.',
-          style: const TextStyle(fontSize: 18, height: 1.7, color: _muted),
+      if (hasPlain) {
+        return SingleChildScrollView(
+          controller: _effectiveController,
+          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 32),
+          child: Text(
+            plain.trim(),
+            style: TextStyle(
+              fontSize: AppConstants.plainLyricsFontSize,
+              fontWeight: AppConstants.plainLyricsFontWeight,
+              height: 1.7,
+              color: isLight ? const Color(0xff334155) : const Color(0xddffffff),
+            ),
+          ),
+        );
+      }
+
+      return Center(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 58,
+                height: 58,
+                decoration: BoxDecoration(
+                  color: isLight
+                      ? Colors.black.withValues(alpha: 0.05)
+                      : Colors.white.withValues(alpha: 0.07),
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(
+                  PhosphorIconsRegular.textAa,
+                  size: 28,
+                  color: isLight ? const Color(0xff64748b) : _muted,
+                ),
+              ),
+              const SizedBox(height: 16),
+              Text(
+                'No lyrics found for this track',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.w600,
+                  color: isLight ? const Color(0xff1e293b) : Colors.white,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                'Lyrics are not available for this song.',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.normal,
+                  color: isLight ? const Color(0xff64748b) : _muted,
+                ),
+              ),
+            ],
+          ),
         ),
       );
     }
 
     return StreamBuilder<Duration>(
       stream: widget.positionStream,
+      initialData: widget.initialPosition,
       builder: (context, snapshot) {
-        final time = snapshot.data?.inMilliseconds ?? 0;
+        final time =
+            (snapshot.data ?? widget.initialPosition)?.inMilliseconds ?? 0;
         var active = -1;
         for (var i = 0; i < widget.parsedLyrics.length; i++) {
           if (time >= widget.parsedLyrics[i].time * 1000) {
@@ -4604,79 +7249,67 @@ class _LyricsAutoScrollViewState extends State<_LyricsAutoScrollView> {
 
         if (active != _lastActiveIndex) {
           _lastActiveIndex = active;
-          if (!_userInteracting && active >= 0) {
+          if (!_userInteracting && active >= 0 && _hasInitialScrolled) {
             WidgetsBinding.instance.addPostFrameCallback((_) {
               if (mounted) _scrollToIndex(active);
             });
           }
         }
 
+        if (!_hasInitialScrolled && active >= 0) {
+          _triggerInitialScroll(active);
+        }
+
         return Stack(
           children: [
-            NotificationListener<ScrollNotification>(
-              onNotification: (notification) {
-                if (notification is UserScrollNotification) {
-                  if (notification.direction != ScrollDirection.idle) {
-                    _userResumeTimer?.cancel();
-                    if (!_userInteracting) {
-                      setState(() => _userInteracting = true);
-                    }
-                  } else {
-                    _userResumeTimer?.cancel();
-                    _userResumeTimer = Timer(
-                      const Duration(milliseconds: 3500),
-                      () {
-                        if (mounted) {
-                          setState(() => _userInteracting = false);
-                          if (_lastActiveIndex >= 0) {
-                            _scrollToIndex(_lastActiveIndex);
-                          }
-                        }
-                      },
-                    );
-                  }
-                }
-                return false;
-              },
-              child: ListView.builder(
-                controller: _effectiveController,
-                padding: const EdgeInsets.fromLTRB(22, 100, 22, 220),
-                itemCount: widget.parsedLyrics.length,
-                itemBuilder: (context, i) {
-                  final isCurrent = i == active;
-                  return InkWell(
-                    key: _keyForIndex(i),
-                    borderRadius: BorderRadius.circular(12),
-                    onTap: () {
-                      widget.onSeek(widget.parsedLyrics[i].time);
+            LayoutBuilder(
+              builder: (context, constraints) {
+                final halfViewport = constraints.maxHeight.isFinite
+                    ? constraints.maxHeight / 2
+                    : 300.0;
+                final verticalPadding = math.max(0.0, halfViewport - 35.0);
+
+                return NotificationListener<UserScrollNotification>(
+                  onNotification: (notification) {
+                    if (notification.direction != ScrollDirection.idle) {
                       _userResumeTimer?.cancel();
-                      setState(() => _userInteracting = false);
-                      _scrollToIndex(i);
-                    },
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(
-                        vertical: 10,
-                        horizontal: 8,
-                      ),
-                      child: AnimatedDefaultTextStyle(
-                        duration: const Duration(milliseconds: 250),
-                        curve: Curves.easeOut,
-                        style: TextStyle(
-                          fontSize: isCurrent ? 24 : 18,
-                          fontWeight: isCurrent
-                              ? FontWeight.w700
-                              : FontWeight.w500,
-                          color: isCurrent
-                              ? Colors.white
-                              : const Color(0x66ffffff),
-                          height: 1.45,
-                        ),
-                        child: Text(widget.parsedLyrics[i].text),
-                      ),
+                      if (!_userInteracting) {
+                        setState(() => _userInteracting = true);
+                      }
+                    } else {
+                      _userResumeTimer?.cancel();
+                      _userResumeTimer = Timer(
+                        const Duration(milliseconds: 6000),
+                        () {
+                          if (mounted && _userInteracting) {
+                            setState(() => _userInteracting = false);
+                            if (_lastActiveIndex >= 0) {
+                              _scrollToIndex(_lastActiveIndex);
+                            }
+                          }
+                        },
+                      );
+                    }
+                    return false;
+                  },
+                  child: SingleChildScrollView(
+                    controller: _effectiveController,
+                    padding: EdgeInsets.fromLTRB(
+                      22,
+                      verticalPadding,
+                      22,
+                      verticalPadding + 40,
                     ),
-                  );
-                },
-              ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        for (int i = 0; i < widget.parsedLyrics.length; i++)
+                          _buildLyricItem(i, i == active, isLight),
+                      ],
+                    ),
+                  ),
+                );
+              },
             ),
             // Floating "Sync lyrics" pill when user scrolled away
             if (_userInteracting && active >= 0)
@@ -4686,47 +7319,68 @@ class _LyricsAutoScrollViewState extends State<_LyricsAutoScrollView> {
                 left: 0,
                 right: 0,
                 child: Center(
-                  child: GestureDetector(
-                    onTap: () {
-                      _userResumeTimer?.cancel();
-                      setState(() => _userInteracting = false);
-                      _scrollToIndex(active);
-                    },
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 16,
-                        vertical: 8,
-                      ),
-                      decoration: BoxDecoration(
-                        color: const Color(0xdd222228),
-                        borderRadius: BorderRadius.circular(24),
-                        border: Border.all(color: Colors.white24),
-                        boxShadow: const [
-                          BoxShadow(
-                            color: Colors.black45,
-                            blurRadius: 10,
-                            offset: Offset(0, 4),
+                  child: Material(
+                    color: Colors.transparent,
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(24),
+                      onTap: () {
+                        _userResumeTimer?.cancel();
+                        setState(() => _userInteracting = false);
+                        _scrollToIndex(
+                          active,
+                          duration: const Duration(milliseconds: 500),
+                          curve: Curves.easeOutCubic,
+                        );
+                      },
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 18,
+                          vertical: 10,
+                        ),
+                        decoration: BoxDecoration(
+                          color: isLight
+                              ? Colors.white
+                              : const Color(0xff222228),
+                          borderRadius: BorderRadius.circular(24),
+                          border: Border.all(
+                            color: isLight
+                                ? const Color(0x28000000)
+                                : Colors.white24,
+                            width: 1.2,
                           ),
-                        ],
-                      ),
-                      child: const Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(
-                            PhosphorIconsRegular.arrowsClockwise,
-                            size: 16,
-                            color: Colors.white,
-                          ),
-                          SizedBox(width: 8),
-                          Text(
-                            'Sync lyrics',
-                            style: TextStyle(
-                              fontSize: 13,
-                              fontWeight: FontWeight.w600,
-                              color: Colors.white,
+                          boxShadow: [
+                            BoxShadow(
+                              color: isLight
+                                  ? Colors.black.withValues(alpha: .15)
+                                  : Colors.black54,
+                              blurRadius: 14,
+                              offset: const Offset(0, 5),
                             ),
-                          ),
-                        ],
+                          ],
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              PhosphorIconsBold.arrowsClockwise,
+                              size: 16,
+                              color: isLight
+                                  ? const Color(0xff0f172a)
+                                  : Colors.white,
+                            ),
+                            const SizedBox(width: 8),
+                            Text(
+                              'Sync lyrics',
+                              style: TextStyle(
+                                fontSize: 13,
+                                fontWeight: FontWeight.w700,
+                                color: isLight
+                                    ? const Color(0xff0f172a)
+                                    : Colors.white,
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
                     ),
                   ),
@@ -4767,4 +7421,1837 @@ class _GradientCircleBorderPainter extends CustomPainter {
   bool shouldRepaint(covariant _GradientCircleBorderPainter oldDelegate) =>
       oldDelegate.gradient != gradient || oldDelegate.strokeWidth != strokeWidth;
 }
+
+/* -------------------------------------------------------------------------- */
+/*                           SETTINGS BOTTOM SHEET                            */
+/* -------------------------------------------------------------------------- */
+
+class _SettingsBottomSheet extends StatefulWidget {
+  final UserProfile? userProfile;
+  final String currentQuality;
+  final String currentTheme;
+  final String currentLanguage;
+  final DateTime? sleepTimerEndTime;
+  final Duration? Function() getSleepTimerRemaining;
+  final Future<void> Function(String name, int age) onSaveProfile;
+  final void Function(Duration duration) onSetSleepTimer;
+  final VoidCallback onCancelSleepTimer;
+  final Future<void> Function(String theme) onThemeChanged;
+  final Future<void> Function(String quality) onQualityChanged;
+  final Future<void> Function(String language) onLanguageChanged;
+
+  const _SettingsBottomSheet({
+    required this.userProfile,
+    required this.currentQuality,
+    required this.currentTheme,
+    required this.currentLanguage,
+    required this.sleepTimerEndTime,
+    required this.getSleepTimerRemaining,
+    required this.onSaveProfile,
+    required this.onSetSleepTimer,
+    required this.onCancelSleepTimer,
+    required this.onThemeChanged,
+    required this.onQualityChanged,
+    required this.onLanguageChanged,
+  });
+
+  @override
+  State<_SettingsBottomSheet> createState() => _SettingsBottomSheetState();
+}
+
+class _SettingsBottomSheetState extends State<_SettingsBottomSheet> {
+  late final TextEditingController _nameCtrl;
+  late final TextEditingController _ageCtrl;
+  late final TextEditingController _hoursCtrl;
+  late final TextEditingController _minutesCtrl;
+  late String _selectedQuality;
+  late String _selectedTheme;
+  late String _selectedLanguage;
+  bool _showCustomTimer = false;
+  Timer? _liveTicker;
+  DateTime? _sleepTimerEndTime;
+  bool _isDisposing = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _nameCtrl = TextEditingController(text: widget.userProfile?.name ?? '');
+    _ageCtrl = TextEditingController(
+      text: widget.userProfile?.age != null ? '${widget.userProfile!.age}' : '',
+    );
+    _hoursCtrl = TextEditingController(text: '0');
+    _minutesCtrl = TextEditingController(text: '30');
+    _selectedQuality = widget.currentQuality;
+    _selectedTheme = widget.currentTheme;
+    _selectedLanguage = widget.currentLanguage;
+    _sleepTimerEndTime = widget.sleepTimerEndTime;
+
+    _startLiveTicker();
+  }
+
+  void _startLiveTicker() {
+    _liveTicker?.cancel();
+    if (_sleepTimerEndTime != null) {
+      _liveTicker = Timer.periodic(const Duration(seconds: 1), (_) {
+        if (!mounted || _isDisposing) {
+          _liveTicker?.cancel();
+          return;
+        }
+        if (_sleepTimerEndTime == null) {
+          _liveTicker?.cancel();
+          return;
+        }
+        setState(() {});
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _isDisposing = true;
+    _liveTicker?.cancel();
+    _liveTicker = null;
+    _nameCtrl.dispose();
+    _ageCtrl.dispose();
+    _hoursCtrl.dispose();
+    _minutesCtrl.dispose();
+    super.dispose();
+  }
+
+  bool get _isLight => Theme.of(context).brightness == Brightness.light;
+  Color get _sheetBg =>
+      _isLight ? AppConstants.colorLightSurface : const Color(0xff16161b);
+  Color get _textColor => _isLight ? const Color(0xff0f172a) : Colors.white;
+  Color get _subtextColor => _isLight ? const Color(0xff64748b) : _muted;
+  Color get _borderColor =>
+      _isLight ? const Color(0x18000000) : Colors.white12;
+  Color get _cardBg =>
+      _isLight ? const Color(0xfff1f5f9) : Colors.white.withValues(alpha: .06);
+
+  @override
+  Widget build(BuildContext context) {
+    return PopScope(
+      onPopInvokedWithResult: (didPop, result) {
+        if (didPop) {
+          _isDisposing = true;
+          _liveTicker?.cancel();
+          _liveTicker = null;
+        }
+      },
+      child: SafeArea(
+        top: false,
+        child: Padding(
+          padding: EdgeInsets.only(
+            bottom: MediaQuery.of(context).viewInsets.bottom,
+          ),
+          child: Container(
+            constraints: BoxConstraints(
+              maxHeight: MediaQuery.of(context).size.height * 0.85,
+            ),
+            padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+            decoration: BoxDecoration(
+              color: _sheetBg,
+              borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+              border: Border(top: BorderSide(color: _borderColor)),
+            ),
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // Handle
+                  Center(
+                    child: Container(
+                      width: 36,
+                      height: 4,
+                      decoration: BoxDecoration(
+                        color: _isLight ? const Color(0x20000000) : Colors.white24,
+                        borderRadius: BorderRadius.circular(2),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+
+                  // Title & Close
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Text(
+                        'Settings',
+                        style: TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.w800,
+                          color: _textColor,
+                        ),
+                      ),
+                      IconButton(
+                        visualDensity: VisualDensity.compact,
+                        padding: EdgeInsets.zero,
+                        constraints: const BoxConstraints(),
+                        icon: Icon(
+                          PhosphorIconsRegular.x,
+                          size: 20,
+                          color: _subtextColor,
+                        ),
+                        onPressed: () {
+                          _isDisposing = true;
+                          _liveTicker?.cancel();
+                          _liveTicker = null;
+                          Navigator.of(context).pop();
+                        },
+                      ),
+                    ],
+                  ),
+                const SizedBox(height: 16),
+
+                /* ---------------------------------------------------- */
+                /* 1. EDIT PROFILE SECTION                              */
+                /* ---------------------------------------------------- */
+                Row(
+                  children: [
+                    Icon(
+                      PhosphorIconsRegular.userCircle,
+                      size: 18,
+                      color: _isLight ? const Color(0xff334155) : Colors.white70,
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      'PROFILE',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: 0.8,
+                        color: _subtextColor,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    Expanded(
+                      flex: 3,
+                      child: SizedBox(
+                        height: 48,
+                        child: TextField(
+                          controller: _nameCtrl,
+                          inputFormatters: const [
+                            UserNameTextInputFormatter(),
+                          ],
+                          style: TextStyle(
+                            color: _textColor,
+                            fontSize: 14,
+                          ),
+                          decoration: InputDecoration(
+                            hintText: 'Your name',
+                            hintStyle: TextStyle(
+                              color: _subtextColor,
+                              fontSize: 13,
+                            ),
+                            prefixIcon: Icon(
+                              PhosphorIconsRegular.user,
+                              size: 18,
+                              color: _subtextColor,
+                            ),
+                            contentPadding: const EdgeInsets.symmetric(
+                              horizontal: 12,
+                              vertical: 14,
+                            ),
+                            filled: true,
+                            fillColor: _cardBg,
+                            border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(12),
+                              borderSide: BorderSide.none,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      flex: 1,
+                      child: SizedBox(
+                        height: 48,
+                        child: TextField(
+                          controller: _ageCtrl,
+                          keyboardType: TextInputType.number,
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: _textColor,
+                            fontSize: 14,
+                            fontWeight: FontWeight.w600,
+                          ),
+                          decoration: InputDecoration(
+                            hintText: 'Age',
+                            hintStyle: TextStyle(
+                              color: _subtextColor,
+                              fontSize: 13,
+                            ),
+                            contentPadding: const EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 14,
+                            ),
+                            filled: true,
+                            fillColor: _cardBg,
+                            border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(12),
+                              borderSide: BorderSide.none,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: SizedBox(
+                    width: 120,
+                    height: 40,
+                    child: ElevatedButton.icon(
+                      onPressed: () async {
+                        final name = _nameCtrl.text.trim();
+                        final age = int.tryParse(_ageCtrl.text.trim());
+                        if (name.isEmpty) {
+                          if (context.mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: const Text(
+                                  'Please enter your name',
+                                ),
+                                behavior: SnackBarBehavior.floating,
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(10),
+                                ),
+                                duration: const Duration(seconds: 2),
+                              ),
+                            );
+                          }
+                          return;
+                        }
+                        if (name.length < 2) {
+                          if (context.mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: const Text(
+                                  'Name must be at least 2 characters',
+                                ),
+                                behavior: SnackBarBehavior.floating,
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(10),
+                                ),
+                                duration: const Duration(seconds: 2),
+                              ),
+                            );
+                          }
+                          return;
+                        }
+                        final firstName = name.split(RegExp(r'\s+')).first;
+                        if (firstName.length >
+                            AppConstants.maxFirstNameLength) {
+                          if (context.mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: Text(
+                                  'First name cannot exceed ${AppConstants.maxFirstNameLength} characters',
+                                ),
+                                behavior: SnackBarBehavior.floating,
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(10),
+                                ),
+                                duration: const Duration(seconds: 2),
+                              ),
+                            );
+                          }
+                          return;
+                        }
+                        if (name.length > AppConstants.maxFullNameLength) {
+                          if (context.mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: Text(
+                                  'Name cannot exceed ${AppConstants.maxFullNameLength} characters',
+                                ),
+                                behavior: SnackBarBehavior.floating,
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(10),
+                                ),
+                                duration: const Duration(seconds: 2),
+                              ),
+                            );
+                          }
+                          return;
+                        }
+                        if (age == null || age < 5 || age > 120) {
+                          if (context.mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: const Text(
+                                  'Please enter a valid age between 5 and 120',
+                                ),
+                                behavior: SnackBarBehavior.floating,
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(10),
+                                ),
+                                duration: const Duration(seconds: 2),
+                              ),
+                            );
+                          }
+                          return;
+                        }
+
+                        await widget.onSaveProfile(name, age);
+                        if (context.mounted) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: const Text(
+                                'Profile saved successfully',
+                              ),
+                              behavior: SnackBarBehavior.floating,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                              duration: const Duration(seconds: 2),
+                            ),
+                          );
+                        }
+                      },
+                      icon: const Icon(
+                        PhosphorIconsBold.check,
+                        size: 15,
+                      ),
+                      label: const Text(
+                        'Save',
+                        style: TextStyle(
+                          fontWeight: FontWeight.w700,
+                          fontSize: 13,
+                        ),
+                      ),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor:
+                            _isLight ? const Color(0xff0f172a) : Colors.white,
+                        foregroundColor:
+                            _isLight ? Colors.white : Colors.black,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        elevation: 0,
+                      ),
+                    ),
+                  ),
+                ),
+
+                /* ---------------------------------------------------- */
+                /* 2. SLEEP TIMER SECTION (15m, 30m, 1h Presets)        */
+                /* ---------------------------------------------------- */
+                const SizedBox(height: 18),
+                Divider(color: _borderColor, height: 1),
+                const SizedBox(height: 16),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Row(
+                      children: [
+                        Icon(
+                          PhosphorIconsRegular.moonStars,
+                          size: 18,
+                          color: _isLight ? const Color(0xff334155) : Colors.white70,
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          'SLEEP TIMER',
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w800,
+                            letterSpacing: 0.8,
+                            color: _subtextColor,
+                          ),
+                        ),
+                      ],
+                    ),
+                    if (_sleepTimerEndTime != null)
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 4,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.indigoAccent.withValues(
+                            alpha: .2,
+                          ),
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(
+                            color: Colors.indigoAccent.withValues(
+                              alpha: .4,
+                            ),
+                          ),
+                        ),
+                        child: Text(
+                          () {
+                            final rem = widget.getSleepTimerRemaining() ??
+                                Duration.zero;
+                            final h = rem.inHours;
+                            final m = rem.inMinutes % 60;
+                            final s = rem.inSeconds % 60;
+                            if (h > 0) return '${h}h ${m}m ${s}s left';
+                            return '${m}m ${s}s left';
+                          }(),
+                          style: const TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w700,
+                            color: Colors.indigoAccent,
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                if (_sleepTimerEndTime != null)
+                  Container(
+                    height: 44,
+                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                    decoration: BoxDecoration(
+                      color: _cardBg,
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: _borderColor),
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(
+                          PhosphorIconsRegular.clockCountdown,
+                          size: 18,
+                          color: Colors.indigoAccent,
+                        ),
+                        const SizedBox(width: 10),
+                        Text(
+                          'Timer running',
+                          style: TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                            color: _textColor,
+                          ),
+                        ),
+                        const Spacer(),
+                        GestureDetector(
+                          onTap: () {
+                            widget.onCancelSleepTimer();
+                            _liveTicker?.cancel();
+                            _liveTicker = null;
+                            setState(() => _sleepTimerEndTime = null);
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: const Text(
+                                  'Sleep timer turned off',
+                                ),
+                                behavior: SnackBarBehavior.floating,
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(10),
+                                ),
+                                duration: const Duration(seconds: 2),
+                              ),
+                            );
+                          },
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 12,
+                              vertical: 6,
+                            ),
+                            decoration: BoxDecoration(
+                              color: Colors.redAccent.withValues(
+                                alpha: .15,
+                              ),
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(
+                                color: Colors.redAccent.withValues(
+                                  alpha: .4,
+                                ),
+                              ),
+                            ),
+                            child: const Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  PhosphorIconsRegular.xCircle,
+                                  size: 14,
+                                  color: Colors.redAccent,
+                                ),
+                                SizedBox(width: 4),
+                                Text(
+                                  'Cancel',
+                                  style: TextStyle(
+                                    fontSize: 11.5,
+                                    fontWeight: FontWeight.w700,
+                                    color: Colors.redAccent,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  )
+                else ...[
+                  Row(
+                    children: [
+                      for (final p in [
+                        {'label': '15m', 'sec': 15 * 60},
+                        {'label': '30m', 'sec': 30 * 60},
+                        {'label': '1h', 'sec': 60 * 60},
+                      ])
+                        Expanded(
+                          child: GestureDetector(
+                            onTap: () {
+                              final dur = Duration(seconds: p['sec'] as int);
+                              widget.onSetSleepTimer(dur);
+                              setState(() {
+                                _sleepTimerEndTime = DateTime.now().add(dur);
+                              });
+                              _startLiveTicker();
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(
+                                  content: Text(
+                                    'Sleep timer set for ${p['label']}',
+                                  ),
+                                  behavior: SnackBarBehavior.floating,
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(
+                                      10,
+                                    ),
+                                  ),
+                                  duration: const Duration(seconds: 2),
+                                ),
+                              );
+                            },
+                            child: Container(
+                              height: 44,
+                              margin: const EdgeInsets.symmetric(
+                                horizontal: 3,
+                              ),
+                              decoration: BoxDecoration(
+                                color: _cardBg,
+                                borderRadius: BorderRadius.circular(10),
+                                border: Border.all(color: _borderColor),
+                              ),
+                              alignment: Alignment.center,
+                              child: Text(
+                                p['label'] as String,
+                                style: TextStyle(
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w700,
+                                  color: _textColor,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      GestureDetector(
+                        onTap: () {
+                          setState(
+                            () => _showCustomTimer = !_showCustomTimer,
+                          );
+                        },
+                        child: Container(
+                          height: 44,
+                          margin: const EdgeInsets.only(left: 3),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 14,
+                          ),
+                          decoration: BoxDecoration(
+                            color: _showCustomTimer
+                                ? (_isLight
+                                    ? const Color(0xffe2e8f0)
+                                    : Colors.white.withValues(alpha: .18))
+                                : _cardBg,
+                            borderRadius: BorderRadius.circular(10),
+                            border: Border.all(
+                              color: _showCustomTimer
+                                  ? (_isLight
+                                      ? const Color(0xff94a3b8)
+                                      : Colors.white54)
+                                  : _borderColor,
+                            ),
+                          ),
+                          alignment: Alignment.center,
+                          child: Icon(
+                            PhosphorIconsRegular.sliders,
+                            size: 18,
+                            color: _isLight
+                                ? const Color(0xff334155)
+                                : Colors.white70,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  if (_showCustomTimer) ...[
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: SizedBox(
+                            height: 44,
+                            child: TextField(
+                              controller: _hoursCtrl,
+                              keyboardType: TextInputType.number,
+                              textAlign: TextAlign.center,
+                              style: TextStyle(
+                                color: _textColor,
+                                fontSize: 14,
+                                fontWeight: FontWeight.w600,
+                              ),
+                              decoration: InputDecoration(
+                                hintText: 'Hours',
+                                hintStyle: TextStyle(
+                                  color: _subtextColor,
+                                  fontSize: 12,
+                                ),
+                                suffixText: 'h',
+                                suffixStyle: TextStyle(
+                                  color: _subtextColor,
+                                  fontSize: 12,
+                                ),
+                                contentPadding: const EdgeInsets.symmetric(
+                                  horizontal: 10,
+                                  vertical: 12,
+                                ),
+                                filled: true,
+                                fillColor: _cardBg,
+                                border: OutlineInputBorder(
+                                  borderRadius: BorderRadius.circular(10),
+                                  borderSide: BorderSide.none,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: SizedBox(
+                            height: 44,
+                            child: TextField(
+                              controller: _minutesCtrl,
+                              keyboardType: TextInputType.number,
+                              textAlign: TextAlign.center,
+                              style: TextStyle(
+                                color: _textColor,
+                                fontSize: 14,
+                                fontWeight: FontWeight.w600,
+                              ),
+                              decoration: InputDecoration(
+                                hintText: 'Mins',
+                                hintStyle: TextStyle(
+                                  color: _subtextColor,
+                                  fontSize: 12,
+                                ),
+                                suffixText: 'm',
+                                suffixStyle: TextStyle(
+                                  color: _subtextColor,
+                                  fontSize: 12,
+                                ),
+                                contentPadding: const EdgeInsets.symmetric(
+                                  horizontal: 10,
+                                  vertical: 12,
+                                ),
+                                filled: true,
+                                fillColor: _cardBg,
+                                border: OutlineInputBorder(
+                                  borderRadius: BorderRadius.circular(10),
+                                  borderSide: BorderSide.none,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        GestureDetector(
+                          onTap: () {
+                            final h = int.tryParse(_hoursCtrl.text.trim()) ?? 0;
+                            final m = int.tryParse(_minutesCtrl.text.trim()) ?? 0;
+                            final total = (h * 3600) + (m * 60);
+                            if (total > 0) {
+                              final dur = Duration(seconds: total);
+                              widget.onSetSleepTimer(dur);
+                              setState(() {
+                                _sleepTimerEndTime = DateTime.now().add(dur);
+                                _showCustomTimer = false;
+                              });
+                              _startLiveTicker();
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(
+                                  content: Text(
+                                    'Sleep timer set for ${h > 0 ? '$h hr ' : ''}$m min',
+                                  ),
+                                  behavior: SnackBarBehavior.floating,
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(
+                                      10,
+                                    ),
+                                  ),
+                                  duration: const Duration(seconds: 2),
+                                ),
+                              );
+                            }
+                          },
+                          child: Container(
+                            height: 44,
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 16,
+                            ),
+                            decoration: BoxDecoration(
+                              color: _isLight
+                                  ? const Color(0xff0f172a)
+                                  : Colors.white,
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                            alignment: Alignment.center,
+                            child: Text(
+                              'Set',
+                              style: TextStyle(
+                                color: _isLight ? Colors.white : Colors.black,
+                                fontWeight: FontWeight.w700,
+                                fontSize: 13,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ],
+
+                /* ---------------------------------------------------- */
+                /* 3. MUSIC LANGUAGE PREFERENCE (English / Hindi)       */
+                /* ---------------------------------------------------- */
+                const SizedBox(height: 18),
+                Divider(color: _borderColor, height: 1),
+                const SizedBox(height: 16),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Row(
+                      children: [
+                        Icon(
+                          PhosphorIconsRegular.translate,
+                          size: 18,
+                          color: _isLight ? const Color(0xff334155) : Colors.white70,
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          'MUSIC LANGUAGE',
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w800,
+                            letterSpacing: 0.8,
+                            color: _subtextColor,
+                          ),
+                        ),
+                      ],
+                    ),
+                    Text(
+                      _selectedLanguage,
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                        color: _isLight ? const Color(0xff334155) : Colors.white70,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    for (final lang in ['English', 'Hindi'])
+                      Expanded(
+                        child: GestureDetector(
+                          onTap: () async {
+                            setState(() => _selectedLanguage = lang);
+                            await widget.onLanguageChanged(lang);
+                          },
+                          child: Container(
+                            height: 46,
+                            margin: const EdgeInsets.symmetric(horizontal: 4),
+                            decoration: BoxDecoration(
+                              color: _selectedLanguage.toLowerCase() ==
+                                      lang.toLowerCase()
+                                  ? (_isLight
+                                      ? const Color(0xff0f172a)
+                                      : Colors.white)
+                                  : _cardBg,
+                              borderRadius: BorderRadius.circular(10),
+                              border: Border.all(
+                                color: _selectedLanguage.toLowerCase() ==
+                                        lang.toLowerCase()
+                                    ? (_isLight
+                                        ? const Color(0xff0f172a)
+                                        : Colors.white)
+                                    : _borderColor,
+                              ),
+                            ),
+                            alignment: Alignment.center,
+                            child: Row(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Icon(
+                                  PhosphorIconsRegular.translate,
+                                  size: 16,
+                                  color: _selectedLanguage.toLowerCase() ==
+                                          lang.toLowerCase()
+                                      ? (_isLight
+                                          ? Colors.white
+                                          : Colors.black)
+                                      : _subtextColor,
+                                ),
+                                const SizedBox(width: 8),
+                                Text(
+                                  lang,
+                                  style: TextStyle(
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w700,
+                                    color: _selectedLanguage.toLowerCase() ==
+                                            lang.toLowerCase()
+                                        ? (_isLight
+                                            ? Colors.white
+                                            : Colors.black)
+                                        : _textColor,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+
+                /* ---------------------------------------------------- */
+                /* 4. THEME SECTION (System, Dark, Light 3-way Switch)  */
+                /* ---------------------------------------------------- */
+                const SizedBox(height: 18),
+                Divider(color: _borderColor, height: 1),
+                const SizedBox(height: 16),
+                Row(
+                  children: [
+                    Icon(
+                      PhosphorIconsRegular.paintBrushBroad,
+                      size: 18,
+                      color: _isLight ? const Color(0xff334155) : Colors.white70,
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      'THEME',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: 0.8,
+                        color: _subtextColor,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                Container(
+                  height: 44,
+                  padding: const EdgeInsets.all(4),
+                  decoration: BoxDecoration(
+                    color: _cardBg,
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: _borderColor),
+                  ),
+                  child: Row(
+                    children: [
+                      for (final opt in [
+                        {
+                          'val': 'system',
+                          'label': 'System',
+                          'icon': PhosphorIconsRegular.deviceMobile,
+                          'iconFill': PhosphorIconsFill.deviceMobile,
+                        },
+                        {
+                          'val': 'dark',
+                          'label': 'Dark',
+                          'icon': PhosphorIconsRegular.moon,
+                          'iconFill': PhosphorIconsFill.moon,
+                        },
+                        {
+                          'val': 'light',
+                          'label': 'Light',
+                          'icon': PhosphorIconsRegular.sun,
+                          'iconFill': PhosphorIconsFill.sun,
+                        },
+                      ])
+                        Expanded(
+                          child: GestureDetector(
+                            onTap: () async {
+                              final mode = opt['val'] as String;
+                              setState(() => _selectedTheme = mode);
+                              await widget.onThemeChanged(mode);
+                            },
+                            child: AnimatedContainer(
+                              duration: const Duration(milliseconds: 200),
+                              decoration: BoxDecoration(
+                                color: _selectedTheme == opt['val']
+                                    ? (_isLight
+                                        ? Colors.white
+                                        : Colors.white.withValues(alpha: .18))
+                                    : Colors.transparent,
+                                borderRadius: BorderRadius.circular(8),
+                                boxShadow: _selectedTheme == opt['val'] && _isLight
+                                    ? [
+                                        BoxShadow(
+                                          color: Colors.black.withValues(alpha: .06),
+                                          blurRadius: 4,
+                                          offset: const Offset(0, 1),
+                                        ),
+                                      ]
+                                    : null,
+                              ),
+                              alignment: Alignment.center,
+                              child: Row(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: [
+                                  Icon(
+                                    _selectedTheme == opt['val']
+                                        ? (opt['iconFill'] as IconData)
+                                        : (opt['icon'] as IconData),
+                                    size: 16,
+                                    color: _selectedTheme == opt['val']
+                                        ? (_isLight
+                                            ? const Color(0xff0f172a)
+                                            : Colors.white)
+                                        : _subtextColor,
+                                  ),
+                                  const SizedBox(width: 6),
+                                  Text(
+                                    opt['label'] as String,
+                                    style: TextStyle(
+                                      fontSize: 12.5,
+                                      fontWeight: _selectedTheme == opt['val']
+                                          ? FontWeight.w700
+                                          : FontWeight.w500,
+                                      color: _selectedTheme == opt['val']
+                                          ? (_isLight
+                                              ? const Color(0xff0f172a)
+                                              : Colors.white)
+                                          : _subtextColor,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+
+                /* ---------------------------------------------------- */
+                /* 5. AUDIO QUALITY SECTION                             */
+                /* ---------------------------------------------------- */
+                const SizedBox(height: 18),
+                Divider(color: _borderColor, height: 1),
+                const SizedBox(height: 16),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Row(
+                      children: [
+                        Icon(
+                          PhosphorIconsRegular.waveform,
+                          size: 18,
+                          color: _isLight ? const Color(0xff334155) : Colors.white70,
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          'AUDIO QUALITY',
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w800,
+                            letterSpacing: 0.8,
+                            color: _subtextColor,
+                          ),
+                        ),
+                      ],
+                    ),
+                    Text(
+                      _selectedQuality == '320kbps'
+                          ? 'HD 320 kbps'
+                          : _selectedQuality,
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                        color: _isLight
+                            ? const Color(0xff334155)
+                            : Colors.white70,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    for (final opt in [
+                      {'val': '320kbps', 'label': '320k', 'sub': 'Best'},
+                      {'val': '160kbps', 'label': '160k', 'sub': 'High'},
+                      {'val': '96kbps', 'label': '96k', 'sub': 'Saver'},
+                      {'val': '48kbps', 'label': '48k', 'sub': 'Low'},
+                    ])
+                      Expanded(
+                        child: GestureDetector(
+                          onTap: () async {
+                            setState(() => _selectedQuality = opt['val']!);
+                            await widget.onQualityChanged(opt['val']!);
+                          },
+                          child: Container(
+                            height: 52,
+                            margin: const EdgeInsets.symmetric(
+                              horizontal: 3,
+                            ),
+                            decoration: BoxDecoration(
+                              color: _selectedQuality == opt['val']
+                                  ? (_isLight
+                                      ? const Color(0xff0f172a)
+                                      : Colors.white)
+                                  : _cardBg,
+                              borderRadius: BorderRadius.circular(10),
+                              border: Border.all(
+                                color: _selectedQuality == opt['val']
+                                    ? (_isLight
+                                        ? const Color(0xff0f172a)
+                                        : Colors.white)
+                                    : _borderColor,
+                              ),
+                            ),
+                            child: Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Text(
+                                  opt['label']!,
+                                  style: TextStyle(
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w800,
+                                    color: _selectedQuality == opt['val']
+                                        ? (_isLight
+                                            ? Colors.white
+                                            : Colors.black)
+                                        : _textColor,
+                                  ),
+                                ),
+                                const SizedBox(height: 2),
+                                Text(
+                                  opt['sub']!,
+                                  style: TextStyle(
+                                    fontSize: 10.5,
+                                    fontWeight: FontWeight.w600,
+                                    color: _selectedQuality == opt['val']
+                                        ? (_isLight
+                                            ? Colors.white70
+                                            : Colors.black87)
+                                        : _subtextColor,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+
+                // Bottom spacing
+                SizedBox(
+                  height: math.max(
+                        MediaQuery.paddingOf(context).bottom,
+                        16.0,
+                      ) +
+                      8.0,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+}
+}
+
+/* -------------------------------------------------------------------------- */
+/*                            EQUALIZER BOTTOM SHEET                          */
+/* -------------------------------------------------------------------------- */
+
+class _EqualizerBottomSheet extends StatefulWidget {
+  final CrossfadePlayer audio;
+  final bool initialEnabled;
+  final String initialPreset;
+  final List<double> initialBands;
+  final double initialBassBoost;
+  final void Function(
+    bool enabled,
+    String preset,
+    List<double> bands,
+    double bassBoost,
+  ) onChanged;
+
+  const _EqualizerBottomSheet({
+    required this.audio,
+    required this.initialEnabled,
+    required this.initialPreset,
+    required this.initialBands,
+    required this.initialBassBoost,
+    required this.onChanged,
+  });
+
+  @override
+  State<_EqualizerBottomSheet> createState() => _EqualizerBottomSheetState();
+}
+
+class _EqualizerBottomSheetState extends State<_EqualizerBottomSheet> {
+  // Theme-aware audio equalizer design tokens
+  bool get _isLight => Theme.of(context).brightness == Brightness.light;
+
+  Color get _sheetBg =>
+      _isLight ? AppConstants.colorLightSurface : const Color(0xff121212);
+  Color get _cardBg =>
+      _isLight ? const Color(0xffF8FAFC) : const Color(0xff1A1A1A);
+  Color get _elevatedBg =>
+      _isLight ? const Color(0xffF1F5F9) : const Color(0xff222222);
+  Color get _accent =>
+      _isLight ? const Color(0xff0F172A) : const Color(0xffB0B0B0);
+  Color get _accentSoft =>
+      _isLight ? const Color(0xffF1F5F9) : const Color(0xff2E2E2E);
+  Color get _textColor =>
+      _isLight ? const Color(0xff0F172A) : const Color(0xffF2F2F2);
+  Color get _secondaryText =>
+      _isLight ? const Color(0xff64748B) : const Color(0xffA1A1A1);
+  Color get _mutedText =>
+      _isLight ? const Color(0xff94A3B8) : const Color(0xff6E6E6E);
+  Color get _borderColor =>
+      _isLight ? const Color(0xffE2E8F0) : const Color(0xff2A2A2A);
+  Color get _sliderInactive =>
+      _isLight ? const Color(0xffCBD5E1) : const Color(0xff3A3A3A);
+  Color get _posEqColor =>
+      _isLight ? const Color(0xff0F172A) : const Color(0xffD4D4D4);
+  Color get _negEqColor =>
+      _isLight ? const Color(0xff64748B) : const Color(0xff8A8A8A);
+  static const _activeBlue = Color(0xff3B82F6);
+
+
+  late bool _enabled;
+  late String _preset;
+  late List<double> _bands;
+  late double _bassBoost;
+  List<String> _frequencies = ['60Hz', '230Hz', '910Hz', '3.6kHz', '14kHz'];
+  double _minDb = -10.0;
+  double _maxDb = 10.0;
+
+  static const Map<String, List<double>> _presets = {
+    'Flat': [0.0, 0.0, 0.0, 0.0, 0.0],
+    'Bass Boost': [6.0, 4.5, 1.0, 0.0, 0.0],
+    'Rock': [4.5, 2.5, -1.0, 2.5, 4.0],
+    'Pop': [-1.0, 1.5, 3.5, 2.0, -1.0],
+    'Electronic': [5.0, 3.5, 0.0, 2.5, 4.0],
+    'Hip Hop': [5.5, 3.0, 0.0, 1.5, 3.0],
+    'Jazz': [3.0, 1.5, -1.5, 1.5, 3.0],
+    'Classical': [4.0, 2.5, -2.0, 2.0, 3.5],
+    'Vocal Boost': [-2.0, 0.0, 4.5, 3.5, 1.0],
+    'Acoustic': [3.5, 2.0, 1.0, 2.5, 3.0],
+    'Deep Bass': [7.0, 5.0, 1.5, -1.0, -2.0],
+  };
+
+  static const List<String> _presetNames = [
+    'Flat',
+    'Bass Boost',
+    'Rock',
+    'Pop',
+    'Electronic',
+    'Hip Hop',
+    'Jazz',
+    'Classical',
+    'Vocal Boost',
+    'Acoustic',
+    'Deep Bass',
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    _enabled = widget.initialEnabled;
+    _preset = widget.initialPreset;
+    _bands = List<double>.from(widget.initialBands);
+    while (_bands.length < 5) {
+      _bands.add(0.0);
+    }
+    _bassBoost = widget.initialBassBoost;
+
+    widget.audio.getEqualizerParameters().then((params) {
+      if (mounted && params != null && params.bands.isNotEmpty) {
+        setState(() {
+          _minDb = params.minDecibels.clamp(-20.0, -6.0);
+          _maxDb = params.maxDecibels.clamp(6.0, 20.0);
+          _frequencies = params.bands.map((b) {
+            final f = b.centerFrequency;
+            if (f < 1000) return '${f.round()}Hz';
+            if (f % 1000 == 0) return '${(f / 1000).round()}kHz';
+            return '${(f / 1000).toStringAsFixed(1)}kHz';
+          }).toList();
+          while (_bands.length < params.bands.length) {
+            _bands.add(0.0);
+          }
+        });
+      }
+    });
+  }
+
+  void _toggleEnabled(bool val) {
+    setState(() => _enabled = val);
+    widget.audio.setEqualizerEnabled(val);
+    UserStorage.saveEqualizerEnabled(val);
+    widget.onChanged(_enabled, _preset, _bands, _bassBoost);
+  }
+
+  void _selectPreset(String presetName) {
+    final target = _presets[presetName];
+    if (target != null) {
+      setState(() {
+        _preset = presetName;
+        _bands = List<double>.from(target);
+      });
+      widget.audio.setAllEqualizerBands(_bands);
+      UserStorage.saveEqualizerPreset(presetName);
+      UserStorage.saveEqualizerBands(_bands);
+      widget.onChanged(_enabled, _preset, _bands, _bassBoost);
+    }
+  }
+
+  void _onBandChanged(int index, double gain) {
+    setState(() {
+      _bands[index] = gain;
+      String matched = 'Custom';
+      for (final entry in _presets.entries) {
+        if (entry.value.length == _bands.length) {
+          bool match = true;
+          for (int i = 0; i < _bands.length; i++) {
+            if ((_bands[i] - entry.value[i]).abs() > 0.1) {
+              match = false;
+              break;
+            }
+          }
+          if (match) {
+            matched = entry.key;
+            break;
+          }
+        }
+      }
+      _preset = matched;
+    });
+    widget.audio.setEqualizerBandGain(index, gain);
+    UserStorage.saveEqualizerPreset(_preset);
+    UserStorage.saveEqualizerBands(_bands);
+    widget.onChanged(_enabled, _preset, _bands, _bassBoost);
+  }
+
+  void _onBassBoostChanged(double val) {
+    setState(() => _bassBoost = val);
+    widget.audio.setBassBoost(val);
+    UserStorage.saveEqualizerBassBoost(val);
+    widget.onChanged(_enabled, _preset, _bands, _bassBoost);
+  }
+
+  void _reset() {
+    setState(() {
+      _preset = 'Flat';
+      _bands = List.filled(_bands.length, 0.0);
+      _bassBoost = 0.0;
+    });
+    widget.audio.setAllEqualizerBands(_bands);
+    widget.audio.setBassBoost(0.0);
+    UserStorage.saveEqualizerPreset('Flat');
+    UserStorage.saveEqualizerBands(_bands);
+    UserStorage.saveEqualizerBassBoost(0.0);
+    widget.onChanged(_enabled, _preset, _bands, _bassBoost);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: BoxDecoration(
+        color: _sheetBg,
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(30)),
+        border: Border(top: BorderSide(color: _borderColor, width: 1)),
+      ),
+      child: SafeArea(
+        top: false,
+        child: SingleChildScrollView(
+          physics: const BouncingScrollPhysics(),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              // 1. Drag handle
+              const SizedBox(height: 12),
+              Center(
+                child: Container(
+                  width: 36,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: _sliderInactive,
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 18),
+
+              // 2. Header
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 24),
+                child: Row(
+                  children: [
+                    Container(
+                      width: 40,
+                      height: 40,
+                      decoration: BoxDecoration(
+                        color: _accentSoft,
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(color: _borderColor),
+                      ),
+                      child: Center(
+                        child: Icon(
+                          PhosphorIconsRegular.slidersHorizontal,
+                          color: _accent,
+                          size: 20,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 14),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Equalizer',
+                            style: GoogleFonts.poppins(
+                              fontSize: 18,
+                              fontWeight: FontWeight.w600,
+                              color: _textColor,
+                              letterSpacing: -0.2,
+                            ),
+                          ),
+                          const SizedBox(height: 2),
+                          AnimatedDefaultTextStyle(
+                            duration: const Duration(milliseconds: 140),
+                            style: GoogleFonts.poppins(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w400,
+                              color: _enabled ? _activeBlue : _secondaryText,
+                            ),
+                            child: Text(
+                              _enabled
+                                  ? 'Active · $_preset'
+                                  : 'Bypassed · $_preset',
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    Transform.scale(
+                      scale: 0.88,
+                      child: Switch.adaptive(
+                        value: _enabled,
+                        activeTrackColor: _activeBlue,
+                        activeThumbColor: Colors.white,
+                        inactiveTrackColor: _borderColor,
+                        inactiveThumbColor: _mutedText,
+                        onChanged: _toggleEnabled,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 20),
+
+              // 3. Preset Section Header
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 24),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text(
+                      'PRESETS',
+                      style: GoogleFonts.poppins(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                        letterSpacing: 1.0,
+                        color: _mutedText,
+                      ),
+                    ),
+                    GestureDetector(
+                      onTap: _reset,
+                      behavior: HitTestBehavior.opaque,
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            PhosphorIconsRegular.arrowCounterClockwise,
+                            size: 13,
+                            color: _secondaryText,
+                          ),
+                          const SizedBox(width: 4),
+                          Text(
+                            'Reset to Flat',
+                            style: GoogleFonts.poppins(
+                              fontSize: 11.5,
+                              fontWeight: FontWeight.w500,
+                              color: _secondaryText,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 10),
+
+              // 4. Horizontal Scrollable Presets (full bleed with 24px insets)
+              SizedBox(
+                height: 34,
+                child: ListView.separated(
+                  scrollDirection: Axis.horizontal,
+                  physics: const BouncingScrollPhysics(),
+                  padding: const EdgeInsets.symmetric(horizontal: 24),
+                  itemCount: _presetNames.length,
+                  separatorBuilder: (context, index) =>
+                      const SizedBox(width: 8),
+                  itemBuilder: (ctx, i) {
+                    final name = _presetNames[i];
+                    final isSel = _preset == name;
+                    return GestureDetector(
+                      onTap: () => _selectPreset(name),
+                      child: AnimatedContainer(
+                        duration: const Duration(milliseconds: 140),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 14,
+                          vertical: 6,
+                        ),
+                        decoration: BoxDecoration(
+                          color: isSel ? _activeBlue : _elevatedBg,
+                          borderRadius: BorderRadius.circular(20),
+                          border: isSel
+                              ? null
+                              : Border.all(color: _borderColor, width: 1),
+                        ),
+                        child: Center(
+                          child: Text(
+                            name,
+                            style: GoogleFonts.poppins(
+                              fontSize: 12,
+                              fontWeight:
+                                  isSel ? FontWeight.w600 : FontWeight.w500,
+                              color: isSel ? Colors.white : _secondaryText,
+                            ),
+                          ),
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+              const SizedBox(height: 18),
+
+              // 5. Equalizer Graph (Card)
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 24),
+                child: AnimatedOpacity(
+                  opacity: _enabled ? 1.0 : 0.38,
+                  duration: const Duration(milliseconds: 150),
+                  child: Container(
+                    padding: const EdgeInsets.fromLTRB(14, 16, 14, 14),
+                    decoration: BoxDecoration(
+                      color: _cardBg,
+                      borderRadius: BorderRadius.circular(20),
+                      border: Border.all(color: _borderColor, width: 1),
+                    ),
+                    child: Column(
+                      children: [
+                        // dB range guideline text
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Text(
+                              '+${_maxDb.round()} dB',
+                              style: GoogleFonts.poppins(
+                                fontSize: 10,
+                                fontWeight: FontWeight.w500,
+                                color: _mutedText,
+                              ),
+                            ),
+                            Text(
+                              '0 dB',
+                              style: GoogleFonts.poppins(
+                                fontSize: 10,
+                                fontWeight: FontWeight.w500,
+                                color: _mutedText,
+                              ),
+                            ),
+                            Text(
+                              '${_minDb.round()} dB',
+                              style: GoogleFonts.poppins(
+                                fontSize: 10,
+                                fontWeight: FontWeight.w500,
+                                color: _mutedText,
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 12),
+
+                        // Sliders area
+                        SizedBox(
+                          height: 175,
+                          child: Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                            children: List.generate(_bands.length, (index) {
+                              final gain = _bands[index];
+                              final freqLabel = index < _frequencies.length
+                                  ? _frequencies[index]
+                                  : 'B${index + 1}';
+                              final isPos = gain > 0.05;
+                              final isNeg = gain < -0.05;
+                              final color = isPos
+                                  ? _posEqColor
+                                  : (isNeg ? _negEqColor : _mutedText);
+                              final text = isPos
+                                  ? '+${gain.toStringAsFixed(1)}'
+                                  : (isNeg
+                                      ? gain.toStringAsFixed(1)
+                                      : '0.0');
+
+                              return Expanded(
+                                child: Column(
+                                  children: [
+                                    // dB label above slider
+                                    Text(
+                                      text,
+                                      style: GoogleFonts.poppins(
+                                        fontSize: 10.5,
+                                        fontWeight: FontWeight.w600,
+                                        color: color,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 6),
+
+                                    // Vertical slider with 0dB baseline
+                                    Expanded(
+                                      child: Stack(
+                                        alignment: Alignment.center,
+                                        children: [
+                                          Positioned(
+                                            left: 2,
+                                            right: 2,
+                                            child: Container(
+                                              height: 1,
+                                              color: _borderColor,
+                                            ),
+                                          ),
+                                          RotatedBox(
+                                            quarterTurns: 3,
+                                            child: SliderTheme(
+                                              data: SliderTheme.of(context)
+                                                  .copyWith(
+                                                trackHeight: 2.8,
+                                                thumbShape:
+                                                    const RoundSliderThumbShape(
+                                                  enabledThumbRadius: 5.5,
+                                                  elevation: 1,
+                                                  pressedElevation: 3,
+                                                ),
+                                                overlayShape:
+                                                    const RoundSliderOverlayShape(
+                                                  overlayRadius: 12,
+                                                ),
+                                                activeTrackColor: _activeBlue,
+                                                inactiveTrackColor:
+                                                    _sliderInactive,
+                                                thumbColor: _activeBlue,
+                                                overlayColor: _activeBlue
+                                                    .withValues(alpha: 0.16),
+                                              ),
+                                              child: Slider(
+                                                value: gain.clamp(
+                                                  _minDb,
+                                                  _maxDb,
+                                                ),
+                                                min: _minDb,
+                                                max: _maxDb,
+                                                onChanged: _enabled
+                                                    ? (val) => _onBandChanged(
+                                                          index,
+                                                          val,
+                                                        )
+                                                    : null,
+                                              ),
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                    const SizedBox(height: 8),
+
+                                    // Frequency label badge
+                                    Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 6,
+                                        vertical: 2.5,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: _elevatedBg,
+                                        borderRadius:
+                                            BorderRadius.circular(6),
+                                        border: Border.all(
+                                          color: _borderColor,
+                                          width: 1,
+                                        ),
+                                      ),
+                                      child: Text(
+                                        freqLabel,
+                                        style: GoogleFonts.poppins(
+                                          fontSize: 10,
+                                          fontWeight: FontWeight.w500,
+                                          color: _secondaryText,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              );
+                            }),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+
+              // 6. Bass Boost Card
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 24),
+                child: AnimatedOpacity(
+                  opacity: _enabled ? 1.0 : 0.38,
+                  duration: const Duration(milliseconds: 150),
+                  child: Container(
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                      color: _cardBg,
+                      borderRadius: BorderRadius.circular(20),
+                      border: Border.all(color: _borderColor, width: 1),
+                    ),
+                    child: Column(
+                      children: [
+                        Row(
+                          children: [
+                            Container(
+                              width: 36,
+                              height: 36,
+                              decoration: BoxDecoration(
+                                color: _accentSoft,
+                                borderRadius: BorderRadius.circular(10),
+                                border: Border.all(color: _borderColor),
+                              ),
+                              child: Center(
+                                child: Icon(
+                                  PhosphorIconsBold.speakerSimpleHigh,
+                                  size: 18,
+                                  color: _accent,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    'Bass Boost',
+                                    style: GoogleFonts.poppins(
+                                      fontSize: 14,
+                                      fontWeight: FontWeight.w600,
+                                      color: _textColor,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    'Low-frequency depth & punch',
+                                    style: GoogleFonts.poppins(
+                                      fontSize: 11.5,
+                                      fontWeight: FontWeight.w400,
+                                      color: _secondaryText,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            Text(
+                              '${(_bassBoost * 100).round()}%',
+                              style: GoogleFonts.poppins(
+                                fontSize: 14,
+                                fontWeight: FontWeight.w600,
+                                color: _bassBoost > 0.001
+                                    ? _activeBlue
+                                    : _secondaryText,
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        SliderTheme(
+                          data: SliderTheme.of(context).copyWith(
+                            trackHeight: 3.5,
+                            thumbShape: const RoundSliderThumbShape(
+                              enabledThumbRadius: 7.0,
+                              elevation: 1,
+                              pressedElevation: 3,
+                            ),
+                            overlayShape: const RoundSliderOverlayShape(
+                              overlayRadius: 13,
+                            ),
+                            activeTrackColor: _activeBlue,
+                            inactiveTrackColor: _sliderInactive,
+                            thumbColor: _activeBlue,
+                            overlayColor:
+                                _activeBlue.withValues(alpha: 0.16),
+                          ),
+                          child: Slider(
+                            value: _bassBoost.clamp(0.0, 1.0),
+                            min: 0.0,
+                            max: 1.0,
+                            onChanged: _enabled ? _onBassBoostChanged : null,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+
+              // Bottom safe-area spacing
+              SizedBox(
+                height: math.max(
+                      MediaQuery.paddingOf(context).bottom,
+                      16.0,
+                    ) +
+                    10.0,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+
 

@@ -7,21 +7,121 @@ import 'constants.dart';
 
 /// Manages seamless crossfading between audio tracks using dual [AudioPlayer] instances.
 class CrossfadePlayer {
-  CrossfadePlayer(
-      {this.crossfadeSeconds = AppConstants.crossfadeDurationSeconds}) {
+  CrossfadePlayer({
+    this.crossfadeSeconds = AppConstants.crossfadeDurationSeconds,
+  }) {
     _activePlayer = _playerA;
     _initPlayerListeners(_playerA);
     _initPlayerListeners(_playerB);
   }
 
-  final AudioPlayer _playerA = AudioPlayer(
+  final AndroidEqualizer equalizerA = AndroidEqualizer();
+  final AndroidLoudnessEnhancer loudnessA = AndroidLoudnessEnhancer();
+  final AndroidEqualizer equalizerB = AndroidEqualizer();
+  final AndroidLoudnessEnhancer loudnessB = AndroidLoudnessEnhancer();
+
+  late final AudioPlayer _playerA = AudioPlayer(
+    audioPipeline: AudioPipeline(
+      androidAudioEffects: [equalizerA, loudnessA],
+    ),
     handleInterruptions: false,
     handleAudioSessionActivation: false,
   );
-  final AudioPlayer _playerB = AudioPlayer(
+  late final AudioPlayer _playerB = AudioPlayer(
+    audioPipeline: AudioPipeline(
+      androidAudioEffects: [equalizerB, loudnessB],
+    ),
     handleInterruptions: false,
     handleAudioSessionActivation: false,
   );
+  bool _eqEnabled = false;
+  final List<double> _eqBandGains = [0.0, 0.0, 0.0, 0.0, 0.0];
+  double _bassBoost = 0.0;
+
+  bool get isEqEnabled => _eqEnabled;
+  List<double> get eqBandGains => List.unmodifiable(_eqBandGains);
+  double get bassBoost => _bassBoost;
+
+  Future<void> setEqualizerEnabled(bool enabled) async {
+    _eqEnabled = enabled;
+    try {
+      await equalizerA.setEnabled(enabled);
+      await equalizerB.setEnabled(enabled);
+      if (enabled) {
+        await applyAllEqualizerSettings();
+      }
+    } catch (_) {}
+  }
+
+  Future<void> setEqualizerBandGain(int bandIndex, double gain) async {
+    if (bandIndex >= 0 && bandIndex < _eqBandGains.length) {
+      _eqBandGains[bandIndex] = gain;
+    }
+    if (!_eqEnabled) return;
+    try {
+      final paramsA = await equalizerA.parameters;
+      if (bandIndex < paramsA.bands.length) {
+        final clamped = gain.clamp(paramsA.minDecibels, paramsA.maxDecibels);
+        await paramsA.bands[bandIndex].setGain(clamped);
+      }
+    } catch (_) {}
+    try {
+      final paramsB = await equalizerB.parameters;
+      if (bandIndex < paramsB.bands.length) {
+        final clamped = gain.clamp(paramsB.minDecibels, paramsB.maxDecibels);
+        await paramsB.bands[bandIndex].setGain(clamped);
+      }
+    } catch (_) {}
+  }
+
+  Future<void> setAllEqualizerBands(List<double> gains) async {
+    for (int i = 0; i < gains.length && i < _eqBandGains.length; i++) {
+      _eqBandGains[i] = gains[i];
+    }
+    if (_eqEnabled) {
+      await applyAllEqualizerSettings();
+    }
+  }
+
+  Future<void> applyAllEqualizerSettings() async {
+    try {
+      final paramsA = await equalizerA.parameters;
+      for (int i = 0; i < _eqBandGains.length && i < paramsA.bands.length; i++) {
+        final clamped = _eqBandGains[i].clamp(paramsA.minDecibels, paramsA.maxDecibels);
+        await paramsA.bands[i].setGain(clamped);
+      }
+    } catch (_) {}
+    try {
+      final paramsB = await equalizerB.parameters;
+      for (int i = 0; i < _eqBandGains.length && i < paramsB.bands.length; i++) {
+        final clamped = _eqBandGains[i].clamp(paramsB.minDecibels, paramsB.maxDecibels);
+        await paramsB.bands[i].setGain(clamped);
+      }
+    } catch (_) {}
+    await setBassBoost(_bassBoost);
+  }
+
+  Future<AndroidEqualizerParameters?> getEqualizerParameters() async {
+    try {
+      return await equalizerA.parameters;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> setBassBoost(double intensity) async {
+    _bassBoost = intensity;
+    try {
+      final enabled = _eqEnabled && intensity > 0.01;
+      await loudnessA.setEnabled(enabled);
+      await loudnessB.setEnabled(enabled);
+      if (enabled) {
+        final targetGain = intensity * 10.0;
+        await loudnessA.setTargetGain(targetGain);
+        await loudnessB.setTargetGain(targetGain);
+      }
+    } catch (_) {}
+  }
   late AudioPlayer _activePlayer;
   AudioPlayer? _fadingInPlayer;
 
@@ -171,9 +271,10 @@ class CrossfadePlayer {
   }) async {
     _cancelFadeTimer();
 
-    final fadeMs = (customDuration ??
-            Duration(seconds: crossfadeSeconds > 0 ? crossfadeSeconds : 5))
-        .inMilliseconds;
+    final fadeMs =
+        (customDuration ??
+                Duration(seconds: crossfadeSeconds > 0 ? crossfadeSeconds : 5))
+            .inMilliseconds;
     final incoming = _inactivePlayer;
     final outgoing = _activePlayer;
     _onCrossfadeCompletedCallback = onCompleted;
@@ -182,7 +283,9 @@ class CrossfadePlayer {
       await incoming.setVolume(0.0);
       // Use pre-buffered source if it matches, avoiding redundant re-buffering
       final isAlreadyPrepared =
-          (_preparedUri != null && nextUri != null && _preparedUri == nextUri) ||
+          (_preparedUri != null &&
+              nextUri != null &&
+              _preparedUri == nextUri) ||
           (_preparedSource == nextSource);
       if (!isAlreadyPrepared) {
         _preparedSource = nextSource;
@@ -210,8 +313,9 @@ class CrossfadePlayer {
       _crossfadeTriggeredForCurrent = false;
 
       _fadeStopwatch = Stopwatch()..start();
-      const tickDuration =
-          Duration(milliseconds: AppConstants.crossfadeTickIntervalMs);
+      const tickDuration = Duration(
+        milliseconds: AppConstants.crossfadeTickIntervalMs,
+      );
 
       _fadeTimer = Timer.periodic(tickDuration, (timer) {
         if (_fadeStopwatch == null || !_fadeStopwatch!.isRunning) return;
@@ -274,17 +378,13 @@ class CrossfadePlayer {
   }
 
   /// Directly plays a track without overlap, or with a brief graceful fade-out of the current track.
-  Future<void> playDirect(AudioSource source,
-      {bool fadeCurrentOut = false}) async {
+  Future<void> playDirect(
+    AudioSource source, {
+    bool fadeCurrentOut = false,
+  }) async {
     _cancelFadeTimer();
-    await Future.wait([
-      _playerA.stop(),
-      _playerB.stop(),
-    ]);
-    await Future.wait([
-      _playerA.setVolume(1.0),
-      _playerB.setVolume(1.0),
-    ]);
+    await Future.wait([_playerA.stop(), _playerB.stop()]);
+    await Future.wait([_playerA.setVolume(1.0), _playerB.setVolume(1.0)]);
     _fadingInPlayer = null;
     _isCrossfading = false;
     _preparedNext = false;
@@ -320,14 +420,8 @@ class CrossfadePlayer {
 
   Future<void> setAudioSource(AudioSource source) async {
     _cancelFadeTimer();
-    await Future.wait([
-      _playerA.stop(),
-      _playerB.stop(),
-    ]);
-    await Future.wait([
-      _playerA.setVolume(1.0),
-      _playerB.setVolume(1.0),
-    ]);
+    await Future.wait([_playerA.stop(), _playerB.stop()]);
+    await Future.wait([_playerA.setVolume(1.0), _playerB.setVolume(1.0)]);
     _fadingInPlayer = null;
     _isCrossfading = false;
     _preparedNext = false;
@@ -352,23 +446,14 @@ class CrossfadePlayer {
   /// Guarantees that no audio will play from either internal player instance.
   Future<void> pause() async {
     _fadeStopwatch?.stop();
-    await Future.wait([
-      _playerA.pause(),
-      _playerB.pause(),
-    ]);
+    await Future.wait([_playerA.pause(), _playerB.pause()]);
     _playingController.add(false);
   }
 
   Future<void> stop() async {
     _cancelFadeTimer();
-    await Future.wait([
-      _playerA.stop(),
-      _playerB.stop(),
-    ]);
-    await Future.wait([
-      _playerA.setVolume(1.0),
-      _playerB.setVolume(1.0),
-    ]);
+    await Future.wait([_playerA.stop(), _playerB.stop()]);
+    await Future.wait([_playerA.setVolume(1.0), _playerB.setVolume(1.0)]);
     _fadingInPlayer = null;
     _isCrossfading = false;
     _preparedNext = false;

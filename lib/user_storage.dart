@@ -7,16 +7,30 @@ class UserProfile {
   const UserProfile({
     required this.name,
     required this.age,
+    this.language = 'English',
   });
 
   final String name;
   final int age;
+  final String language;
+
+  UserProfile copyWith({
+    String? name,
+    int? age,
+    String? language,
+  }) =>
+      UserProfile(
+        name: name ?? this.name,
+        age: age ?? this.age,
+        language: language ?? this.language,
+      );
 }
 
 class UserStorage {
   static const _keyOnboardingDone = 'sonix_onboarding_done';
   static const _keyUserName = 'sonix_user_name';
   static const _keyUserAge = 'sonix_user_age';
+  static const _keyUserLanguage = 'sonix_user_language';
 
   static Future<bool> isOnboardingComplete() async {
     try {
@@ -30,11 +44,33 @@ class UserStorage {
   static Future<void> saveProfile({
     required String name,
     required int age,
+    String language = 'English',
   }) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_keyUserName, name.trim());
+    String cleanName = name.trim();
+    if (cleanName.length > AppConstants.maxFullNameLength) {
+      cleanName = cleanName.substring(0, AppConstants.maxFullNameLength);
+    }
+    await prefs.setString(_keyUserName, cleanName);
     await prefs.setInt(_keyUserAge, age);
+    await prefs.setString(_keyUserLanguage, language);
     await prefs.setBool(_keyOnboardingDone, true);
+  }
+
+  static Future<String> getLanguage() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getString(_keyUserLanguage) ?? 'English';
+    } catch (_) {
+      return 'English';
+    }
+  }
+
+  static Future<void> saveLanguage(String language) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_keyUserLanguage, language);
+    } catch (_) {}
   }
 
   static Future<UserProfile?> getProfile() async {
@@ -42,8 +78,9 @@ class UserStorage {
       final prefs = await SharedPreferences.getInstance();
       final name = prefs.getString(_keyUserName);
       final age = prefs.getInt(_keyUserAge);
+      final lang = prefs.getString(_keyUserLanguage) ?? 'English';
       if (name != null && name.isNotEmpty && age != null) {
-        return UserProfile(name: name, age: age);
+        return UserProfile(name: name, age: age, language: lang);
       }
     } catch (_) {}
     return null;
@@ -69,7 +106,9 @@ class UserStorage {
     return [];
   }
 
-  static Future<void> saveLikedSongsRaw(List<Map<String, dynamic>> songs) async {
+  static Future<void> saveLikedSongsRaw(
+    List<Map<String, dynamic>> songs,
+  ) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_keyLikedSongs, jsonEncode(songs));
   }
@@ -91,7 +130,9 @@ class UserStorage {
     return [];
   }
 
-  static Future<void> saveHistorySongsRaw(List<Map<String, dynamic>> songs) async {
+  static Future<void> saveHistorySongsRaw(
+    List<Map<String, dynamic>> songs,
+  ) async {
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString(_keyHistorySongs, jsonEncode(songs));
@@ -100,11 +141,29 @@ class UserStorage {
 
   static const _keySongQuality = 'sonix_song_quality';
   static const _keyCrossfadeSeconds = 'sonix_crossfade_seconds';
+  static const _keyThemeMode = 'sonix_theme_mode';
+
+  static Future<String> getThemeMode() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getString(_keyThemeMode) ?? AppConstants.defaultTheme;
+    } catch (_) {
+      return AppConstants.defaultTheme;
+    }
+  }
+
+  static Future<void> saveThemeMode(String mode) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_keyThemeMode, mode);
+    } catch (_) {}
+  }
 
   static Future<String> getSongQuality() async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      return prefs.getString(_keySongQuality) ?? AppConstants.defaultSongQuality;
+      return prefs.getString(_keySongQuality) ??
+          AppConstants.defaultSongQuality;
     } catch (_) {
       return AppConstants.defaultSongQuality;
     }
@@ -134,14 +193,94 @@ class UserStorage {
     } catch (_) {}
   }
 
+  static const _keyEqEnabled = 'sonix_eq_enabled';
+  static const _keyEqPreset = 'sonix_eq_preset';
+  static const _keyEqBands = 'sonix_eq_bands';
+  static const _keyEqBassBoost = 'sonix_eq_bass_boost';
+
+  static Future<bool> getEqualizerEnabled() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getBool(_keyEqEnabled) ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<void> saveEqualizerEnabled(bool enabled) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_keyEqEnabled, enabled);
+    } catch (_) {}
+  }
+
+  static Future<String> getEqualizerPreset() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getString(_keyEqPreset) ?? 'Flat';
+    } catch (_) {
+      return 'Flat';
+    }
+  }
+
+  static Future<void> saveEqualizerPreset(String preset) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_keyEqPreset, preset);
+    } catch (_) {}
+  }
+
+  static Future<List<double>> getEqualizerBands() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final str = prefs.getString(_keyEqBands);
+      if (str != null && str.isNotEmpty) {
+        final decoded = jsonDecode(str);
+        if (decoded is List) {
+          return decoded.map((e) => (e as num).toDouble()).toList();
+        }
+      }
+    } catch (_) {}
+    return [0.0, 0.0, 0.0, 0.0, 0.0];
+  }
+
+  static Future<void> saveEqualizerBands(List<double> bands) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_keyEqBands, jsonEncode(bands));
+    } catch (_) {}
+  }
+
+  static Future<double> getEqualizerBassBoost() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getDouble(_keyEqBassBoost) ?? 0.0;
+    } catch (_) {
+      return 0.0;
+    }
+  }
+
+  static Future<void> saveEqualizerBassBoost(double value) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setDouble(_keyEqBassBoost, value);
+    } catch (_) {}
+  }
+
   static Future<void> clearProfile() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_keyOnboardingDone);
     await prefs.remove(_keyUserName);
     await prefs.remove(_keyUserAge);
+    await prefs.remove(_keyUserLanguage);
     await prefs.remove(_keyLikedSongs);
     await prefs.remove(_keyHistorySongs);
     await prefs.remove(_keySongQuality);
     await prefs.remove(_keyCrossfadeSeconds);
+    await prefs.remove(_keyThemeMode);
+    await prefs.remove(_keyEqEnabled);
+    await prefs.remove(_keyEqPreset);
+    await prefs.remove(_keyEqBands);
+    await prefs.remove(_keyEqBassBoost);
   }
 }
