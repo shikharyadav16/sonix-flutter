@@ -139,6 +139,34 @@ class UserStorage {
     } catch (_) {}
   }
 
+  static const _keyOfflineSongs = 'sonix_offline_songs';
+
+  static Future<List<Map<String, dynamic>>> getOfflineSongsRaw() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final jsonStr = prefs.getString(_keyOfflineSongs);
+      if (jsonStr != null && jsonStr.isNotEmpty) {
+        final decoded = jsonDecode(jsonStr);
+        if (decoded is List) {
+          return decoded
+              .whereType<Map>()
+              .map((m) => Map<String, dynamic>.from(m))
+              .toList();
+        }
+      }
+    } catch (_) {}
+    return [];
+  }
+
+  static Future<void> saveOfflineSongsRaw(
+    List<Map<String, dynamic>> songs,
+  ) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_keyOfflineSongs, jsonEncode(songs));
+    } catch (_) {}
+  }
+
   static const _keySongQuality = 'sonix_song_quality';
   static const _keyCrossfadeSeconds = 'sonix_crossfade_seconds';
   static const _keyThemeMode = 'sonix_theme_mode';
@@ -267,6 +295,83 @@ class UserStorage {
     } catch (_) {}
   }
 
+  static const _keyRecentSearches = 'sonix_recent_searches';
+
+  static Future<List<String>> getRecentSearches() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getStringList(_keyRecentSearches) ?? [];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  static Future<void> saveRecentSearch(String query) async {
+    final clean = query.trim();
+    if (clean.isEmpty) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final list = prefs.getStringList(_keyRecentSearches) ?? [];
+      list.removeWhere((item) => item.toLowerCase() == clean.toLowerCase());
+      list.insert(0, clean);
+      if (list.length > 15) {
+        list.removeRange(15, list.length);
+      }
+      await prefs.setStringList(_keyRecentSearches, list);
+    } catch (_) {}
+  }
+
+  static Future<void> removeRecentSearch(String query) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final list = prefs.getStringList(_keyRecentSearches) ?? [];
+      list.removeWhere((item) => item.toLowerCase() == query.trim().toLowerCase());
+      await prefs.setStringList(_keyRecentSearches, list);
+    } catch (_) {}
+  }
+
+  static Future<void> clearRecentSearches() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove(_keyRecentSearches);
+    } catch (_) {}
+  }
+
+  static const _keyRepeatMode = 'sonix_repeat_mode';
+  static const _keyShuffle = 'sonix_shuffle';
+
+  static Future<String> getRepeatMode() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getString(_keyRepeatMode) ?? 'off';
+    } catch (_) {
+      return 'off';
+    }
+  }
+
+  static Future<void> saveRepeatMode(String mode) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_keyRepeatMode, mode);
+    } catch (_) {}
+  }
+
+  static Future<bool> getShuffle() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getBool(_keyShuffle) ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<void> saveShuffle(bool shuffle) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_keyShuffle, shuffle);
+    } catch (_) {}
+  }
+
   static Future<void> clearProfile() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_keyOnboardingDone);
@@ -275,6 +380,8 @@ class UserStorage {
     await prefs.remove(_keyUserLanguage);
     await prefs.remove(_keyLikedSongs);
     await prefs.remove(_keyHistorySongs);
+    await prefs.remove(_keyOfflineSongs);
+    await prefs.remove(_keyRecentSearches);
     await prefs.remove(_keySongQuality);
     await prefs.remove(_keyCrossfadeSeconds);
     await prefs.remove(_keyThemeMode);
@@ -282,5 +389,7 @@ class UserStorage {
     await prefs.remove(_keyEqPreset);
     await prefs.remove(_keyEqBands);
     await prefs.remove(_keyEqBassBoost);
+    await prefs.remove(_keyRepeatMode);
+    await prefs.remove(_keyShuffle);
   }
 }

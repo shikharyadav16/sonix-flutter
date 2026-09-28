@@ -257,6 +257,16 @@ class CrossfadePlayer {
     }
   }
 
+  /// Clears any pre-buffered track on the inactive player.
+  void clearPrepared() {
+    _preparedSource = null;
+    _preparedUri = null;
+    _preparedNext = false;
+    if (!_isCrossfading) {
+      unawaited(_inactivePlayer.stop());
+    }
+  }
+
   /// Starts an equal-power crossfade transition into the next track.
   /// Both tracks overlap while outgoing fades out (1.0 -> 0.0)
   /// and incoming fades in (0.0 -> 1.0).

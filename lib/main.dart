@@ -1,11 +1,15 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
+import 'package:file_picker/file_picker.dart';
 import 'package:dart_des/dart_des.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
+import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:http/http.dart' as http;
 import 'package:just_audio/just_audio.dart';
@@ -22,6 +26,9 @@ import 'user_storage.dart';
 
 /// Two distinct playback modes.
 enum PlaybackMode { suggestions, playlist }
+
+/// Repeat playback modes for track queues.
+enum PlaybackRepeatMode { off, all, one }
 
 const _fallbackArt = AppConstants.fallbackArtworkUrl;
 const _ink = AppConstants.colorInk;
@@ -79,6 +86,76 @@ String decodeHtmlEntities(String? input) {
 String upgradeArtwork(String? url) {
   if (url == null || url.isEmpty) return '';
   return url.replaceAll(RegExp(r'\d+x\d+'), '500x500');
+}
+
+/// Runs on a dedicated background isolate — zero impact on the Flutter UI thread!
+List<String> _scanMusicDirectoriesInBackground(List<String> knownPaths) {
+  final knownSet = knownPaths.toSet();
+  final allowedExts = {
+    '.mp3',
+    '.m4a',
+    '.aac',
+    '.flac',
+    '.wav',
+    '.ogg',
+    '.wma',
+  };
+  final found = <String>[];
+
+  final targetDirNames = ['Music', 'Download', 'Podcasts', 'Audiobooks', 'Recordings'];
+  final candidateRoots = [
+    '/storage/emulated/0',
+    '/sdcard',
+  ];
+
+  final dirsToScan = <Directory>[];
+  for (final root in candidateRoots) {
+    for (final name in targetDirNames) {
+      final d = Directory('$root/$name');
+      try {
+        if (d.existsSync()) {
+          dirsToScan.add(d);
+        }
+      } catch (_) {}
+    }
+  }
+
+  int dirsProcessed = 0;
+  const maxDirs = 60;
+
+  while (dirsToScan.isNotEmpty && dirsProcessed < maxDirs) {
+    final dir = dirsToScan.removeAt(0);
+    dirsProcessed++;
+
+    try {
+      final entities = dir.listSync(followLinks: false);
+      for (final entity in entities) {
+        final path = entity.path;
+        final lower = path.toLowerCase();
+        if (lower.contains('whatsapp') ||
+            lower.contains('com.whatsapp') ||
+            lower.endsWith('.opus')) {
+          continue;
+        }
+
+        if (entity is File) {
+          if (allowedExts.any((ext) => lower.endsWith(ext))) {
+            if (!knownSet.contains(path)) {
+              knownSet.add(path);
+              found.add(path);
+            }
+          }
+        } else if (entity is Directory) {
+          final dirName = path.split(Platform.pathSeparator).last;
+          if (!dirName.startsWith('.') && dirName.toLowerCase() != 'android') {
+            dirsToScan.add(entity);
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
+  return found;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -438,6 +515,29 @@ class Album {
   );
 }
 
+class SearchSuggestion {
+  const SearchSuggestion({
+    required this.id,
+    required this.type,
+    required this.title,
+    required this.subtitle,
+    required this.image,
+    this.permaUrl = '',
+  });
+
+  final String id;
+  final String type; // 'song', 'artist', 'album', 'playlist'
+  final String title;
+  final String subtitle;
+  final String image;
+  final String permaUrl;
+
+  bool get isSong => type == 'song';
+  bool get isArtist => type == 'artist';
+  bool get isAlbum => type == 'album';
+  bool get isPlaylist => type == 'playlist';
+}
+
 /* -------------------------------------------------------------------------- */
 /*                                    API                                     */
 /* -------------------------------------------------------------------------- */
@@ -529,6 +629,82 @@ class Api {
         .whereType<Map>()
         .map((item) => Playlist.fromJson(Map<String, dynamic>.from(item)))
         .toList();
+  }
+
+  /// Autocomplete live search suggestions across songs, artists, albums, and playlists.
+  static Future<List<SearchSuggestion>> getSuggestions(String query, {int limit = 16}) async {
+    final q = query.trim();
+    if (q.isEmpty) return [];
+
+    try {
+      final uri = Uri.parse(AppConstants.saavnApiBaseUrl).replace(queryParameters: {
+        '__call': 'autocomplete.get',
+        'query': q,
+        '_format': 'json',
+        '_marker': '0',
+        'api_version': '4',
+        'ctx': 'web6dot0',
+      });
+      final response = await http.get(uri, headers: AppConstants.saavnHeaders);
+      if (response.statusCode >= 400) return [];
+
+      final dynamic decoded = jsonDecode(response.body);
+      if (decoded is! Map) return [];
+
+      const buckets = ['topquery', 'songs', 'artists', 'albums', 'playlists'];
+      final out = <SearchSuggestion>[];
+      final seen = <String>{};
+
+      String normaliseSuggestType(dynamic t, String fallback) {
+        final s = (t?.toString() ?? fallback).toLowerCase();
+        if (s.startsWith('song') || s.startsWith('track')) return 'song';
+        if (s.startsWith('album')) return 'album';
+        if (s.startsWith('artist') || s.startsWith('singer')) return 'artist';
+        if (s.startsWith('playlist')) return 'playlist';
+        return fallback.startsWith('song') ? 'song' : fallback;
+      }
+
+      for (final bucket in buckets) {
+        final bData = decoded[bucket];
+        if (bData is! Map) continue;
+        final rows = bData['data'];
+        if (rows is! List) continue;
+
+        for (final item in rows) {
+          if (item is! Map) continue;
+          final id = item['id']?.toString() ?? '';
+          if (id.isEmpty) continue;
+
+          final type = normaliseSuggestType(item['type'], bucket);
+          final key = '$type:$id';
+          if (seen.contains(key)) continue;
+          seen.add(key);
+
+          final rawTitle = item['title']?.toString() ?? item['name']?.toString() ?? '';
+          final rawSubtitle = item['subtitle']?.toString() ??
+              item['description']?.toString() ??
+              item['extra']?.toString() ??
+              '';
+          final rawImage = item['image']?.toString() ?? item['artwork']?.toString() ?? '';
+
+          out.add(
+            SearchSuggestion(
+              id: id,
+              type: type,
+              title: decodeHtmlEntities(rawTitle),
+              subtitle: decodeHtmlEntities(rawSubtitle),
+              image: upgradeArtwork(rawImage),
+              permaUrl: item['perma_url']?.toString() ?? item['url']?.toString() ?? '',
+            ),
+          );
+          if (out.length >= limit) break;
+        }
+        if (out.length >= limit) break;
+      }
+      return out;
+    } catch (_) {
+      return [];
+    }
   }
 
   /// Fetch full song details and decrypted streams directly from JioSaavn.
@@ -2053,6 +2229,12 @@ class SonixHome extends StatefulWidget {
 class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
   UserProfile? _userProfile;
   final _search = TextEditingController();
+  final _searchFocusNode = FocusNode();
+  List<SearchSuggestion> _searchSuggestions = [];
+  bool _loadingSuggestions = false;
+  Timer? _searchDebounceTimer;
+  bool _fullSearchSubmitted = false;
+  List<String> _recentSearches = [];
   late final CrossfadePlayer _audio;
   late final AnimationController _gradientAnim;
   late final AnimationController _queueAnim;
@@ -2068,6 +2250,9 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
 
   // ---- Queue / playback mode state ----
   PlaybackMode _playbackMode = PlaybackMode.suggestions;
+  PlaybackRepeatMode _repeatMode = PlaybackRepeatMode.off;
+  bool _isShuffle = false;
+  List<Song> _unshuffledPlaylist = [];
   List<Song> _suggestionQueue = [];   // holds 15 suggestions at a time
   List<Song> _playlistQueue = [];     // all songs for playlist repeat
   int _playlistQueueIndex = -1;       // current index inside _playlistQueue
@@ -2077,6 +2262,9 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
 
   Map<String, Song> _likedSongs = {};
   bool _viewingLikedSongs = false;
+  List<Song> _offlineSongs = [];
+  bool _viewingOfflineSongs = false;
+  bool _isScanningOffline = false;
   String _songQuality = '320kbps';
   String _themeMode = AppConstants.defaultTheme;
   String _musicLanguage = 'English';
@@ -2088,6 +2276,8 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
   double _eqBassBoost = 0.0;
   late final PageController _speedDialPageCtrl;
   int _speedDialPage = 0;
+  late final PageController _fullScreenPageCtrl;
+  double _fsVerticalDragDist = 0.0;
 
   bool get _isHindi => _musicLanguage.toLowerCase() == 'hindi';
   List<Song> get _effectiveSpeedDialSongs =>
@@ -2104,21 +2294,24 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
       _isHindi ? _hindiFeaturedPlaylists : _featuredPlaylists;
 
   bool get _isLight => Theme.of(context).brightness == Brightness.light;
-  Color get _bg => _isLight ? AppConstants.colorLightBackground : _ink;
-  Color get _cardBg => _isLight ? AppConstants.colorLightSurface : _surface;
+  Color get _bg =>
+      _isLight ? AppConstants.colorLightBackground : AppConstants.colorInk;
+  Color get _cardBg =>
+      _isLight ? AppConstants.colorLightSurface : AppConstants.colorSurface;
   Color get _sheetBg =>
-      _isLight ? AppConstants.colorLightSurface : const Color(0xff16161b);
+      _isLight ? AppConstants.colorSheetLight : AppConstants.colorSheetDark;
   Color get _headerBg =>
-      _isLight ? AppConstants.colorLightSurface : const Color(0xee080808);
-  Color get _textColor => _isLight ? const Color(0xff0f172a) : Colors.white;
-  Color get _subtextColor => _isLight ? const Color(0xff64748b) : _muted;
+      _isLight ? AppConstants.colorHeaderLight : AppConstants.colorHeaderDark;
+  Color get _textColor =>
+      _isLight ? AppConstants.colorTextLight : AppConstants.colorTextDark;
+  Color get _subtextColor =>
+      _isLight ? AppConstants.colorSubtextLight : AppConstants.colorSubtextDark;
   Color get _borderColor =>
-      _isLight ? const Color(0x18000000) : const Color(0x18ffffff);
+      _isLight ? AppConstants.colorBorderLight : AppConstants.colorBorderDark;
   Color get _dividerColor =>
-      _isLight ? const Color(0x12000000) : Colors.white12;
-  Color get _inputFill => _isLight
-      ? const Color(0xfff1f3f5)
-      : Colors.white.withValues(alpha: .06);
+      _isLight ? AppConstants.colorDividerLight : AppConstants.colorDividerDark;
+  Color get _inputFill =>
+      _isLight ? AppConstants.colorInputFillLight : AppConstants.colorInputFillDark;
 
   Playlist? _openedPlaylist;
   bool _loadingPlaylist = false;
@@ -2183,6 +2376,8 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
       });
     }
     _loadLikedSongs();
+    _loadOfflineSongs();
+    _loadRecentSearches();
     _loadHistory();
     _loadEqualizer();
     UserStorage.getSongQuality().then((q) {
@@ -2190,6 +2385,25 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
     });
     UserStorage.getThemeMode().then((m) {
       if (mounted) setState(() => _themeMode = m);
+    });
+    UserStorage.getRepeatMode().then((modeStr) {
+      if (!mounted) return;
+      setState(() {
+        switch (modeStr) {
+          case 'all':
+            _repeatMode = PlaybackRepeatMode.all;
+            break;
+          case 'one':
+            _repeatMode = PlaybackRepeatMode.one;
+            break;
+          default:
+            _repeatMode = PlaybackRepeatMode.off;
+            break;
+        }
+      });
+    });
+    UserStorage.getShuffle().then((shuffled) {
+      if (mounted) setState(() => _isShuffle = shuffled);
     });
     _gradientAnim = AnimationController(
       vsync: this,
@@ -2201,7 +2415,9 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
       duration: const Duration(milliseconds: 320),
     );
     _speedDialPageCtrl = PageController();
+    _fullScreenPageCtrl = PageController();
     _search.addListener(_onSearchChanged);
+    _searchFocusNode.addListener(_onSearchFocusChanged);
     _playingSub = _audio.playingStream.listen((isPlaying) {
       if (isPlaying) {
         if (!_historyAddedForCurrent && _current != null) {
@@ -2240,8 +2456,74 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
     });
   }
 
+  void _onSearchFocusChanged() {
+    if (_searchFocusNode.hasFocus && _homeMode) {
+      setState(() {
+        _homeMode = false;
+        _fullSearchSubmitted = false;
+      });
+    }
+  }
+
+  Future<void> _loadRecentSearches() async {
+    final list = await UserStorage.getRecentSearches();
+    if (mounted) setState(() => _recentSearches = list);
+  }
+
   void _onSearchChanged() {
-    if (mounted) setState(() {});
+    final query = _search.text.trim();
+    if (query.isEmpty) {
+      _searchDebounceTimer?.cancel();
+      if (mounted) {
+        setState(() {
+          _searchSuggestions = [];
+          _loadingSuggestions = false;
+          _fullSearchSubmitted = false;
+        });
+      }
+      return;
+    }
+
+    if (_homeMode) {
+      setState(() {
+        _homeMode = false;
+        _fullSearchSubmitted = false;
+      });
+    } else if (_fullSearchSubmitted) {
+      setState(() => _fullSearchSubmitted = false);
+    }
+
+    _searchDebounceTimer?.cancel();
+    _searchDebounceTimer = Timer(const Duration(milliseconds: 250), () {
+      _fetchSearchSuggestions(query);
+    });
+  }
+
+  Future<void> _fetchSearchSuggestions(String query) async {
+    if (!mounted || query.isEmpty) return;
+    setState(() => _loadingSuggestions = true);
+    final suggestions = await Api.getSuggestions(query, limit: 16);
+    if (!mounted || _search.text.trim() != query) return;
+    setState(() {
+      _searchSuggestions = suggestions;
+      _loadingSuggestions = false;
+    });
+  }
+
+  void _exitSearch() {
+    _search.clear();
+    _searchFocusNode.unfocus();
+    _searchDebounceTimer?.cancel();
+    setState(() {
+      _homeMode = true;
+      _fullSearchSubmitted = false;
+      _searchSuggestions = [];
+      _loadingSuggestions = false;
+      _artistResults = [];
+      _results = [];
+      _albumResults = [];
+      _playlistResults = [];
+    });
   }
 
   @override
@@ -2250,7 +2532,11 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
     _gradientAnim.dispose();
     _queueAnim.dispose();
     _speedDialPageCtrl.dispose();
+    _fullScreenPageCtrl.dispose();
+    _searchDebounceTimer?.cancel();
     _search.removeListener(_onSearchChanged);
+    _searchFocusNode.removeListener(_onSearchFocusChanged);
+    _searchFocusNode.dispose();
     _playingSub?.cancel();
     _processingStateSub?.cancel();
     _historyPositionSub?.cancel();
@@ -2264,20 +2550,24 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
   Future<void> _runSearch(String value) async {
     final query = value.trim();
     if (query.isEmpty) {
-      setState(() {
-        _homeMode = true;
-        _artistResults = [];
-        _results = [];
-        _albumResults = [];
-        _playlistResults = [];
-      });
+      _exitSearch();
       return;
     }
+    _searchFocusNode.unfocus();
+    _searchDebounceTimer?.cancel();
+
+    // Persist to recent searches
+    await UserStorage.saveRecentSearch(query);
+    unawaited(_loadRecentSearches());
+
     setState(() {
       _searching = true;
       _homeMode = false;
+      _fullSearchSubmitted = true;
+      _searchSuggestions = [];
       _openedPlaylist = null;
       _viewingLikedSongs = false;
+      _viewingOfflineSongs = false;
     });
     try {
       // Fetch artists, songs, albums, and playlists in parallel
@@ -2309,10 +2599,66 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
     }
   }
 
+  Future<void> _playSuggestionSong(SearchSuggestion suggestion) async {
+    final song = Song(
+      id: suggestion.id,
+      title: suggestion.title,
+      artist: suggestion.subtitle.isNotEmpty ? suggestion.subtitle : 'Artist',
+      album: 'JioSaavn',
+      artwork: suggestion.image,
+    );
+    await _playSongForSuggestionMode(song);
+  }
+
+  Future<void> _openAlbumById(String id, [String? title, String? artwork]) async {
+    await _openPlaylist(Playlist(
+      id: id,
+      title: title ?? 'Album',
+      artwork: artwork ?? '',
+      type: 'ALBUM',
+    ));
+  }
+
+  Future<void> _openArtistById(String id, [String? name, String? image]) async {
+    await _openPlaylist(Playlist(
+      id: id,
+      title: name ?? 'Artist',
+      artwork: image ?? '',
+      type: 'ARTIST',
+    ));
+  }
+
+  Future<void> _openPlaylistById(String id, [String? title, String? artwork]) async {
+    await _openPlaylist(Playlist(
+      id: id,
+      title: title ?? 'Playlist',
+      artwork: artwork ?? '',
+      type: 'PLAYLIST',
+    ));
+  }
+
+  Future<void> _onSuggestionTapped(SearchSuggestion suggestion) async {
+    await UserStorage.saveRecentSearch(suggestion.title);
+    unawaited(_loadRecentSearches());
+
+    if (suggestion.isSong) {
+      await _playSuggestionSong(suggestion);
+    } else if (suggestion.isAlbum) {
+      await _openAlbumById(suggestion.id, suggestion.title, suggestion.image);
+    } else if (suggestion.isArtist) {
+      await _openArtistById(suggestion.id, suggestion.title, suggestion.image);
+    } else if (suggestion.isPlaylist) {
+      await _openPlaylistById(suggestion.id, suggestion.title, suggestion.image);
+    } else {
+      _runSearch(suggestion.title);
+    }
+  }
+
   Future<void> _openPlaylist(Playlist playlist) async {
     setState(() {
       _openedPlaylist = playlist;
       _viewingLikedSongs = false;
+      _viewingOfflineSongs = false;
       _loadingPlaylist = playlist.songs.isEmpty;
     });
 
@@ -2340,12 +2686,27 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
 
   /* ------------------------------ PLAYBACK ------------------------------- */
 
-  AudioSource _sourceForSong(Song song, String stream) =>
-      AudioSource.uri(Uri.parse(stream), tag: song.id);
-
+  AudioSource _sourceForSong(Song song, String stream) {
+    if (stream.startsWith('/') ||
+        stream.startsWith('file:') ||
+        (stream.length > 2 && stream[1] == ':')) {
+      final cleanPath = stream.startsWith('file://')
+          ? Uri.parse(stream).toFilePath()
+          : stream;
+      return AudioSource.file(cleanPath, tag: song.id);
+    }
+    return AudioSource.uri(Uri.parse(stream), tag: song.id);
+  }
 
   /// Resolve a song's stream URL and full metadata via the API.
   Future<(Song, String?)?> _resolveSong(Song song) async {
+    if (song.id.startsWith('offline_') ||
+        (song.streamUrl != null &&
+            (song.streamUrl!.startsWith('/') ||
+                song.streamUrl!.startsWith('file:') ||
+                (song.streamUrl!.length > 2 && song.streamUrl![1] == ':')))) {
+      return (song, song.streamUrl);
+    }
     Map<String, dynamic>? details;
     try {
       details = await Api.details(song.id);
@@ -2490,14 +2851,22 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
         });
       }
 
-      // Fetch lyrics in background.
-      final lyricData = await Api.lyrics(resolved);
-      if (!mounted || request != _playRequest) return;
-      setState(() {
-        _lyrics = lyricData;
-        _parsedLyrics = parseLyrics(lyricData?['syncedLyrics'] as String?);
-        _isLoadingLyrics = false;
-      });
+      // Fetch lyrics in background (online tracks only).
+      if (!resolved.id.startsWith('offline_')) {
+        final lyricData = await Api.lyrics(resolved);
+        if (!mounted || request != _playRequest) return;
+        setState(() {
+          _lyrics = lyricData;
+          _parsedLyrics = parseLyrics(lyricData?['syncedLyrics'] as String?);
+          _isLoadingLyrics = false;
+        });
+      } else {
+        setState(() {
+          _lyrics = null;
+          _parsedLyrics = [];
+          _isLoadingLyrics = false;
+        });
+      }
     } catch (_) {
       audioHandler.setLoading(false);
       if (mounted && request == _playRequest) {
@@ -2535,6 +2904,9 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
 
   /// Fetch exactly 15 suggestions. Replaces the suggestion queue entirely.
   Future<void> _fetchSuggestions(String songId) async {
+    if (_playbackMode == PlaybackMode.playlist || songId.startsWith('offline_')) {
+      return;
+    }
     if (_isFetchingSuggestions) return;
     _isFetchingSuggestions = true;
     try {
@@ -2557,17 +2929,32 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
 
   /// Called when user presses Play All / Shuffle on a playlist or liked songs.
   /// Clears suggestion queue, loads all playlist songs, plays first, repeats.
-  Future<void> _playPlaylist(List<Song> songs) async {
-    if (songs.isEmpty) return;
+  Future<void> _playPlaylist(List<Song> songs) => _playPlaylistSong(songs, 0);
+
+  /// Plays a playlist starting at a specific song index in playlist repeat mode.
+  Future<void> _playPlaylistSong(List<Song> songs, int startIndex) async {
+    if (songs.isEmpty || startIndex < 0 || startIndex >= songs.length) return;
 
     setState(() {
       _playbackMode = PlaybackMode.playlist;
       _suggestionQueue = [];
-      _playlistQueue = [...songs];
-      _playlistQueueIndex = 0;
+      _unshuffledPlaylist = List<Song>.from(songs);
+      if (_isShuffle && songs.length > 2) {
+        final startSong = songs[startIndex];
+        final remaining = <Song>[];
+        for (int i = 0; i < songs.length; i++) {
+          if (i != startIndex) remaining.add(songs[i]);
+        }
+        remaining.shuffle();
+        _playlistQueue = [startSong, ...remaining];
+        _playlistQueueIndex = 0;
+      } else {
+        _playlistQueue = [...songs];
+        _playlistQueueIndex = startIndex;
+      }
     });
 
-    await _play(songs.first);
+    await _play(songs[startIndex]);
   }
 
   /* -------------------- Song completion / auto-advance ------------------- */
@@ -2577,6 +2964,14 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
     if (_isLoadingTrack || _current == null) return;
     // If an active crossfade is currently transitioning, skip auto-advance.
     if (_audio.isCrossfading) return;
+    if (_repeatMode == PlaybackRepeatMode.one) {
+      _audio.seek(Duration.zero);
+      _audio.play();
+      _songPlayStopwatch.reset();
+      _historyAddedForCurrent = false;
+      if (mounted) setState(() {});
+      return;
+    }
     _next();
   }
 
@@ -2591,8 +2986,18 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
 
   void _advancePlaylist() {
     if (_playlistQueue.isEmpty) return;
-    _playlistQueueIndex = (_playlistQueueIndex + 1) % _playlistQueue.length;
-    _play(_playlistQueue[_playlistQueueIndex]);
+    final nextIdx = _playlistQueueIndex + 1;
+    if (nextIdx < _playlistQueue.length) {
+      _playlistQueueIndex = nextIdx;
+      _play(_playlistQueue[_playlistQueueIndex]);
+    } else if (_repeatMode == PlaybackRepeatMode.all) {
+      _playlistQueueIndex = 0;
+      _play(_playlistQueue[_playlistQueueIndex]);
+    } else {
+      _audio.pause();
+      _audio.seek(Duration.zero);
+      if (mounted) setState(() {});
+    }
   }
 
   void _advanceSuggestionQueue() {
@@ -2624,6 +3029,7 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
 
   /// Called ~13s before song ends (prefetch window: 8s before crossfade starts).
   void _onPrepareNextTrack() {
+    if (_repeatMode == PlaybackRepeatMode.one) return;
     final nextSong = _peekNextSong();
     if (nextSong == null) return;
 
@@ -2640,6 +3046,7 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
 
   /// Called when 5 seconds remain — start the 5s crossfade transition.
   void _onCrossfadeTriggered() {
+    if (_repeatMode == PlaybackRepeatMode.one) return;
     if (_audio.isCrossfading || _isLoadingTrack) return;
     final nextSong = _peekNextSong();
     if (nextSong == null) return;
@@ -2715,13 +3122,20 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
 
   /// Peek at the next song WITHOUT removing it from the queue.
   Song? _peekNextSong() {
+    if (_repeatMode == PlaybackRepeatMode.one) return null;
     if (_playbackHistoryIndex < _playbackHistory.length - 1) {
       return _playbackHistory[_playbackHistoryIndex + 1];
     }
     if (_playbackMode == PlaybackMode.playlist) {
       if (_playlistQueue.isEmpty) return null;
-      final nextIdx = (_playlistQueueIndex + 1) % _playlistQueue.length;
-      return _playlistQueue[nextIdx];
+      final nextIdx = _playlistQueueIndex + 1;
+      if (nextIdx < _playlistQueue.length) {
+        return _playlistQueue[nextIdx];
+      } else if (_repeatMode == PlaybackRepeatMode.all) {
+        return _playlistQueue.first;
+      } else {
+        return null;
+      }
     } else {
       return _suggestionQueue.isNotEmpty ? _suggestionQueue.first : null;
     }
@@ -2736,7 +3150,12 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
     }
     if (_playbackMode == PlaybackMode.playlist) {
       if (_playlistQueue.isEmpty) return;
-      _playlistQueueIndex = (_playlistQueueIndex + 1) % _playlistQueue.length;
+      final nextIdx = _playlistQueueIndex + 1;
+      if (nextIdx < _playlistQueue.length) {
+        _playlistQueueIndex = nextIdx;
+      } else if (_repeatMode == PlaybackRepeatMode.all) {
+        _playlistQueueIndex = 0;
+      }
     } else {
       if (_suggestionQueue.isNotEmpty) {
         final consumed = _suggestionQueue.removeAt(0);
@@ -2801,13 +3220,14 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
       }
     }
 
-    if (songToPlay == null &&
-        _playbackMode == PlaybackMode.playlist &&
+    if (_playbackMode == PlaybackMode.playlist &&
         _playlistQueue.isNotEmpty) {
       _playlistQueueIndex =
           (_playlistQueueIndex - 1 + _playlistQueue.length) %
               _playlistQueue.length;
       songToPlay = _playlistQueue[_playlistQueueIndex];
+      _play(songToPlay, isHistoryNavigation: true);
+      return;
     }
 
     if (songToPlay == null) return;
@@ -2955,8 +3375,18 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
         : song.artwork.trim();
     return _paletteFutures.putIfAbsent(key, () async {
       try {
+        final ImageProvider imageProvider;
+        if (key.startsWith('/') ||
+            key.startsWith('file:') ||
+            (key.length > 2 && key[1] == ':')) {
+          final clean =
+              key.startsWith('file://') ? Uri.parse(key).toFilePath() : key;
+          imageProvider = FileImage(File(clean));
+        } else {
+          imageProvider = NetworkImage(key);
+        }
         final palette = await PaletteGenerator.fromImageProvider(
-          NetworkImage(key),
+          imageProvider,
           maximumColorCount: 12,
         );
         final colors = <Color>[
@@ -3005,15 +3435,31 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
   @override
   Widget build(BuildContext context) {
     return PopScope(
-      canPop: !_fullScreen && _openedPlaylist == null && !_viewingLikedSongs,
+      canPop: !_fullScreen &&
+          _openedPlaylist == null &&
+          !_viewingLikedSongs &&
+          !_viewingOfflineSongs &&
+          _homeMode,
       onPopInvokedWithResult: (didPop, _) {
         if (!didPop) {
           if (_fullScreen) {
+            if (_queueAnim.value > 0.05) {
+              _queueAnim.animateTo(0.0, curve: Curves.easeOutCubic);
+              return;
+            }
             setState(() => _fullScreen = false);
           } else if (_openedPlaylist != null) {
             setState(() => _openedPlaylist = null);
           } else if (_viewingLikedSongs) {
             setState(() => _viewingLikedSongs = false);
+          } else if (_viewingOfflineSongs) {
+            setState(() => _viewingOfflineSongs = false);
+          } else if (!_homeMode) {
+            if (_fullSearchSubmitted && _search.text.trim().isNotEmpty) {
+              setState(() => _fullSearchSubmitted = false);
+            } else {
+              _exitSearch();
+            }
           }
         }
       },
@@ -3028,6 +3474,8 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                     _playlistHeader()
                   else if (_viewingLikedSongs)
                     _likedSongsHeader()
+                  else if (_viewingOfflineSongs)
+                    _offlineSongsHeader()
                   else
                     _header(),
                   Expanded(
@@ -3035,7 +3483,13 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                         ? _playlistView()
                         : (_viewingLikedSongs
                               ? _likedSongsView()
-                              : (_homeMode ? _home() : _searchResults())),
+                              : (_viewingOfflineSongs
+                                    ? _offlineSongsView()
+                                    : (_homeMode
+                                          ? _home()
+                                          : (_fullSearchSubmitted
+                                                ? _searchResults()
+                                                : _searchSuggestionsPage())))),
                   ),
                   if (_current != null) _playerBar(),
                 ],
@@ -3070,6 +3524,11 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
       _fullScreenLyrics = false;
       _fullScreen = true;
     });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_fullScreenPageCtrl.hasClients) {
+        _fullScreenPageCtrl.jumpToPage(0);
+      }
+    });
   }
 
   /* -------------------------------- HEADER ------------------------------- */
@@ -3083,187 +3542,198 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
     child: Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        GestureDetector(
-          onTap: () {
-            _search.clear();
-            setState(() {
-              _homeMode = true;
-              _openedPlaylist = null;
-              _viewingLikedSongs = false;
-              _artistResults = [];
-              _results = [];
-              _albumResults = [];
-              _playlistResults = [];
-            });
-          },
-          child: Row(
-            children: [
-              Container(
-                width: 38,
-                height: 38,
-                decoration: BoxDecoration(
-                  color: _isLight
-                      ? const Color(0xfff1f3f5)
-                      : Colors.white.withValues(alpha: .1),
-                  borderRadius: BorderRadius.circular(9),
-                ),
-                child: Icon(
-                  PhosphorIconsRegular.musicNote,
-                  color: _textColor,
-                ),
-              ),
-              const SizedBox(width: 10),
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  if (_userProfile != null && _userProfile!.name.isNotEmpty)
-                    Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Text(
-                          'Hello, ',
-                          style: TextStyle(
-                            fontSize: 18,
-                            fontWeight: FontWeight.w900,
-                            color: _textColor,
-                            fontFamily: GoogleFonts.manrope().fontFamily,
-                          ),
-                        ),
-                        ShaderMask(
-                          shaderCallback: (bounds) => const LinearGradient(
-                            colors: AppConstants.userNameGradientColors,
-                          ).createShader(
-                            Rect.fromLTWH(0, 0, bounds.width, bounds.height),
-                          ),
-                          blendMode: BlendMode.srcIn,
-                          child: Text(
-                            () {
-                              final first = _userProfile!.name
-                                  .trim()
-                                  .split(RegExp(r'\s+'))
-                                  .first;
-                              if (first.length >
-                                  AppConstants.maxFirstNameLength) {
-                                return first.substring(
-                                  0,
-                                  AppConstants.maxFirstNameLength,
-                                );
-                              }
-                              return first;
-                            }(),
-                            style: TextStyle(
-                              fontSize: 18,
-                              fontWeight: FontWeight.w900,
-                              fontFamily: GoogleFonts.manrope().fontFamily,
-                            ),
-                          ),
-                        ),
-                      ],
-                    )
-                  else
-                    ShaderMask(
-                      shaderCallback: (bounds) => const LinearGradient(
-                        colors: AppConstants.userNameGradientColors,
-                      ).createShader(
-                        Rect.fromLTWH(0, 0, bounds.width, bounds.height),
-                      ),
-                      blendMode: BlendMode.srcIn,
-                      child: Text(
-                        'Sonix',
-                        style: TextStyle(
-                          fontSize: 18,
-                          fontWeight: FontWeight.w800,
-                          fontFamily: GoogleFonts.manrope().fontFamily,
-                        ),
-                      ),
-                    ),
-                  Text(
-                    _userProfile != null && _userProfile!.name.isNotEmpty
-                        ? 'ENJOY YOUR MUSIC'
-                        : 'SONG PLAYER',
-                    style: TextStyle(
-                      fontSize: 9,
-                      color: _subtextColor,
-                      letterSpacing: 1.2,
-                      fontWeight: FontWeight.w600,
-                      fontFamily: GoogleFonts.manrope().fontFamily,
-                    ),
-                  ),
-                ],
-              ),
-              const Spacer(),
-              GestureDetector(
-                onTap: _openEqualizerSheet,
-                child: Container(
+        if (_homeMode) ...[
+          GestureDetector(
+            onTap: () {
+              _search.clear();
+              setState(() {
+                _homeMode = true;
+                _openedPlaylist = null;
+                _viewingLikedSongs = false;
+                _viewingOfflineSongs = false;
+                _artistResults = [];
+                _results = [];
+                _albumResults = [];
+                _playlistResults = [];
+              });
+            },
+            child: Row(
+              children: [
+                Container(
                   width: 38,
                   height: 38,
-                  margin: const EdgeInsets.only(right: 10),
                   decoration: BoxDecoration(
                     color: _isLight
                         ? const Color(0xfff1f3f5)
-                        : Colors.white.withValues(alpha: .12),
-                    shape: BoxShape.circle,
+                        : Colors.white.withValues(alpha: .1),
+                    borderRadius: BorderRadius.circular(9),
                   ),
-                  child: Stack(
-                    alignment: Alignment.center,
-                    children: [
-                      Icon(
-                        PhosphorIconsRegular.slidersHorizontal,
-                        size: 20,
-                        color:
-                            _eqEnabled ? const Color(0xff3B82F6) : _textColor,
-                      ),
-                      if (_eqEnabled)
-                        Positioned(
-                          top: 7,
-                          right: 7,
-                          child: Container(
-                            width: 6,
-                            height: 6,
-                            decoration: const BoxDecoration(
-                              color: Color(0xff3B82F6),
-                              shape: BoxShape.circle,
-                            ),
-                          ),
-                        ),
-                    ],
+                  child: Icon(
+                    PhosphorIconsRegular.musicNote,
+                    color: _textColor,
                   ),
                 ),
-              ),
-              GestureDetector(
-                onTap: _openUserMenu,
-                child: CustomPaint(
-                  foregroundPainter: const _GradientCircleBorderPainter(
-                    gradient: LinearGradient(
-                      colors: AppConstants.userNameGradientColors,
+                const SizedBox(width: 10),
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    if (_userProfile != null && _userProfile!.name.isNotEmpty)
+                      Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            'Hello, ',
+                            style: GoogleFonts.manrope(
+                              fontSize: 19.5,
+                              fontWeight: FontWeight.w900,
+                              color: _textColor,
+                              letterSpacing: -0.4,
+                            ),
+                          ),
+                          ShaderMask(
+                            shaderCallback: (bounds) => const LinearGradient(
+                              colors: AppConstants.userNameGradientColors,
+                            ).createShader(
+                              Rect.fromLTWH(0, 0, bounds.width, bounds.height),
+                            ),
+                            blendMode: BlendMode.srcIn,
+                            child: Text(
+                              () {
+                                final first = _userProfile!.name
+                                    .trim()
+                                    .split(RegExp(r'\s+'))
+                                    .first;
+                                if (first.length >
+                                    AppConstants.maxFirstNameLength) {
+                                  return first.substring(
+                                    0,
+                                    AppConstants.maxFirstNameLength,
+                                  );
+                                }
+                                return first;
+                              }(),
+                              style: GoogleFonts.manrope(
+                                fontSize: 19.5,
+                                fontWeight: FontWeight.w900,
+                                letterSpacing: -0.4,
+                              ),
+                            ),
+                          ),
+                        ],
+                      )
+                    else
+                      ShaderMask(
+                        shaderCallback: (bounds) => const LinearGradient(
+                          colors: AppConstants.userNameGradientColors,
+                        ).createShader(
+                          Rect.fromLTWH(0, 0, bounds.width, bounds.height),
+                        ),
+                        blendMode: BlendMode.srcIn,
+                        child: Text(
+                          'Sonix',
+                          style: GoogleFonts.manrope(
+                            fontSize: 20,
+                            fontWeight: FontWeight.w900,
+                            letterSpacing: -0.5,
+                          ),
+                        ),
+                      ),
+                    Text(
+                      _userProfile != null && _userProfile!.name.isNotEmpty
+                          ? 'ENJOY YOUR MUSIC'
+                          : 'SONG PLAYER',
+                      style: GoogleFonts.manrope(
+                        fontSize: 9.5,
+                        color: _subtextColor,
+                        letterSpacing: 1.2,
+                        fontWeight: FontWeight.w700,
+                      ),
                     ),
-                    strokeWidth: 1,
-                  ),
+                  ],
+                ),
+                const Spacer(),
+                GestureDetector(
+                  onTap: _openEqualizerSheet,
                   child: Container(
                     width: 38,
                     height: 38,
+                    margin: const EdgeInsets.only(right: 10),
                     decoration: BoxDecoration(
                       color: _isLight
                           ? const Color(0xfff1f3f5)
                           : Colors.white.withValues(alpha: .12),
                       shape: BoxShape.circle,
                     ),
-                    child: Icon(
-                      PhosphorIconsBold.user,
-                      size: 20,
-                      color: _textColor,
+                    child: Stack(
+                      alignment: Alignment.center,
+                      children: [
+                        Icon(
+                          PhosphorIconsRegular.slidersHorizontal,
+                          size: 20,
+                          color:
+                              _eqEnabled ? const Color(0xff3B82F6) : _textColor,
+                        ),
+                        if (_eqEnabled)
+                          Positioned(
+                            top: 7,
+                            right: 7,
+                            child: Container(
+                              width: 6,
+                              height: 6,
+                              decoration: const BoxDecoration(
+                                color: Color(0xff3B82F6),
+                                shape: BoxShape.circle,
+                              ),
+                            ),
+                          ),
+                      ],
                     ),
                   ),
                 ),
-              ),
-            ],
+                GestureDetector(
+                  onTap: _openUserMenu,
+                  child: CustomPaint(
+                    foregroundPainter: const _GradientCircleBorderPainter(
+                      gradient: LinearGradient(
+                        colors: AppConstants.userNameGradientColors,
+                      ),
+                      strokeWidth: 1,
+                    ),
+                    child: Container(
+                      width: 38,
+                      height: 38,
+                      decoration: BoxDecoration(
+                        color: _isLight
+                            ? const Color(0xfff1f3f5)
+                            : Colors.white.withValues(alpha: .12),
+                        shape: BoxShape.circle,
+                      ),
+                      child: Icon(
+                        PhosphorIconsBold.user,
+                        size: 20,
+                        color: _textColor,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
           ),
-        ),
-        const SizedBox(height: 12),
+          const SizedBox(height: 12),
+        ],
         TextField(
           controller: _search,
+          focusNode: _searchFocusNode,
           textInputAction: TextInputAction.search,
           onSubmitted: _runSearch,
+          onTap: () {
+            if (_homeMode) {
+              setState(() {
+                _homeMode = false;
+                _fullSearchSubmitted = false;
+              });
+            }
+          },
           style: TextStyle(
             fontSize: 14,
             fontWeight: FontWeight.w500,
@@ -3275,11 +3745,21 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
               color: _subtextColor,
               fontWeight: FontWeight.w400,
             ),
-            prefixIcon: Icon(
-              PhosphorIconsRegular.magnifyingGlass,
-              size: 19,
-              color: _subtextColor,
-            ),
+            prefixIcon: !_homeMode
+                ? IconButton(
+                    icon: Icon(
+                      PhosphorIconsRegular.arrowLeft,
+                      size: 20,
+                      color: _textColor,
+                    ),
+                    onPressed: _exitSearch,
+                    tooltip: 'Back to Home',
+                  )
+                : Icon(
+                    PhosphorIconsRegular.magnifyingGlass,
+                    size: 19,
+                    color: _subtextColor,
+                  ),
             suffixIcon: _search.text.isEmpty
                 ? null
                 : IconButton(
@@ -3291,15 +3771,12 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                     onPressed: () {
                       _search.clear();
                       setState(() {
-                        _homeMode = true;
-                        _openedPlaylist = null;
-                        _viewingLikedSongs = false;
-                        _artistResults = [];
-                        _results = [];
-                        _albumResults = [];
-                        _playlistResults = [];
+                        _searchSuggestions = [];
+                        _loadingSuggestions = false;
+                        _fullSearchSubmitted = false;
                       });
                     },
+                    tooltip: 'Clear',
                   ),
             filled: true,
             fillColor: _inputFill,
@@ -3319,7 +3796,8 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
   Widget _home() => ListView(
     padding: const EdgeInsets.fromLTRB(14, 18, 14, 120),
     children: [
-      if (_noticeVisible) _notice(),
+      if (_noticeVisible && AppConstants.noticeContent.trim().isNotEmpty)
+        _notice(),
       _speedDialSection(),
       _section('Trending', _effectiveTrendingSongs, horizontal: true),
       _section('Suggested for You', _effectiveSuggestedSongs),
@@ -3349,59 +3827,71 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
     ],
   );
 
-  Widget _notice() => Container(
-    margin: const EdgeInsets.only(bottom: 22),
-    padding: const EdgeInsets.all(13),
-    decoration: BoxDecoration(
-      color: _isLight ? const Color(0xfffefce8) : const Color(0xff211c0b),
-      border: Border.all(
-        color: _isLight ? const Color(0xfffef08a) : const Color(0xff816b22),
+  Widget _notice() {
+    if (AppConstants.noticeContent.trim().isEmpty) {
+      return const SizedBox.shrink();
+    }
+    return Container(
+      margin: const EdgeInsets.only(bottom: 22),
+      padding: const EdgeInsets.all(13),
+      decoration: BoxDecoration(
+        color: _isLight ? AppConstants.noticeBgLight : AppConstants.noticeBgDark,
+        border: Border.all(
+          color: _isLight
+              ? AppConstants.noticeBorderLight
+              : AppConstants.noticeBorderDark,
+        ),
+        borderRadius: BorderRadius.circular(10),
       ),
-      borderRadius: BorderRadius.circular(10),
-    ),
-    child: Row(
-      children: [
-        Icon(
-          PhosphorIconsRegular.info,
-          color: _isLight ? const Color(0xffca8a04) : const Color(0xffeab308),
-        ),
-        const SizedBox(width: 11),
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                'Notice',
-                style: TextStyle(
-                  color: _isLight
-                      ? const Color(0xff854d0e)
-                      : const Color(0xffffd95c),
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-              Text(
-                "We can't add new artists or songs here right now.",
-                style: TextStyle(
-                  fontSize: 12,
-                  color: _isLight
-                      ? const Color(0xffa16207)
-                      : const Color(0xffd8cfa5),
-                ),
-              ),
-            ],
+      child: Row(
+        children: [
+          Icon(
+            PhosphorIconsRegular.info,
+            color: _isLight
+                ? AppConstants.noticeIconLight
+                : AppConstants.noticeIconDark,
           ),
-        ),
-        IconButton(
-          onPressed: () => setState(() => _noticeVisible = false),
-          icon: Icon(
-            PhosphorIconsRegular.x,
-            size: 17,
-            color: _isLight ? const Color(0xff854d0e) : _muted,
+          const SizedBox(width: 11),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (AppConstants.noticeTitle.trim().isNotEmpty)
+                  Text(
+                    AppConstants.noticeTitle,
+                    style: TextStyle(
+                      color: _isLight
+                          ? AppConstants.noticeTitleLight
+                          : AppConstants.noticeTitleDark,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                Text(
+                  AppConstants.noticeContent,
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: _isLight
+                        ? AppConstants.noticeTextLight
+                        : AppConstants.noticeTextDark,
+                  ),
+                ),
+              ],
+            ),
           ),
-        ),
-      ],
-    ),
-  );
+          IconButton(
+            onPressed: () => setState(() => _noticeVisible = false),
+            icon: Icon(
+              PhosphorIconsRegular.x,
+              size: 17,
+              color: _isLight
+                  ? AppConstants.noticeCloseIconLight
+                  : AppConstants.noticeCloseIconDark,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 
   Widget _speedDialSection() {
     return Column(
@@ -3440,19 +3930,28 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
         LayoutBuilder(
           builder: (context, constraints) {
             final totalWidth = constraints.maxWidth;
-            const crossAxisSpacing = 6.0;
-            const mainAxisSpacing = 6.0;
+            final itemSpacing = AppConstants.speedDialItemSpacing;
+            final slideGap = AppConstants.speedDialSlideGap;
+            final slideHorizontalPadding = slideGap / 2.0;
             const crossAxisCount = 3;
+
+            // Width available for the 3 columns on a single slide
+            final availableSlideWidth =
+                totalWidth - (slideHorizontalPadding * 2);
             final cardWidth =
-                (totalWidth - (crossAxisSpacing * (crossAxisCount - 1))) /
+                (availableSlideWidth - (itemSpacing * (crossAxisCount - 1))) /
                     crossAxisCount;
-            final cardHeight = cardWidth + 23.0;
-            final gridHeight = (cardHeight * 3) + (mainAxisSpacing * 2);
+            final cardHeight = cardWidth + 24.0;
+            final gridHeight = (cardHeight * 3) + (itemSpacing * 2);
 
             return SizedBox(
               height: gridHeight,
               child: PageView.builder(
                 controller: _speedDialPageCtrl,
+                physics: const BouncingScrollPhysics(
+                  parent: AlwaysScrollableScrollPhysics(),
+                ),
+                clipBehavior: Clip.none,
                 itemCount: 3,
                 onPageChanged: (page) => setState(() => _speedDialPage = page),
                 itemBuilder: (context, pageIndex) {
@@ -3465,28 +3964,32 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                     endIndex.clamp(0, songsList.length),
                   );
 
-                  return Column(
-                    children: [
-                      for (int row = 0; row < 3; row++) ...[
-                        if (row > 0) const SizedBox(height: mainAxisSpacing),
-                        Row(
-                          children: [
-                            for (int col = 0; col < 3; col++) ...[
-                              if (col > 0)
-                                const SizedBox(width: crossAxisSpacing),
-                              Expanded(
-                                child: (row * 3 + col < pageSongs.length)
-                                    ? _speedDialCard(
-                                        pageSongs[row * 3 + col],
-                                        cardWidth,
-                                      )
-                                    : const SizedBox(),
-                              ),
+                  return Padding(
+                    padding: EdgeInsets.symmetric(
+                      horizontal: slideHorizontalPadding,
+                    ),
+                    child: Column(
+                      children: [
+                        for (int row = 0; row < 3; row++) ...[
+                          if (row > 0) SizedBox(height: itemSpacing),
+                          Row(
+                            children: [
+                              for (int col = 0; col < 3; col++) ...[
+                                if (col > 0) SizedBox(width: itemSpacing),
+                                Expanded(
+                                  child: (row * 3 + col < pageSongs.length)
+                                      ? _speedDialCard(
+                                          pageSongs[row * 3 + col],
+                                          cardWidth,
+                                        )
+                                      : const SizedBox(),
+                                ),
+                              ],
                             ],
-                          ],
-                        ),
+                          ),
+                        ],
                       ],
-                    ],
+                    ),
                   );
                 },
               ),
@@ -3506,14 +4009,16 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                 onTap: () {
                   _speedDialPageCtrl.animateToPage(
                     index,
-                    duration: const Duration(milliseconds: 300),
-                    curve: Curves.easeInOut,
+                    duration: const Duration(milliseconds: 320),
+                    curve: Curves.easeOutCubic,
                   );
                 },
                 behavior: HitTestBehavior.opaque,
                 child: Padding(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 3, vertical: 4),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 3,
+                    vertical: 4,
+                  ),
                   child: AnimatedContainer(
                     duration: const Duration(milliseconds: 240),
                     curve: Curves.easeOutCubic,
@@ -3562,40 +4067,24 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                   borderRadius: BorderRadius.circular(10),
                   child: _art(song.artwork, width: size, height: size),
                 ),
-                // Active playing border
-                if (isCurrent)
-                  Container(
-                    decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(10),
-                      border: Border.all(
-                        color: const Color(0xff3B82F6),
-                        width: 1.5,
-                      ),
-                    ),
-                  ),
-                // Active playing badge
-                if (isCurrent)
-                  Positioned(
-                    top: 5,
-                    right: 5,
+                // Darkened image and centered wave sound icon when playing
+                if (isCurrent) ...[
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(10),
                     child: Container(
-                      width: 20,
-                      height: 20,
-                      decoration: const BoxDecoration(
-                        color: Color(0xff3B82F6),
-                        shape: BoxShape.circle,
-                      ),
-                      child: Center(
-                        child: Icon(
-                          isPlaying
-                              ? PhosphorIconsFill.pause
-                              : PhosphorIconsFill.play,
-                          size: 10,
-                          color: Colors.white,
-                        ),
-                      ),
+                      color: Colors.black.withValues(alpha: 0.44),
                     ),
                   ),
+                  Center(
+                    child: Icon(
+                      isPlaying
+                          ? PhosphorIconsBold.waveform
+                          : PhosphorIconsFill.play,
+                      size: (size * 0.28).clamp(22.0, 30.0),
+                      color: Colors.white,
+                    ),
+                  ),
+                ],
                 // Subtle progress indicator for the currently playing song
                 if (isCurrent)
                   Positioned(
@@ -3613,11 +4102,11 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                             : 0.0;
                         return ClipRRect(
                           borderRadius: const BorderRadius.vertical(
-                            bottom: Radius.circular(9),
+                            bottom: Radius.circular(10),
                           ),
                           child: Container(
                             height: 3.5,
-                            color: Colors.black54,
+                            color: Colors.black38,
                             child: FractionallySizedBox(
                               alignment: Alignment.centerLeft,
                               widthFactor: progress,
@@ -3639,10 +4128,10 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
             song.title,
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
-            style: GoogleFonts.poppins(
-              fontSize: 11.5,
-              fontWeight: isCurrent ? FontWeight.w700 : FontWeight.w500,
-              color: isCurrent ? const Color(0xff3B82F6) : _textColor,
+            style: GoogleFonts.manrope(
+              fontSize: 12,
+              fontWeight: FontWeight.w800,
+              color: _textColor,
             ),
           ),
         ],
@@ -3658,10 +4147,11 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
             padding: const EdgeInsets.only(bottom: 12),
             child: Text(
               title,
-              style: TextStyle(
+              style: GoogleFonts.manrope(
                 fontSize: 20,
-                fontWeight: FontWeight.w800,
+                fontWeight: FontWeight.w900,
                 color: _textColor,
+                letterSpacing: -0.3,
               ),
             ),
           ),
@@ -3751,9 +4241,9 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
               song.title,
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
-              style: TextStyle(
+              style: GoogleFonts.manrope(
                 fontSize: 14,
-                fontWeight: FontWeight.w700,
+                fontWeight: FontWeight.w800,
                 color: _textColor,
               ),
             ),
@@ -3774,10 +4264,11 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
             const SizedBox(width: 8),
             Text(
               'Featured Playlists',
-              style: TextStyle(
+              style: GoogleFonts.manrope(
                 fontSize: 20,
-                fontWeight: FontWeight.w800,
+                fontWeight: FontWeight.w900,
                 color: _textColor,
+                letterSpacing: -0.3,
               ),
             ),
           ],
@@ -3805,10 +4296,11 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
             padding: const EdgeInsets.only(bottom: 12),
             child: Text(
               'Recently Played',
-              style: TextStyle(
+              style: GoogleFonts.manrope(
                 fontSize: 20,
-                fontWeight: FontWeight.w800,
+                fontWeight: FontWeight.w900,
                 color: _textColor,
+                letterSpacing: -0.3,
               ),
             ),
           ),
@@ -3841,10 +4333,11 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
             children: [
               Text(
                 'Recently Played',
-                style: TextStyle(
+                style: GoogleFonts.manrope(
                   fontSize: 20,
-                  fontWeight: FontWeight.w800,
+                  fontWeight: FontWeight.w900,
                   color: _textColor,
+                  letterSpacing: -0.3,
                 ),
               ),
               GestureDetector(
@@ -3934,9 +4427,9 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
             playlist.title,
             maxLines: 2,
             overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              fontSize: 13,
-              fontWeight: FontWeight.w700,
+            style: GoogleFonts.manrope(
+              fontSize: 13.5,
+              fontWeight: FontWeight.w800,
               color: _textColor,
               height: 1.25,
             ),
@@ -4004,8 +4497,9 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                     song.title,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontWeight: FontWeight.w700,
+                    style: GoogleFonts.manrope(
+                      fontSize: 14.5,
+                      fontWeight: FontWeight.w800,
                       color: _textColor,
                     ),
                   ),
@@ -4038,6 +4532,24 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
 
   Widget _art(String url, {required double width, required double height}) {
     final cleanUrl = url.trim();
+    if (cleanUrl.isNotEmpty &&
+        (cleanUrl.startsWith('/') ||
+            cleanUrl.startsWith('file:') ||
+            (cleanUrl.length > 2 && cleanUrl[1] == ':'))) {
+      final cleanPath = cleanUrl.startsWith('file://')
+          ? Uri.parse(cleanUrl).toFilePath()
+          : cleanUrl;
+      final file = File(cleanPath);
+      if (file.existsSync()) {
+        return Image.file(
+          file,
+          width: width,
+          height: height,
+          fit: BoxFit.cover,
+          errorBuilder: (_, _, _) => _fallbackArtWidget(width, height),
+        );
+      }
+    }
     final effectiveUrl = cleanUrl.isEmpty ? _fallbackArt : cleanUrl;
     return Image.network(
       effectiveUrl,
@@ -4049,15 +4561,17 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
         width: width,
         height: height,
         fit: BoxFit.cover,
-        errorBuilder: (_, _, _) => Container(
-          width: width,
-          height: height,
-          color: _cardBg,
-          child: Icon(PhosphorIconsRegular.musicNote, color: _subtextColor),
-        ),
+        errorBuilder: (_, _, _) => _fallbackArtWidget(width, height),
       ),
     );
   }
+
+  Widget _fallbackArtWidget(double width, double height) => Container(
+        width: width,
+        height: height,
+        color: _cardBg,
+        child: Icon(PhosphorIconsRegular.musicNote, color: _subtextColor),
+      );
 
   /* ----------------------------- SEARCH RESULT ---------------------------- */
 
@@ -4069,10 +4583,11 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
         const SizedBox(width: 8),
         Text(
           count != null && count > 0 ? '$title ($count)' : title,
-          style: TextStyle(
+          style: GoogleFonts.manrope(
             fontSize: 20,
-            fontWeight: FontWeight.w800,
+            fontWeight: FontWeight.w900,
             color: _textColor,
+            letterSpacing: -0.3,
           ),
         ),
       ],
@@ -4114,9 +4629,9 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
             textAlign: TextAlign.center,
-            style: TextStyle(
+            style: GoogleFonts.manrope(
               fontSize: 13.5,
-              fontWeight: FontWeight.w700,
+              fontWeight: FontWeight.w800,
               color: _textColor,
             ),
           ),
@@ -4205,9 +4720,9 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
             album.title,
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              fontSize: 13,
-              fontWeight: FontWeight.w700,
+            style: GoogleFonts.manrope(
+              fontSize: 13.5,
+              fontWeight: FontWeight.w800,
               color: _textColor,
             ),
           ),
@@ -4228,6 +4743,487 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
       ),
     ),
   );
+
+  /* ---------------------- SEARCH SUGGESTIONS & AUTOCOMPLETE PAGE -------------------- */
+
+  Widget _searchSuggestionsPage() {
+    final query = _search.text.trim();
+    if (query.isEmpty) {
+      return _searchHubView();
+    }
+    return _searchQuerySuggestionsView(query);
+  }
+
+  Widget _searchHubView() {
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 14, 16, 120),
+      children: [
+        if (_recentSearches.isNotEmpty) ...[
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(
+                'Recent Searches',
+                style: TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w700,
+                  color: _textColor,
+                  letterSpacing: .2,
+                ),
+              ),
+              TextButton(
+                onPressed: () async {
+                  await UserStorage.clearRecentSearches();
+                  if (mounted) setState(() => _recentSearches = []);
+                },
+                style: TextButton.styleFrom(
+                  padding: EdgeInsets.zero,
+                  visualDensity: VisualDensity.compact,
+                ),
+                child: Text(
+                  'Clear all',
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: _subtextColor,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          ..._recentSearches.map((term) => _recentSearchRow(term)),
+          const SizedBox(height: 24),
+        ],
+
+        Row(
+          children: [
+            const Icon(
+              PhosphorIconsRegular.flame,
+              size: 18,
+              color: Color(0xffff416c),
+            ),
+            const SizedBox(width: 7),
+            Text(
+              'Trending Searches',
+              style: GoogleFonts.manrope(
+                fontSize: 14.5,
+                fontWeight: FontWeight.w800,
+                color: _textColor,
+                letterSpacing: .2,
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: (_isHindi
+                  ? const [
+                      'Arijit Singh',
+                      'Bollywood Hits',
+                      'Sidhu Moose Wala',
+                      'Trending Hindi',
+                      'Shreya Ghoshal',
+                      'Lo-Fi Beats',
+                      'Punjabi Pop',
+                      'Romantic Songs',
+                      'Anuv Jain',
+                      'Pritam',
+                    ]
+                  : const [
+                      'Taylor Swift',
+                      'The Weeknd',
+                      'Drake',
+                      'Billie Eilish',
+                      'Pop Hits',
+                      'Hip Hop Hits',
+                      'Ed Sheeran',
+                      'Dua Lipa',
+                      'Top 50 Global',
+                      'Coldplay',
+                      'Justin Bieber',
+                      'Bruno Mars',
+                    ])
+              .map((tag) => _trendingSearchTag(tag))
+              .toList(),
+        ),
+      ],
+    );
+  }
+
+  Widget _recentSearchRow(String term) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(10),
+      onTap: () {
+        _search.text = term;
+        _search.selection = TextSelection.collapsed(offset: term.length);
+        _runSearch(term);
+      },
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
+        child: Row(
+          children: [
+            Icon(
+              PhosphorIconsRegular.clockCounterClockwise,
+              size: 18,
+              color: _subtextColor,
+            ),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Text(
+                term,
+                style: TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w500,
+                  color: _textColor,
+                ),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            IconButton(
+              padding: EdgeInsets.zero,
+              visualDensity: VisualDensity.compact,
+              constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+              icon: Icon(
+                PhosphorIconsRegular.x,
+                size: 15,
+                color: _subtextColor,
+              ),
+              onPressed: () async {
+                await UserStorage.removeRecentSearch(term);
+                unawaited(_loadRecentSearches());
+              },
+              tooltip: 'Remove',
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _trendingSearchTag(String tag) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(20),
+      onTap: () {
+        _search.text = tag;
+        _search.selection = TextSelection.collapsed(offset: tag.length);
+        _runSearch(tag);
+      },
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+        decoration: BoxDecoration(
+          color: _isLight
+              ? const Color(0xfff1f5f9)
+              : Colors.white.withValues(alpha: .08),
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: _borderColor),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              PhosphorIconsRegular.magnifyingGlass,
+              size: 13,
+              color: _subtextColor,
+            ),
+            const SizedBox(width: 6),
+            Text(
+              tag,
+              style: GoogleFonts.manrope(
+                fontSize: 12.5,
+                fontWeight: FontWeight.w700,
+                color: _textColor,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _searchQuerySuggestionsView(String query) {
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 10, 16, 120),
+      children: [
+        // 1. Direct Search Action Banner
+        InkWell(
+          borderRadius: BorderRadius.circular(12),
+          onTap: () => _runSearch(query),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+            decoration: BoxDecoration(
+              color: _isLight
+                  ? const Color(0xfff8fafc)
+                  : Colors.white.withValues(alpha: .05),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(
+                color: _isLight
+                    ? const Color(0xffe2e8f0)
+                    : Colors.white.withValues(alpha: .08),
+              ),
+            ),
+            child: Row(
+              children: [
+                Container(
+                  width: 36,
+                  height: 36,
+                  decoration: BoxDecoration(
+                    color: _isLight
+                        ? const Color(0xff0f172a)
+                        : Colors.white.withValues(alpha: .15),
+                    shape: BoxShape.circle,
+                  ),
+                  child: const Center(
+                    child: Icon(
+                      PhosphorIconsRegular.magnifyingGlass,
+                      size: 18,
+                      color: Colors.white,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Search for "$query"',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w700,
+                          color: _textColor,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        'Search across songs, artists, albums & playlists',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: _subtextColor,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Icon(
+                  PhosphorIconsRegular.arrowRight,
+                  size: 16,
+                  color: _subtextColor,
+                ),
+              ],
+            ),
+          ),
+        ),
+
+        if (_loadingSuggestions && _searchSuggestions.isEmpty) ...[
+          const SizedBox(height: 36),
+          Center(
+            child: SizedBox(
+              width: 22,
+              height: 22,
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                color: _isLight ? const Color(0xff0f172a) : Colors.white70,
+              ),
+            ),
+          ),
+        ] else if (_searchSuggestions.isNotEmpty) ...[
+          const SizedBox(height: 18),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(
+                'SUGGESTIONS',
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: 1.1,
+                  color: _subtextColor,
+                ),
+              ),
+              if (_loadingSuggestions)
+                SizedBox(
+                  width: 14,
+                  height: 14,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 1.5,
+                    color: _subtextColor,
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          ..._searchSuggestions.map((s) => _suggestionRow(s, query)),
+        ] else if (!_loadingSuggestions) ...[
+          const SizedBox(height: 48),
+          Center(
+            child: Column(
+              children: [
+                Icon(
+                  PhosphorIconsRegular.magnifyingGlass,
+                  size: 44,
+                  color: _subtextColor.withValues(alpha: .5),
+                ),
+                const SizedBox(height: 14),
+                Text(
+                  'No direct suggestions found',
+                  style: TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w600,
+                    color: _textColor,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  'Press Enter or tap above to search everywhere',
+                  style: TextStyle(fontSize: 12, color: _subtextColor),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+
+  Widget _suggestionRow(SearchSuggestion suggestion, String query) {
+    Color badgeColor;
+    Color badgeBg;
+    IconData typeIcon;
+    String typeLabel;
+
+    if (suggestion.isArtist) {
+      badgeColor = const Color(0xffa855f7);
+      badgeBg = const Color(0xffa855f7).withValues(alpha: .12);
+      typeIcon = PhosphorIconsRegular.user;
+      typeLabel = 'ARTIST';
+    } else if (suggestion.isAlbum) {
+      badgeColor = const Color(0xfff59e0b);
+      badgeBg = const Color(0xfff59e0b).withValues(alpha: .12);
+      typeIcon = PhosphorIconsRegular.disc;
+      typeLabel = 'ALBUM';
+    } else if (suggestion.isPlaylist) {
+      badgeColor = const Color(0xff14b8a6);
+      badgeBg = const Color(0xff14b8a6).withValues(alpha: .12);
+      typeIcon = PhosphorIconsRegular.playlist;
+      typeLabel = 'PLAYLIST';
+    } else {
+      badgeColor = const Color(0xff3b82f6);
+      badgeBg = const Color(0xff3b82f6).withValues(alpha: .12);
+      typeIcon = PhosphorIconsRegular.musicNote;
+      typeLabel = 'SONG';
+    }
+
+    return InkWell(
+      borderRadius: BorderRadius.circular(10),
+      onTap: () => _onSuggestionTapped(suggestion),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 7, horizontal: 4),
+        child: Row(
+          children: [
+            // Artwork / Avatar
+            suggestion.isArtist
+                ? ClipOval(
+                    child: _art(suggestion.image, width: 44, height: 44),
+                  )
+                : ClipRRect(
+                    borderRadius: BorderRadius.circular(8),
+                    child: _art(suggestion.image, width: 44, height: 44),
+                  ),
+            const SizedBox(width: 12),
+
+            // Title & Subtitle + Badge
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    suggestion.title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: GoogleFonts.manrope(
+                      fontSize: 14,
+                      fontWeight: FontWeight.w800,
+                      color: _textColor,
+                    ),
+                  ),
+                  const SizedBox(height: 3),
+                  Row(
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 5,
+                          vertical: 1.5,
+                        ),
+                        decoration: BoxDecoration(
+                          color: badgeBg,
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(typeIcon, size: 9, color: badgeColor),
+                            const SizedBox(width: 3),
+                            Text(
+                              typeLabel,
+                              style: TextStyle(
+                                fontSize: 8.5,
+                                fontWeight: FontWeight.w700,
+                                letterSpacing: .5,
+                                color: badgeColor,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      if (suggestion.subtitle.isNotEmpty) ...[
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: Text(
+                            suggestion.subtitle,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: _subtextColor,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ],
+              ),
+            ),
+
+            // Insert into search bar button
+            IconButton(
+              icon: Icon(
+                PhosphorIconsRegular.arrowUpLeft,
+                size: 18,
+                color: _subtextColor,
+              ),
+              tooltip: 'Insert into search',
+              onPressed: () {
+                _search.text = suggestion.title;
+                _search.selection = TextSelection.collapsed(
+                  offset: suggestion.title.length,
+                );
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 
   Widget _searchResults() {
     if (_searching) {
@@ -4350,9 +5346,9 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
             _openedPlaylist?.title ?? 'Playlist',
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              fontSize: 16,
-              fontWeight: FontWeight.w700,
+            style: GoogleFonts.manrope(
+              fontSize: 16.5,
+              fontWeight: FontWeight.w800,
               color: _textColor,
             ),
           ),
@@ -4404,9 +5400,9 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                     playlist.title,
                     maxLines: 2,
                     overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: 18,
-                      fontWeight: FontWeight.w800,
+                    style: GoogleFonts.manrope(
+                      fontSize: 19,
+                      fontWeight: FontWeight.w900,
                       height: 1.2,
                       color: _textColor,
                     ),
@@ -4583,11 +5579,11 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                     song.title,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontWeight: FontWeight.w700,
+                    style: GoogleFonts.manrope(
+                      fontWeight: FontWeight.w800,
                       fontSize: 14,
                       color: isCurrent
-                          ? _textColor
+                          ? (_isLight ? const Color(0xff2563eb) : const Color(0xff60a5fa))
                           : _textColor.withValues(alpha: .9),
                     ),
                   ),
@@ -4681,8 +5677,9 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                     song.title,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontWeight: FontWeight.w700,
+                    style: GoogleFonts.manrope(
+                      fontWeight: FontWeight.w800,
+                      fontSize: 14,
                       color: _textColor,
                     ),
                   ),
@@ -4769,9 +5766,9 @@ class _SonixHomeState extends State<SonixHome> with TickerProviderStateMixin {
                                 track.title,
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                  fontWeight: FontWeight.w700,
-                                  fontSize: 13,
+                                style: GoogleFonts.manrope(
+                                  fontWeight: FontWeight.w800,
+                                  fontSize: 13.5,
                                   color: _textColor,
                                 ),
                               ),
@@ -4964,7 +5961,7 @@ Widget _fullScreenView() {
   final track = _current!;
   final screenHeight = MediaQuery.sizeOf(context).height;
   final bottomPadding = MediaQuery.paddingOf(context).bottom;
-  final collapsedHeight = 54.0 + bottomPadding;
+  final collapsedHeight = 62.0 + bottomPadding;
   final maxSheetHeight = screenHeight * 0.78;
 
   return FutureBuilder<List<Color>>(
@@ -5034,61 +6031,70 @@ Widget _fullScreenView() {
               bottom: false,
               child: Column(
                 children: [
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(18, 12, 12, 6),
-                    child: Row(
-                      children: [
-                        Icon(
-                          PhosphorIconsRegular.musicNote,
-                          size: 19,
-                          color: _textColor,
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: Text(
-                            'Now Playing',
-                            style: TextStyle(
-                              fontWeight: FontWeight.w700,
-                              color: _textColor,
+                  GestureDetector(
+                    behavior: HitTestBehavior.translucent,
+                    onVerticalDragEnd: (details) {
+                      if ((details.primaryVelocity ?? 0) > 200) {
+                        _queueAnim.value = 0.0;
+                        setState(() => _fullScreen = false);
+                      }
+                    },
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(18, 12, 12, 6),
+                      child: Row(
+                        children: [
+                          Icon(
+                            PhosphorIconsRegular.musicNote,
+                            size: 19,
+                            color: _textColor,
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              'Now Playing',
+                              style: TextStyle(
+                                fontWeight: FontWeight.w700,
+                                color: _textColor,
+                              ),
                             ),
                           ),
-                        ),
-                        IconButton(
-                          onPressed: () => _toggleLike(track),
-                          icon: Icon(
-                            _likedSongs.containsKey(track.id)
-                                ? PhosphorIconsFill.heart
-                                : PhosphorIconsRegular.heart,
-                            color: _likedSongs.containsKey(track.id)
-                                ? Colors.redAccent
-                                : _textColor,
-                            size: 22,
+                          IconButton(
+                            onPressed: () => _toggleLike(track),
+                            icon: Icon(
+                              _likedSongs.containsKey(track.id)
+                                  ? PhosphorIconsFill.heart
+                                  : PhosphorIconsRegular.heart,
+                              color: _likedSongs.containsKey(track.id)
+                                  ? Colors.redAccent
+                                  : _textColor,
+                              size: 22,
+                            ),
+                            tooltip: _likedSongs.containsKey(track.id)
+                                ? 'Unlike'
+                                : 'Like',
                           ),
-                          tooltip: _likedSongs.containsKey(track.id)
-                              ? 'Unlike'
-                              : 'Like',
-                        ),
-                        IconButton(
-                          onPressed: () => _showSongOptions(track),
-                          icon: Icon(
-                            PhosphorIconsRegular.dotsThreeVertical,
-                            size: 22,
-                            color: _textColor,
+                          IconButton(
+                            onPressed: () => _showSongOptions(track),
+                            icon: Icon(
+                              PhosphorIconsRegular.dotsThreeVertical,
+                              size: 22,
+                              color: _textColor,
+                            ),
+                            tooltip: 'Options',
                           ),
-                          tooltip: 'Options',
-                        ),
-                        IconButton(
-                          onPressed: () {
-                            _queueAnim.value = 0.0;
-                            setState(() => _fullScreen = false);
-                          },
-                          icon: Icon(
-                            PhosphorIconsRegular.caretDown,
-                            color: _textColor,
+                          IconButton(
+                            onPressed: () {
+                              _queueAnim.value = 0.0;
+                              setState(() => _fullScreen = false);
+                            },
+                            icon: Icon(
+                              PhosphorIconsRegular.caretDown,
+                              color: _textColor,
+                            ),
+                            tooltip: 'Minimize player',
                           ),
-                          tooltip: 'Minimize player',
-                        ),
-                      ],
+                        ],
+                      ),
                     ),
                   ),
                   Container(
@@ -5107,8 +6113,17 @@ Widget _fullScreenView() {
                             icon: PhosphorIconsRegular.disc,
                             label: 'Player',
                             active: !_fullScreenLyrics,
-                            onTap: () =>
-                                setState(() => _fullScreenLyrics = false),
+                            onTap: () {
+                              if (_fullScreenPageCtrl.hasClients) {
+                                _fullScreenPageCtrl.animateToPage(
+                                  0,
+                                  duration: const Duration(milliseconds: 300),
+                                  curve: Curves.easeOutCubic,
+                                );
+                              } else {
+                                setState(() => _fullScreenLyrics = false);
+                              }
+                            },
                           ),
                         ),
                         Expanded(
@@ -5116,115 +6131,234 @@ Widget _fullScreenView() {
                             icon: PhosphorIconsRegular.textAa,
                             label: 'Lyrics',
                             active: _fullScreenLyrics,
-                            onTap: () =>
-                                setState(() => _fullScreenLyrics = true),
+                            onTap: () {
+                              if (_fullScreenPageCtrl.hasClients) {
+                                _fullScreenPageCtrl.animateToPage(
+                                  1,
+                                  duration: const Duration(milliseconds: 300),
+                                  curve: Curves.easeOutCubic,
+                                );
+                              } else {
+                                setState(() => _fullScreenLyrics = true);
+                              }
+                            },
                           ),
                         ),
                       ],
                     ),
                   ),
                   Expanded(
-                    child: _fullScreenLyrics
-                        ? Column(
-                            children: [
-                              Expanded(child: _lyricsBody()),
-                              const SizedBox(height: 22),
-                              _fullScreenSlider(),
-                              _fullScreenControls(),
-                              const SizedBox(height: 12),
-                              SizedBox(height: collapsedHeight + 14),
-                            ],
-                          )
-                        : LayoutBuilder(
+                    child: PageView(
+                      controller: _fullScreenPageCtrl,
+                      physics: const BouncingScrollPhysics(),
+                      onPageChanged: (page) {
+                        setState(() => _fullScreenLyrics = (page == 1));
+                      },
+                      children: [
+                        // Page 0: Fullscreen Player
+                        GestureDetector(
+                          behavior: HitTestBehavior.translucent,
+                          onVerticalDragStart: (_) => _fsVerticalDragDist = 0.0,
+                          onVerticalDragUpdate: (details) {
+                            _fsVerticalDragDist += details.delta.dy;
+                          },
+                          onVerticalDragEnd: (details) {
+                            final v = details.primaryVelocity ?? 0.0;
+                            if (v > 250 || _fsVerticalDragDist > 60) {
+                              _queueAnim.value = 0.0;
+                              setState(() => _fullScreen = false);
+                            } else if (v < -250 || _fsVerticalDragDist < -60) {
+                              _queueAnim.animateTo(1.0, curve: Curves.easeOutCubic);
+                            }
+                            _fsVerticalDragDist = 0.0;
+                          },
+                          child: LayoutBuilder(
                             builder: (context, constraints) {
                               final availableHeight = constraints.maxHeight;
                               final artSize = (availableHeight * 0.36)
                                   .clamp(160.0, 240.0);
 
-                              return SingleChildScrollView(
-                                physics: const BouncingScrollPhysics(),
-                                child: ConstrainedBox(
-                                  constraints: BoxConstraints(
-                                      minHeight: availableHeight),
-                                  child: Column(
-                                    mainAxisAlignment: MainAxisAlignment.center,
-                                    children: [
-                                      SizedBox(height: (availableHeight * 0.01).clamp(16.0, 32.0)),
-                                      Center(
-                                        child: Container(
-                                          decoration: BoxDecoration(
-                                            borderRadius:
-                                                BorderRadius.circular(16),
-                                            boxShadow: [
-                                              BoxShadow(
-                                                color: _isLight
-                                                    ? artworkColor
-                                                        .withValues(alpha: 0.3)
-                                                    : Colors.black
-                                                        .withValues(alpha: 0.5),
-                                                blurRadius: 28,
-                                                offset:
-                                                    const Offset(0, 10),
+                              return NotificationListener<ScrollNotification>(
+                                onNotification: (notification) {
+                                  if (notification is OverscrollNotification &&
+                                      notification.overscroll < -15) {
+                                    _queueAnim.value = 0.0;
+                                    setState(() => _fullScreen = false);
+                                    return true;
+                                  }
+                                  return false;
+                                },
+                                child: SingleChildScrollView(
+                                  physics: availableHeight < 460
+                                      ? const ClampingScrollPhysics()
+                                      : const NeverScrollableScrollPhysics(),
+                                  child: ConstrainedBox(
+                                    constraints: BoxConstraints(
+                                        minHeight: availableHeight),
+                                    child: Column(
+                                      mainAxisAlignment:
+                                          MainAxisAlignment.center,
+                                      children: [
+                                        SizedBox(
+                                            height: (availableHeight * 0.01)
+                                                .clamp(16.0, 32.0)),
+                                        Center(
+                                          child: Container(
+                                            decoration: BoxDecoration(
+                                              borderRadius:
+                                                  BorderRadius.circular(16),
+                                              boxShadow: [
+                                                BoxShadow(
+                                                  color: _isLight
+                                                      ? artworkColor
+                                                          .withValues(alpha: 0.3)
+                                                      : Colors.black
+                                                          .withValues(alpha: 0.5),
+                                                  blurRadius: 28,
+                                                  offset:
+                                                      const Offset(0, 10),
+                                                ),
+                                              ],
+                                            ),
+                                            child: ClipRRect(
+                                              borderRadius:
+                                                  BorderRadius.circular(16),
+                                              child: _art(
+                                                track.artwork,
+                                                width: artSize,
+                                                height: artSize,
                                               ),
-                                            ],
-                                          ),
-                                          child: ClipRRect(
-                                            borderRadius:
-                                                BorderRadius.circular(16),
-                                            child: _art(
-                                              track.artwork,
-                                              width: artSize,
-                                              height: artSize,
                                             ),
                                           ),
                                         ),
-                                      ),
-                                      const SizedBox(height: 18),
-                                      Padding(
-                                        padding: const EdgeInsets
-                                            .symmetric(horizontal: 24),
-                                        child: Text(
-                                          track.title,
-                                          textAlign: TextAlign.center,
-                                          maxLines: 2,
-                                          overflow: TextOverflow.ellipsis,
-                                          style: TextStyle(
-                                            fontSize: 22,
-                                            fontWeight: FontWeight.w700,
-                                            color: _textColor,
+                                        const SizedBox(height: 18),
+                                        Padding(
+                                          padding: const EdgeInsets
+                                              .symmetric(horizontal: 24),
+                                          child: Text(
+                                            track.title,
+                                            textAlign: TextAlign.center,
+                                            maxLines: 2,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: GoogleFonts.manrope(
+                                              fontSize: 22,
+                                              fontWeight: FontWeight.w900,
+                                              color: _textColor,
+                                              letterSpacing: -0.4,
+                                            ),
                                           ),
                                         ),
-                                      ),
-                                      const SizedBox(height: 6),
-                                      Padding(
-                                        padding: const EdgeInsets
-                                            .symmetric(horizontal: 24),
-                                        child: Text(
-                                          track.artist,
-                                          textAlign: TextAlign.center,
-                                          maxLines: 1,
-                                          overflow: TextOverflow.ellipsis,
-                                          style: TextStyle(
-                                            color: _subtextColor,
-                                            fontSize: 15,
+                                        const SizedBox(height: 6),
+                                        Padding(
+                                          padding: const EdgeInsets
+                                              .symmetric(horizontal: 24),
+                                          child: Text(
+                                            track.artist,
+                                            textAlign: TextAlign.center,
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: TextStyle(
+                                              color: _subtextColor,
+                                              fontSize: 15,
+                                            ),
                                           ),
                                         ),
-                                      ),
-                                      const SizedBox(height: 22),
-                                      // Progress bar slider directly below Title & Artist
-                                      _fullScreenSlider(),
-                                      // const SizedBox(height: 2),
-                                      // Player buttons (prev, play, next) directly below slider
-                                      _fullScreenControls(),
-                                      const SizedBox(height: 12),
-                                      // Space above the Up Next bottom bar
-                                      SizedBox(height: collapsedHeight + 14),
-                                    ],
+                                        const SizedBox(height: 22),
+                                        _fullScreenSlider(),
+                                        _fullScreenControls(),
+                                        const SizedBox(height: 12),
+                                        SizedBox(height: collapsedHeight + 14),
+                                      ],
+                                    ),
                                   ),
                                 ),
                               );
                             },
                           ),
+                        ),
+
+                        // Page 1: Lyrics View
+                        GestureDetector(
+                          behavior: HitTestBehavior.translucent,
+                          onVerticalDragStart: (_) => _fsVerticalDragDist = 0.0,
+                          onVerticalDragUpdate: (details) {
+                            _fsVerticalDragDist += details.delta.dy;
+                          },
+                          onVerticalDragEnd: (details) {
+                            final v = details.primaryVelocity ?? 0.0;
+                            if (v > 250 || _fsVerticalDragDist > 60) {
+                              _queueAnim.value = 0.0;
+                              setState(() => _fullScreen = false);
+                            } else if (v < -250 || _fsVerticalDragDist < -60) {
+                              _queueAnim.animateTo(1.0, curve: Curves.easeOutCubic);
+                            }
+                            _fsVerticalDragDist = 0.0;
+                          },
+                          child: Column(
+                            children: [
+                              Expanded(
+                                child: NotificationListener<ScrollNotification>(
+                                  onNotification: (notification) {
+                                    if (notification is OverscrollNotification) {
+                                      if (notification.overscroll < -15) {
+                                        _queueAnim.value = 0.0;
+                                        setState(() => _fullScreen = false);
+                                        return true;
+                                      } else if (notification.overscroll > 12) {
+                                        _queueAnim.animateTo(1.0, curve: Curves.easeOutCubic);
+                                        return true;
+                                      }
+                                    }
+                                    if (notification is ScrollEndNotification) {
+                                      final v = notification.dragDetails?.primaryVelocity ?? 0.0;
+                                      if (notification.metrics.pixels <= 0 && v > 250) {
+                                        _queueAnim.value = 0.0;
+                                        setState(() => _fullScreen = false);
+                                        return true;
+                                      }
+                                      if ((notification.metrics.pixels >= notification.metrics.maxScrollExtent - 20 ||
+                                              notification.metrics.maxScrollExtent <= 0) &&
+                                          v < -200) {
+                                        _queueAnim.animateTo(1.0, curve: Curves.easeOutCubic);
+                                        return true;
+                                      }
+                                    }
+                                    return false;
+                                  },
+                                  child: _lyricsBody(),
+                                ),
+                              ),
+                              GestureDetector(
+                                behavior: HitTestBehavior.translucent,
+                                onVerticalDragStart: (_) => _fsVerticalDragDist = 0.0,
+                                onVerticalDragUpdate: (details) {
+                                  _fsVerticalDragDist += details.delta.dy;
+                                },
+                                onVerticalDragEnd: (details) {
+                                  final v = details.primaryVelocity ?? 0.0;
+                                  if (v > 250 || _fsVerticalDragDist > 60) {
+                                    _queueAnim.value = 0.0;
+                                    setState(() => _fullScreen = false);
+                                  } else if (v < -250 || _fsVerticalDragDist < -60) {
+                                    _queueAnim.animateTo(1.0, curve: Curves.easeOutCubic);
+                                  }
+                                  _fsVerticalDragDist = 0.0;
+                                },
+                                child: Column(
+                                  children: [
+                                    const SizedBox(height: 22),
+                                    _fullScreenSlider(),
+                                    _fullScreenControls(),
+                                    const SizedBox(height: 12),
+                                    SizedBox(height: collapsedHeight + 14),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
                 ],
               ),
@@ -5233,22 +6367,31 @@ Widget _fullScreenView() {
             AnimatedBuilder(
               animation: _queueAnim,
               builder: (context, _) {
-                final t = Curves.easeOutCubic.transform(_queueAnim.value);
+                final animVal = _queueAnim.value;
                 final currentHeight =
-                    ui.lerpDouble(collapsedHeight, maxSheetHeight, t)!;
-                final isExpanded = _queueAnim.value > 0.05;
+                    ui.lerpDouble(collapsedHeight, maxSheetHeight, animVal)!;
+                final isExpanded = animVal > 0.03;
 
                 return Stack(
                   children: [
                     if (isExpanded)
                       Positioned.fill(
                         child: GestureDetector(
+                          behavior: HitTestBehavior.opaque,
                           onTap: () => _queueAnim.animateTo(
                             0.0,
                             curve: Curves.easeOutCubic,
                           ),
+                          onVerticalDragUpdate: (details) =>
+                              _onQueueDragUpdate(
+                            details,
+                            collapsedHeight,
+                            maxSheetHeight,
+                          ),
+                          onVerticalDragEnd: _onQueueDragEnd,
                           child: Container(
-                            color: Colors.black.withValues(alpha: 0.48 * t),
+                            color:
+                                Colors.black.withValues(alpha: 0.48 * animVal),
                           ),
                         ),
                       ),
@@ -5260,7 +6403,7 @@ Widget _fullScreenView() {
                       child: _buildUpNextSheet(
                         track: track,
                         artworkColor: artworkColor,
-                        t: t,
+                        animVal: animVal,
                         collapsedHeight: collapsedHeight,
                         maxHeight: maxSheetHeight,
                         bottomPadding: bottomPadding,
@@ -5277,35 +6420,108 @@ Widget _fullScreenView() {
   );
 }
 
-  Widget _fullScreenControls() => Row(
-    mainAxisAlignment: MainAxisAlignment.center,
-    children: [
-      IconButton(
-        onPressed: _previous,
-        icon: Icon(
-          PhosphorIconsRegular.skipBack,
-          size: 30,
-          color: _textColor,
-        ),
+  Widget _fullScreenControls() {
+    final shuffleActive = _isShuffle;
+    final repeatActive = _repeatMode != PlaybackRepeatMode.off;
+    final activeColor =
+        _isLight ? const Color(0xff2563eb) : const Color(0xff60a5fa);
+    final inactiveColor = _textColor.withValues(alpha: 0.50);
+
+    final IconData repeatIcon = switch (_repeatMode) {
+      PlaybackRepeatMode.off => PhosphorIconsRegular.repeat,
+      PlaybackRepeatMode.all => PhosphorIconsRegular.repeat,
+      PlaybackRepeatMode.one => PhosphorIconsRegular.repeatOnce,
+    };
+
+    final String repeatTooltip = switch (_repeatMode) {
+      PlaybackRepeatMode.off => 'Repeat: Off',
+      PlaybackRepeatMode.all => 'Repeat: All',
+      PlaybackRepeatMode.one => 'Repeat: One',
+    };
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 18),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          IconButton(
+            onPressed: _toggleShuffle,
+            splashRadius: 22,
+            icon: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  PhosphorIconsRegular.shuffle,
+                  size: 22,
+                  color: shuffleActive ? activeColor : inactiveColor,
+                ),
+                const SizedBox(height: 3),
+                Container(
+                  width: 4,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: shuffleActive ? activeColor : Colors.transparent,
+                    shape: BoxShape.circle,
+                  ),
+                ),
+              ],
+            ),
+            tooltip: shuffleActive ? 'Shuffle: On' : 'Shuffle: Off',
+          ),
+          IconButton(
+            onPressed: _previous,
+            splashRadius: 26,
+            icon: Icon(
+              PhosphorIconsRegular.skipBack,
+              size: 30,
+              color: _textColor,
+            ),
+            tooltip: 'Previous',
+          ),
+          _buildPlayPauseButton(
+            iconSize: 62,
+            spinnerSize: 50,
+            strokeWidth: 3.0,
+            color: _textColor,
+          ),
+          IconButton(
+            onPressed: _next,
+            splashRadius: 26,
+            icon: Icon(
+              PhosphorIconsRegular.skipForward,
+              size: 30,
+              color: _textColor,
+            ),
+            tooltip: 'Next',
+          ),
+          IconButton(
+            onPressed: _toggleRepeatMode,
+            splashRadius: 22,
+            icon: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  repeatIcon,
+                  size: 22,
+                  color: repeatActive ? activeColor : inactiveColor,
+                ),
+                const SizedBox(height: 3),
+                Container(
+                  width: 4,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: repeatActive ? activeColor : Colors.transparent,
+                    shape: BoxShape.circle,
+                  ),
+                ),
+              ],
+            ),
+            tooltip: repeatTooltip,
+          ),
+        ],
       ),
-      const SizedBox(width: 16),
-      _buildPlayPauseButton(
-        iconSize: 62,
-        spinnerSize: 50,
-        strokeWidth: 3.0,
-        color: _textColor,
-      ),
-      const SizedBox(width: 16),
-      IconButton(
-        onPressed: _next,
-        icon: Icon(
-          PhosphorIconsRegular.skipForward,
-          size: 30,
-          color: _textColor,
-        ),
-      ),
-    ],
-  );
+    );
+  }
 
   Widget _fullScreenSlider() => StreamBuilder<Duration?>(
     stream: _audio.durationStream,
@@ -5489,6 +6705,52 @@ Widget _fullScreenView() {
     }
   }
 
+  void _toggleRepeatMode() {
+    setState(() {
+      switch (_repeatMode) {
+        case PlaybackRepeatMode.off:
+          _repeatMode = PlaybackRepeatMode.all;
+          break;
+        case PlaybackRepeatMode.all:
+          _repeatMode = PlaybackRepeatMode.one;
+          break;
+        case PlaybackRepeatMode.one:
+          _repeatMode = PlaybackRepeatMode.off;
+          break;
+      }
+    });
+    UserStorage.saveRepeatMode(_repeatMode.name);
+  }
+
+  void _toggleShuffle() {
+    setState(() {
+      _isShuffle = !_isShuffle;
+      if (_isShuffle) {
+        if (_playbackMode == PlaybackMode.playlist) {
+          if (_unshuffledPlaylist.isEmpty && _playlistQueue.isNotEmpty) {
+            _unshuffledPlaylist = List<Song>.from(_playlistQueue);
+          }
+          _shuffleQueue();
+        } else {
+          if (_suggestionQueue.length > 1) {
+            _suggestionQueue.shuffle();
+          }
+        }
+      } else {
+        if (_playbackMode == PlaybackMode.playlist &&
+            _unshuffledPlaylist.isNotEmpty) {
+          final cur = _current;
+          _playlistQueue = List<Song>.from(_unshuffledPlaylist);
+          if (cur != null) {
+            final idx = _playlistQueue.indexWhere((s) => s.id == cur.id);
+            _playlistQueueIndex = idx >= 0 ? idx : 0;
+          }
+        }
+      }
+    });
+    UserStorage.saveShuffle(_isShuffle);
+  }
+
   void _shuffleQueue() {
     if (_playbackMode == PlaybackMode.playlist) {
       if (_playlistQueue.length > 2) {
@@ -5508,6 +6770,49 @@ Widget _fullScreenView() {
         setState(() {});
       }
     }
+  }
+
+  void _removeFromQueue(Song song) {
+    setState(() {
+      // 1. Remove from playlist queue (active playlist loop)
+      final currentSong = (_playlistQueueIndex >= 0 && _playlistQueueIndex < _playlistQueue.length)
+          ? _playlistQueue[_playlistQueueIndex]
+          : null;
+      _playlistQueue.removeWhere(
+          (s) => s.id == song.id || (s.streamUrl != null && s.streamUrl == song.streamUrl));
+      if (_playlistQueue.isEmpty) {
+        _playlistQueueIndex = -1;
+      } else if (currentSong != null) {
+        final newIdx = _playlistQueue.indexWhere(
+            (s) => s.id == currentSong.id || (s.streamUrl != null && s.streamUrl == currentSong.streamUrl));
+        if (newIdx != -1) {
+          _playlistQueueIndex = newIdx;
+        } else {
+          _playlistQueueIndex = _playlistQueueIndex.clamp(0, _playlistQueue.length - 1);
+        }
+      } else {
+        _playlistQueueIndex = _playlistQueueIndex.clamp(0, _playlistQueue.length - 1);
+      }
+
+      // 2. Remove from suggestion queue (Up Next in suggestion mode)
+      _suggestionQueue.removeWhere(
+          (s) => s.id == song.id || (s.streamUrl != null && s.streamUrl == song.streamUrl));
+
+      // 3. Remove from playback history forward queue (Up Next from history)
+      _playbackHistory.removeWhere(
+          (s) => s.id == song.id || (s.streamUrl != null && s.streamUrl == song.streamUrl));
+      if (_playbackHistoryIndex >= _playbackHistory.length) {
+        _playbackHistoryIndex = _playbackHistory.length - 1;
+      }
+
+      // 4. Invalidate prepared song and reset crossfade buffer if it was the removed track
+      if (_preparedSong?.id == song.id ||
+          (_preparedStreamUrl != null && _preparedStreamUrl == song.streamUrl)) {
+        _preparedSong = null;
+        _preparedStreamUrl = null;
+        _audio.clearPrepared();
+      }
+    });
   }
 
   void _reorderQueueItem(int oldIndex, int newIndex) {
@@ -5545,80 +6850,295 @@ Widget _fullScreenView() {
     });
   }
 
-  void _onQueueDragUpdate(DragUpdateDetails details, double maxHeight) {
-    if (maxHeight <= 0) return;
+  void _onQueueDragUpdate(
+    DragUpdateDetails details,
+    double collapsedHeight,
+    double maxHeight,
+  ) {
+    final travelDistance = maxHeight - collapsedHeight;
+    if (travelDistance <= 0) return;
     final delta = details.primaryDelta ?? 0.0;
-    _queueAnim.value = (_queueAnim.value - (delta / maxHeight)).clamp(0.0, 1.0);
+    _queueAnim.value =
+        (_queueAnim.value - (delta / travelDistance)).clamp(0.0, 1.0);
   }
 
   void _onQueueDragEnd(DragEndDetails details) {
     final velocity = details.primaryVelocity ?? 0.0;
-    if (velocity < -250) {
+    if (velocity < -120) {
       _queueAnim.animateTo(1.0, curve: Curves.easeOutCubic);
-    } else if (velocity > 250) {
+    } else if (velocity > 80) {
       _queueAnim.animateTo(0.0, curve: Curves.easeOutCubic);
-    } else if (_queueAnim.value >= 0.4) {
-      _queueAnim.animateTo(1.0, curve: Curves.easeOutCubic);
+    } else if (_queueAnim.value < 0.70) {
+      _queueAnim.animateTo(0.0, curve: Curves.easeOutCubic);
     } else {
-      _queueAnim.animateTo(0.0, curve: Curves.easeOutCubic);
+      _queueAnim.animateTo(1.0, curve: Curves.easeOutCubic);
     }
   }
 
   Widget _buildUpNextSheet({
     required Song track,
     required Color artworkColor,
-    required double t,
+    required double animVal,
     required double collapsedHeight,
     required double maxHeight,
     required double bottomPadding,
   }) {
     final queue = _upcomingQueue;
-    final isExpanded = t > 0.18;
+    final solidSheetBg = _isLight ? Colors.white : const Color(0xff16161b);
+    final collapsedSheetBg = _isLight
+        ? Colors.white.withValues(alpha: 0.62)
+        : const Color(0xff141418).withValues(alpha: 0.52);
+    final sheetBgColor =
+        Color.lerp(collapsedSheetBg, solidSheetBg, animVal)!;
 
     return Container(
       decoration: BoxDecoration(
-        color: _isLight ? Colors.white : const Color(0xff18181c),
         borderRadius: const BorderRadius.vertical(top: Radius.circular(22)),
-        border: Border(
-          top: BorderSide(
-            color: _isLight
-                ? const Color(0x20000000)
-                : Colors.white.withValues(alpha: 0.18),
-            width: 1.0,
-          ),
-        ),
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withValues(alpha: 0.38),
-            blurRadius: 22,
-            offset: const Offset(0, -6),
+            color: Colors.black.withValues(alpha: 0.22 + 0.18 * animVal),
+            blurRadius: 20,
+            offset: const Offset(0, -4),
           ),
         ],
       ),
-      child: isExpanded
-          ? Column(
+      child: ClipRRect(
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(22)),
+        child: BackdropFilter(
+          filter: ui.ImageFilter.blur(sigmaX: 18, sigmaY: 18),
+          child: Container(
+            decoration: BoxDecoration(
+              color: sheetBgColor,
+              borderRadius:
+                  const BorderRadius.vertical(top: Radius.circular(22)),
+              border: Border(
+                top: BorderSide(
+                  color: _isLight
+                      ? Colors.black.withValues(alpha: 0.08 + 0.04 * animVal)
+                      : Colors.white.withValues(alpha: 0.14 + 0.06 * animVal),
+                  width: 1.0,
+                ),
+              ),
+            ),
+            child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                GestureDetector(
-                  behavior: HitTestBehavior.opaque,
-                  onVerticalDragUpdate: (details) =>
-                      _onQueueDragUpdate(details, maxHeight),
-                  onVerticalDragEnd: _onQueueDragEnd,
-                  child: Column(
-                    children: [
-                      const SizedBox(height: 8),
-                      Container(
-                        width: 38,
-                        height: 4.5,
-                        decoration: BoxDecoration(
-                          color: _isLight
-                              ? const Color(0x32000000)
-                              : Colors.white24,
-                          borderRadius: BorderRadius.circular(2),
+                _buildUpNextHeader(
+                  queue: queue,
+                  animVal: animVal,
+                  collapsedHeight: collapsedHeight,
+                  maxHeight: maxHeight,
+                  bottomPadding: bottomPadding,
+                ),
+                Expanded(
+                  child: animVal > 0.03
+                      ? Opacity(
+                          opacity: ((animVal - 0.03) / 0.20).clamp(0.0, 1.0),
+                          child: NotificationListener<ScrollNotification>(
+                            onNotification: (notification) {
+                              if (notification is OverscrollNotification) {
+                                if (notification.overscroll < -12) {
+                                  _queueAnim.animateTo(
+                                    0.0,
+                                    curve: Curves.easeOutCubic,
+                                  );
+                                  return true;
+                                }
+                              } else if (notification
+                                  is ScrollUpdateNotification) {
+                                if (notification.metrics.pixels <= 0 &&
+                                    (notification.scrollDelta ?? 0) < -12) {
+                                  _queueAnim.animateTo(
+                                    0.0,
+                                    curve: Curves.easeOutCubic,
+                                  );
+                                  return true;
+                                }
+                              } else if (notification
+                                  is ScrollEndNotification) {
+                                final v = notification
+                                        .dragDetails?.primaryVelocity ??
+                                    0.0;
+                                if (notification.metrics.pixels <= 5 &&
+                                    (v > 100 ||
+                                        notification.metrics.pixels < -10)) {
+                                  _queueAnim.animateTo(
+                                    0.0,
+                                    curve: Curves.easeOutCubic,
+                                  );
+                                  return true;
+                                }
+                              }
+                              return false;
+                            },
+                            child: _buildQueueList(track, queue),
+                          ),
+                        )
+                      : GestureDetector(
+                          behavior: HitTestBehavior.opaque,
+                          onTap: () => _queueAnim.animateTo(
+                            1.0,
+                            curve: Curves.easeOutCubic,
+                          ),
+                          onVerticalDragUpdate: (details) =>
+                              _onQueueDragUpdate(
+                            details,
+                            collapsedHeight,
+                            maxHeight,
+                          ),
+                          onVerticalDragEnd: _onQueueDragEnd,
+                          child: const SizedBox.expand(),
+                        ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildUpNextHeader({
+    required List<Song> queue,
+    required double animVal,
+    required double collapsedHeight,
+    required double maxHeight,
+    required double bottomPadding,
+  }) {
+    final bottomInset = bottomPadding * (1.0 - animVal).clamp(0.0, 1.0);
+    final activeColor =
+        _isLight ? const Color(0xff2563eb) : const Color(0xff60a5fa);
+    final shuffleActive = _isShuffle;
+    final repeatActive = _repeatMode != PlaybackRepeatMode.off;
+
+    final IconData repeatIcon = switch (_repeatMode) {
+      PlaybackRepeatMode.off => PhosphorIconsRegular.repeat,
+      PlaybackRepeatMode.all => PhosphorIconsRegular.repeat,
+      PlaybackRepeatMode.one => PhosphorIconsRegular.repeatOnce,
+    };
+
+    final String repeatTooltip = switch (_repeatMode) {
+      PlaybackRepeatMode.off => 'Repeat: Off',
+      PlaybackRepeatMode.all => 'Repeat: All',
+      PlaybackRepeatMode.one => 'Repeat: One',
+    };
+
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: () {
+        if (_queueAnim.value < 0.5) {
+          _queueAnim.animateTo(1.0, curve: Curves.easeOutCubic);
+        } else {
+          _queueAnim.animateTo(0.0, curve: Curves.easeOutCubic);
+        }
+      },
+      onVerticalDragUpdate: (details) =>
+          _onQueueDragUpdate(details, collapsedHeight, maxHeight),
+      onVerticalDragEnd: _onQueueDragEnd,
+      child: Container(
+        color: Colors.transparent,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const SizedBox(height: 7),
+            Center(
+              child: Container(
+                width: 36,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: _isLight
+                      ? Colors.black.withValues(alpha: 0.20 + 0.10 * animVal)
+                      : Colors.white.withValues(alpha: 0.24 + 0.10 * animVal),
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+            ),
+            const SizedBox(height: 5),
+            SizedBox(
+              height: 36,
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  // Collapsed header row
+                  Opacity(
+                    opacity: (1.0 - animVal * 2.5).clamp(0.0, 1.0),
+                    child: IgnorePointer(
+                      ignoring: animVal > 0.15,
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 16),
+                        child: Row(
+                          children: [
+                            Icon(
+                              PhosphorIconsRegular.playlist,
+                              size: 17,
+                              color: _textColor,
+                            ),
+                            const SizedBox(width: 8),
+                            Text(
+                              'UP NEXT',
+                              style: TextStyle(
+                                fontSize: 12,
+                                fontWeight: FontWeight.w800,
+                                letterSpacing: 0.8,
+                                color: _textColor,
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 6,
+                                vertical: 1.5,
+                              ),
+                              decoration: BoxDecoration(
+                                color: _isLight
+                                    ? Colors.black.withValues(alpha: 0.08)
+                                    : Colors.white.withValues(alpha: 0.12),
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                              child: Text(
+                                '${queue.length}',
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w700,
+                                  color: _textColor,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            if (queue.isNotEmpty)
+                              Expanded(
+                                child: Text(
+                                  'Next: ${queue.first.title}',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  textAlign: TextAlign.end,
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    color: _subtextColor,
+                                    fontWeight: FontWeight.w500,
+                                  ),
+                                ),
+                              )
+                            else
+                              const Spacer(),
+                            const SizedBox(width: 6),
+                            Icon(
+                              PhosphorIconsRegular.caretUp,
+                              size: 16,
+                              color: _subtextColor,
+                            ),
+                          ],
                         ),
                       ),
-                      Padding(
-                        padding: const EdgeInsets.fromLTRB(18, 8, 10, 8),
+                    ),
+                  ),
+                  // Expanded header row
+                  Opacity(
+                    opacity: ((animVal - 0.15) * 2.5).clamp(0.0, 1.0),
+                    child: IgnorePointer(
+                      ignoring: animVal < 0.15,
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 0, 8, 0),
                         child: Row(
                           children: [
                             Icon(
@@ -5645,143 +7165,96 @@ Widget _fullScreenView() {
                                 color: _isLight
                                     ? Colors.black.withValues(alpha: 0.06)
                                     : Colors.white.withValues(alpha: 0.12),
-                                borderRadius: BorderRadius.circular(12),
-                              ),
-                              child: Text(
-                                '${queue.length} ${queue.length == 1 ? 'song' : 'songs'}',
-                                style: TextStyle(
-                                  fontSize: 11.5,
-                                  fontWeight: FontWeight.w700,
-                                  color: _textColor,
-                                ),
-                              ),
-                            ),
-                            const Spacer(),
-                            if (queue.length > 1)
-                              IconButton(
-                                onPressed: _shuffleQueue,
-                                icon: Icon(
-                                  PhosphorIconsRegular.shuffle,
-                                  size: 19,
-                                  color: _textColor,
-                                ),
-                                tooltip: 'Shuffle queue',
-                              ),
-                            IconButton(
-                              onPressed: () => _queueAnim.animateTo(
-                                0.0,
-                                curve: Curves.easeOutCubic,
-                              ),
-                              icon: Icon(
-                                PhosphorIconsRegular.caretDown,
-                                size: 20,
-                                color: _textColor,
-                              ),
-                              tooltip: 'Collapse',
-                            ),
-                          ],
-                        ),
-                      ),
-                      Divider(color: _borderColor, height: 1),
-                    ],
-                  ),
-                ),
-                Expanded(
-                  child: _buildQueueList(track, queue),
-                ),
-              ],
-            )
-          : GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onTap: () =>
-                  _queueAnim.animateTo(1.0, curve: Curves.easeOutCubic),
-              onVerticalDragUpdate: (details) =>
-                  _onQueueDragUpdate(details, maxHeight),
-              onVerticalDragEnd: _onQueueDragEnd,
-              child: SafeArea(
-                top: false,
-                child: Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 6, 16, 0),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Container(
-                        width: 36,
-                        height: 4,
-                        decoration: BoxDecoration(
-                          color: _isLight
-                              ? const Color(0x30000000)
-                              : Colors.white24,
-                          borderRadius: BorderRadius.circular(2),
-                        ),
-                      ),
-                      const SizedBox(height: 8),
-                      Row(
-                        children: [
-                          Icon(
-                            PhosphorIconsRegular.playlist,
-                            size: 17,
-                            color: _textColor,
-                          ),
-                          const SizedBox(width: 8),
-                          Text(
-                            'UP NEXT',
-                            style: TextStyle(
-                              fontSize: 12.5,
-                              fontWeight: FontWeight.w800,
-                              letterSpacing: 0.8,
-                              color: _textColor,
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 6,
-                              vertical: 2,
-                            ),
-                            decoration: BoxDecoration(
-                              color: _isLight
-                                  ? Colors.black.withValues(alpha: 0.08)
-                                  : Colors.white.withValues(alpha: 0.12),
-                              borderRadius: BorderRadius.circular(10),
+                              borderRadius: BorderRadius.circular(12),
                             ),
                             child: Text(
-                              '${queue.length}',
+                              '${queue.length} ${queue.length == 1 ? 'song' : 'songs'}',
                               style: TextStyle(
-                                fontSize: 11,
+                                fontSize: 11.5,
                                 fontWeight: FontWeight.w700,
                                 color: _textColor,
                               ),
                             ),
                           ),
-                          const SizedBox(width: 10),
-                          if (queue.isNotEmpty)
-                            Expanded(
-                              child: Text(
-                                'Next: ${queue.first.title}',
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                textAlign: TextAlign.end,
-                                style: TextStyle(
-                                  fontSize: 12,
-                                  color: _subtextColor,
-                                  fontWeight: FontWeight.w500,
-                                ),
-                              ),
+                          const Spacer(),
+                          // Shuffle button
+                          IconButton(
+                            onPressed: _toggleShuffle,
+                            padding: EdgeInsets.zero,
+                            visualDensity: VisualDensity.compact,
+                            constraints: const BoxConstraints(
+                              minWidth: 32,
+                              minHeight: 32,
                             ),
-                          const SizedBox(width: 6),
-                          Icon(
-                            PhosphorIconsRegular.caretUp,
-                            size: 16,
-                            color: _subtextColor,
+                            splashRadius: 18,
+                            icon: Icon(
+                              PhosphorIconsRegular.shuffle,
+                              size: 19,
+                              color: shuffleActive
+                                  ? activeColor
+                                  : _subtextColor,
+                            ),
+                            tooltip: shuffleActive
+                                ? 'Shuffle: On'
+                                : 'Shuffle: Off',
+                          ),
+                          const SizedBox(width: 4),
+                          // Repeat button (Repeat One / Repeat All / Off)
+                          IconButton(
+                            onPressed: _toggleRepeatMode,
+                            padding: EdgeInsets.zero,
+                            visualDensity: VisualDensity.compact,
+                            constraints: const BoxConstraints(
+                              minWidth: 32,
+                              minHeight: 32,
+                            ),
+                            splashRadius: 18,
+                            icon: Icon(
+                              repeatIcon,
+                              size: 19,
+                              color: repeatActive
+                                  ? activeColor
+                                  : _subtextColor,
+                            ),
+                            tooltip: repeatTooltip,
+                          ),
+                          const SizedBox(width: 4),
+                          IconButton(
+                            onPressed: () => _queueAnim.animateTo(
+                              0.0,
+                              curve: Curves.easeOutCubic,
+                            ),
+                            padding: EdgeInsets.zero,
+                            visualDensity: VisualDensity.compact,
+                            constraints: const BoxConstraints(
+                              minWidth: 32,
+                              minHeight: 32,
+                            ),
+                            splashRadius: 18,
+                            icon: Icon(
+                              PhosphorIconsRegular.caretDown,
+                              size: 20,
+                              color: _textColor,
+                            ),
+                            tooltip: 'Collapse',
                           ),
                         ],
                       ),
-                    ],
+                    ),
                   ),
                 ),
+              ],
               ),
             ),
+            if (animVal > 0.05)
+              Opacity(
+                opacity: animVal.clamp(0.0, 1.0),
+                child: Divider(color: _borderColor, height: 1),
+              ),
+            if (bottomInset > 0) SizedBox(height: bottomInset),
+          ],
+        ),
+      ),
     );
   }
 
@@ -5864,6 +7337,9 @@ Widget _fullScreenView() {
   Widget _buildQueueList(Song currentSong, List<Song> queue) {
     if (queue.isEmpty) {
       return ListView(
+        physics: const AlwaysScrollableScrollPhysics(
+          parent: BouncingScrollPhysics(),
+        ),
         padding: EdgeInsets.fromLTRB(
           16,
           10,
@@ -5871,7 +7347,15 @@ Widget _fullScreenView() {
           math.max(MediaQuery.paddingOf(context).bottom, 16.0) + 12.0,
         ),
         children: [
-          _buildQueueNowPlayingCard(currentSong),
+          GestureDetector(
+            behavior: HitTestBehavior.translucent,
+            onVerticalDragEnd: (details) {
+              if ((details.primaryVelocity ?? 0) > 100) {
+                _queueAnim.animateTo(0.0, curve: Curves.easeOutCubic);
+              }
+            },
+            child: _buildQueueNowPlayingCard(currentSong),
+          ),
           const SizedBox(height: 16),
           Padding(
             padding: const EdgeInsets.only(bottom: 8),
@@ -5923,43 +7407,54 @@ Widget _fullScreenView() {
     }
 
     return ReorderableListView.builder(
+      physics: const AlwaysScrollableScrollPhysics(
+        parent: BouncingScrollPhysics(),
+      ),
       padding: EdgeInsets.fromLTRB(
         16,
         10,
         16,
         math.max(MediaQuery.paddingOf(context).bottom, 16.0) + 16.0,
       ),
-      header: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          _buildQueueNowPlayingCard(currentSong),
-          const SizedBox(height: 16),
-          Padding(
-            padding: const EdgeInsets.only(bottom: 8),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Text(
-                  'UP NEXT',
-                  style: TextStyle(
-                    fontSize: 11,
-                    fontWeight: FontWeight.w800,
-                    letterSpacing: 1.0,
-                    color: _subtextColor,
+      header: GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onVerticalDragEnd: (details) {
+          if ((details.primaryVelocity ?? 0) > 100) {
+            _queueAnim.animateTo(0.0, curve: Curves.easeOutCubic);
+          }
+        },
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _buildQueueNowPlayingCard(currentSong),
+            const SizedBox(height: 16),
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(
+                    'UP NEXT',
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: 1.0,
+                      color: _subtextColor,
+                    ),
                   ),
-                ),
-                Text(
-                  'Hold or drag to reorder',
-                  style: TextStyle(
-                    fontSize: 11,
-                    fontWeight: FontWeight.w600,
-                    color: _subtextColor.withValues(alpha: 0.7),
+                  Text(
+                    'Hold or drag to reorder',
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w600,
+                      color: _subtextColor.withValues(alpha: 0.7),
+                    ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
       itemCount: queue.length,
       buildDefaultDragHandles: false,
@@ -6036,9 +7531,9 @@ Widget _fullScreenView() {
                     song.title,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
+                    style: GoogleFonts.manrope(
                       fontSize: 13.5,
-                      fontWeight: FontWeight.w600,
+                      fontWeight: FontWeight.w800,
                       color: _textColor,
                     ),
                   ),
@@ -6066,7 +7561,20 @@ Widget _fullScreenView() {
                   ),
                 ),
               ),
-            const SizedBox(width: 6),
+            IconButton(
+              padding: EdgeInsets.zero,
+              visualDensity: VisualDensity.compact,
+              constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+              splashRadius: 16,
+              icon: Icon(
+                PhosphorIconsRegular.x,
+                size: 16,
+                color: _subtextColor.withValues(alpha: 0.6),
+              ),
+              onPressed: () => _removeFromQueue(song),
+              tooltip: 'Remove from queue',
+            ),
+            const SizedBox(width: 4),
             ReorderableDragStartListener(
               index: index,
               child: Container(
@@ -6186,6 +7694,7 @@ Widget _fullScreenView() {
     final updated = Map<String, Song>.from(_likedSongs);
     if (currentlyLiked) {
       updated.remove(song.id);
+      _removeFromQueue(song);
     } else {
       updated[song.id] = song;
     }
@@ -6235,23 +7744,15 @@ Widget _fullScreenView() {
                   width: 44,
                   height: 44,
                   decoration: BoxDecoration(
-                    gradient: const LinearGradient(
-                      colors: [Color(0xffff416c), Color(0xffff4b2b)],
-                      begin: Alignment.topLeft,
-                      end: Alignment.bottomRight,
-                    ),
+                    color: _isLight
+                        ? const Color(0xfff1f5f9)
+                        : Colors.white.withValues(alpha: .08),
                     borderRadius: BorderRadius.circular(12),
-                    boxShadow: [
-                      BoxShadow(
-                        color: const Color(0xffff416c).withValues(alpha: .3),
-                        blurRadius: 10,
-                        offset: const Offset(0, 3),
-                      ),
-                    ],
+                    border: Border.all(color: _borderColor),
                   ),
-                  child: const Icon(
+                  child: Icon(
                     PhosphorIconsFill.heart,
-                    color: Colors.white,
+                    color: _textColor,
                     size: 22,
                   ),
                 ),
@@ -6274,6 +7775,48 @@ Widget _fullScreenView() {
                 ),
                 onTap: () {
                   Navigator.of(ctx).pop('liked');
+                },
+              ),
+              ListTile(
+                contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 4,
+                  vertical: 4,
+                ),
+                leading: Container(
+                  width: 44,
+                  height: 44,
+                  decoration: BoxDecoration(
+                    color: _isLight
+                        ? const Color(0xfff1f5f9)
+                        : Colors.white.withValues(alpha: .08),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: _borderColor),
+                  ),
+                  child: Icon(
+                    PhosphorIconsRegular.musicNotes,
+                    color: _textColor,
+                    size: 22,
+                  ),
+                ),
+                title: Text(
+                  'Offline Songs',
+                  style: TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.w700,
+                    color: _textColor,
+                  ),
+                ),
+                subtitle: Text(
+                  '${_offlineSongs.length} ${_offlineSongs.length == 1 ? 'device track' : 'device tracks'}',
+                  style: TextStyle(fontSize: 12, color: _subtextColor),
+                ),
+                trailing: Icon(
+                  PhosphorIconsRegular.caretRight,
+                  color: _subtextColor,
+                  size: 20,
+                ),
+                onTap: () {
+                  Navigator.of(ctx).pop('offline');
                 },
               ),
               ListTile(
@@ -6374,9 +7917,20 @@ Widget _fullScreenView() {
     } else if (choice == 'liked') {
       setState(() {
         _viewingLikedSongs = true;
+        _viewingOfflineSongs = false;
         _openedPlaylist = null;
         _homeMode = false;
       });
+    } else if (choice == 'offline') {
+      setState(() {
+        _viewingOfflineSongs = true;
+        _viewingLikedSongs = false;
+        _openedPlaylist = null;
+        _homeMode = false;
+      });
+      if (_offlineSongs.isEmpty && !_isScanningOffline) {
+        unawaited(_scanDeviceForAudio(showFeedback: false));
+      }
     }
   }
 
@@ -6581,6 +8135,31 @@ Widget _fullScreenView() {
                 _toggleLike(song);
               },
             ),
+            if (_openedPlaylist != null &&
+                _openedPlaylist!.songs.any((s) => s.id == song.id))
+              ListTile(
+                contentPadding: const EdgeInsets.symmetric(horizontal: 4),
+                leading: const Icon(
+                  PhosphorIconsRegular.trash,
+                  color: Colors.redAccent,
+                  size: 24,
+                ),
+                title: const Text(
+                  'Remove from Playlist',
+                  style: TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w600,
+                    color: Colors.redAccent,
+                  ),
+                ),
+                onTap: () {
+                  Navigator.of(ctx).pop();
+                  setState(() {
+                    _openedPlaylist!.songs.removeWhere((s) => s.id == song.id);
+                  });
+                  _removeFromQueue(song);
+                },
+              ),
             ListTile(
               contentPadding: const EdgeInsets.symmetric(horizontal: 4),
               leading: Icon(
@@ -6732,10 +8311,11 @@ Widget _fullScreenView() {
                 children: [
                   Text(
                     'Liked Songs',
-                    style: TextStyle(
+                    style: GoogleFonts.manrope(
                       fontSize: 22,
-                      fontWeight: FontWeight.w800,
+                      fontWeight: FontWeight.w900,
                       color: _textColor,
+                      letterSpacing: -0.4,
                     ),
                   ),
                   const SizedBox(height: 6),
@@ -6907,11 +8487,11 @@ Widget _fullScreenView() {
                     song.title,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontWeight: FontWeight.w700,
+                    style: GoogleFonts.manrope(
+                      fontWeight: FontWeight.w800,
                       fontSize: 14,
                       color: isCurrent
-                          ? _textColor
+                          ? (_isLight ? const Color(0xff2563eb) : const Color(0xff60a5fa))
                           : _textColor.withValues(alpha: .9),
                     ),
                   ),
@@ -6948,6 +8528,1293 @@ Widget _fullScreenView() {
             ),
             IconButton(
               onPressed: () => _showSongOptions(song, likedList),
+              icon: Icon(
+                PhosphorIconsRegular.dotsThreeVertical,
+                size: 20,
+                color: _subtextColor,
+              ),
+              tooltip: 'More options',
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /* --------------------------- OFFLINE SONGS (DEVICE) ---------------------- */
+
+  Future<void> _loadOfflineSongs() async {
+    try {
+      final rawList = await UserStorage.getOfflineSongsRaw();
+      final loaded = <Song>[];
+      for (final item in rawList) {
+        final song = Song.fromJson(item);
+        final stream = song.streamUrl;
+        if (stream != null && stream.isNotEmpty) {
+          final lower = stream.toLowerCase();
+          // Exclude any WhatsApp voice notes or files
+          if (lower.contains('whatsapp') ||
+              lower.contains('com.whatsapp') ||
+              lower.endsWith('.opus')) {
+            continue;
+          }
+          final clean = stream.startsWith('file://') ? Uri.parse(stream).toFilePath() : stream;
+          final file = File(clean);
+          if (await file.exists()) {
+            loaded.add(song);
+          }
+        }
+      }
+      if (mounted) {
+        setState(() => _offlineSongs = loaded);
+      }
+      // If any WhatsApp audio was purged, save the cleaned list back to storage
+      if (loaded.length != rawList.length) {
+        unawaited(UserStorage.saveOfflineSongsRaw(loaded.map((s) => s.toJson()).toList()));
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _saveOfflineSongs() async {
+    try {
+      final list = _offlineSongs.map((s) => s.toJson()).toList();
+      await UserStorage.saveOfflineSongsRaw(list);
+    } catch (_) {}
+  }
+
+  Song _fileToSong(File file) {
+    final fileName = file.uri.pathSegments.isNotEmpty ? file.uri.pathSegments.last : 'Unknown Audio';
+    String cleanTitle = fileName;
+    final dotIndex = cleanTitle.lastIndexOf('.');
+    if (dotIndex > 0) {
+      cleanTitle = cleanTitle.substring(0, dotIndex);
+    }
+    String artist = 'Device Audio';
+    String title = cleanTitle;
+    if (cleanTitle.contains(' - ')) {
+      final parts = cleanTitle.split(' - ');
+      if (parts.length >= 2) {
+        artist = parts[0].trim();
+        title = parts.sublist(1).join(' - ').trim();
+      }
+    } else if (cleanTitle.contains('-')) {
+      final parts = cleanTitle.split('-');
+      if (parts.length >= 2) {
+        artist = parts[0].trim();
+        title = parts.sublist(1).join('-').trim();
+      }
+    }
+    return Song(
+      id: 'offline_${file.path}',
+      title: title.isEmpty ? 'Unknown Track' : title,
+      artist: artist.isEmpty ? 'Device Audio' : artist,
+      album: 'Device Storage',
+      artwork: '',
+      streamUrl: file.path,
+    );
+  }
+
+  Future<void> _scanDeviceForAudio({bool showFeedback = true}) async {
+    if (_isScanningOffline) return;
+    setState(() => _isScanningOffline = true);
+
+    int newlyFound = 0;
+    try {
+      final currentPaths = _offlineSongs
+          .map((s) => s.streamUrl)
+          .whereType<String>()
+          .toSet();
+      final added = <Song>[];
+
+      // 1. High-speed native Android MediaStore query (runs on native background worker thread)
+      if (Platform.isAndroid) {
+        try {
+          const channel = MethodChannel('com.example.song_player_mobile/offline_audio');
+          await channel.invokeMethod<bool>('requestStoragePermission');
+          final mediaFiles = await channel.invokeListMethod<Map>('getAudioFiles');
+          if (mediaFiles != null) {
+            for (final item in mediaFiles) {
+              final path = item['path']?.toString();
+              if (path != null && path.isNotEmpty) {
+                final lower = path.toLowerCase();
+                if (lower.contains('whatsapp') ||
+                    lower.contains('com.whatsapp') ||
+                    lower.endsWith('.opus')) {
+                  continue;
+                }
+                if (!currentPaths.contains(path)) {
+                  currentPaths.add(path);
+                  final title = item['title']?.toString() ?? '';
+                  final artist = item['artist']?.toString() ?? 'Device Audio';
+                  final album = item['album']?.toString() ?? 'Device Storage';
+                  final duration = (item['duration'] as num?)?.toInt() ?? 0;
+
+                  added.add(
+                    Song(
+                      id: 'offline_$path',
+                      title: title.isNotEmpty ? title : 'Audio Track',
+                      artist: (artist.isNotEmpty && artist != '<unknown>') ? artist : 'Device Audio',
+                      album: (album.isNotEmpty && album != '<unknown>') ? album : 'Device Storage',
+                      duration: duration,
+                      artwork: '',
+                      streamUrl: path,
+                    ),
+                  );
+                  newlyFound++;
+                }
+              }
+            }
+          }
+        } catch (_) {}
+      }
+
+      // 2. Off-main-thread supplemental background scan of user music directories
+      // Executed inside a dedicated background Isolate (zero UI thread freezing)
+      try {
+        final backgroundPaths = await compute(
+          _scanMusicDirectoriesInBackground,
+          currentPaths.toList(),
+        );
+
+        for (final path in backgroundPaths) {
+          if (!currentPaths.contains(path)) {
+            currentPaths.add(path);
+            final file = File(path);
+            added.add(_fileToSong(file));
+            newlyFound++;
+          }
+        }
+      } catch (_) {}
+
+      if (added.isNotEmpty && mounted) {
+        setState(() {
+          _offlineSongs.addAll(added);
+        });
+        await _saveOfflineSongs();
+      }
+    } catch (_) {} finally {
+      if (mounted) {
+        setState(() => _isScanningOffline = false);
+        if (showFeedback) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                newlyFound > 0
+                    ? 'Found $newlyFound new device audio ${newlyFound == 1 ? 'track' : 'tracks'}.'
+                    : (_offlineSongs.isEmpty
+                        ? 'No audio files found. Try using "Import Files".'
+                        : 'Device scan complete. ${_offlineSongs.length} total tracks available.'),
+              ),
+              duration: const Duration(seconds: 2),
+            ),
+          );
+        }
+      }
+    }
+  }
+
+  Future<void> _importOfflineSongs() async {
+    try {
+      final files = await FilePicker.pickFiles(
+        type: FileType.audio,
+      );
+      if (files.isEmpty) return;
+
+      int addedCount = 0;
+      final currentPaths = _offlineSongs.map((s) => s.streamUrl).whereType<String>().toSet();
+      final added = <Song>[];
+
+      for (final file in files) {
+        final path = file.path;
+        if (path != null && path.isNotEmpty) {
+          final lower = path.toLowerCase();
+          if (lower.contains('whatsapp') ||
+              lower.contains('com.whatsapp') ||
+              lower.endsWith('.opus')) {
+            continue;
+          }
+          if (!currentPaths.contains(path)) {
+            final f = File(path);
+            if (f.existsSync()) {
+              currentPaths.add(path);
+              added.add(_fileToSong(f));
+              addedCount++;
+            }
+          }
+        }
+      }
+
+      if (!mounted) return;
+
+      if (added.isNotEmpty) {
+        setState(() {
+          _offlineSongs.addAll(added);
+        });
+        await _saveOfflineSongs();
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Imported $addedCount audio ${addedCount == 1 ? 'track' : 'tracks'} to Offline Songs.'),
+              duration: const Duration(seconds: 2),
+            ),
+          );
+        }
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Selected audio tracks are already in Offline Songs or excluded.'),
+            duration: Duration(seconds: 2),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to import audio: $e'),
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      }
+    }
+  }
+
+  void _removeOfflineSong(Song song) {
+    setState(() {
+      _offlineSongs.removeWhere(
+          (s) => s.id == song.id || (s.streamUrl != null && s.streamUrl == song.streamUrl));
+      _removeFromQueue(song);
+    });
+    _saveOfflineSongs();
+  }
+
+  Future<void> _showStoragePermissionDialog() async {
+    await showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: _sheetBg,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+        actionsOverflowButtonSpacing: 8,
+        title: Row(
+          children: [
+            const Icon(PhosphorIconsRegular.shieldCheck, color: Color(0xff3B82F6), size: 22),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                'Storage Permission Required',
+                style: GoogleFonts.manrope(
+                  fontWeight: FontWeight.w800,
+                  fontSize: 17,
+                  color: _textColor,
+                ),
+              ),
+            ),
+          ],
+        ),
+        content: Text(
+          'Android requires "All files access" to delete or rename audio files directly on your device storage. Tap "Open Settings" and toggle "Allow access to manage all files" for Sonix.',
+          style: TextStyle(fontSize: 13.5, color: _textColor),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: Text('Cancel', style: TextStyle(color: _subtextColor, fontWeight: FontWeight.w600)),
+          ),
+          ElevatedButton(
+            onPressed: () async {
+              Navigator.pop(ctx);
+              if (Platform.isAndroid) {
+                const channel = MethodChannel('com.example.song_player_mobile/offline_audio');
+                await channel.invokeMethod('requestAllFilesAccess');
+              }
+            },
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xff3B82F6),
+              foregroundColor: Colors.white,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+            ),
+            child: const Text('Open Settings', style: TextStyle(fontWeight: FontWeight.w700)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _deleteOfflineSongFromStorage(Song song) async {
+    final path = song.streamUrl;
+    if (path == null || path.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Cannot locate song file on storage.')),
+        );
+      }
+      return;
+    }
+
+    bool fileDeleted = false;
+
+    // 1. Try Android native platform channel if on Android
+    if (Platform.isAndroid) {
+      try {
+        const channel = MethodChannel('com.example.song_player_mobile/offline_audio');
+        final res = await channel.invokeMethod<bool>('deleteAudioFile', {'path': path});
+        fileDeleted = res ?? false;
+      } on PlatformException catch (e) {
+        if (e.code == 'ALL_FILES_ACCESS_REQUIRED') {
+          if (mounted) {
+            await _showStoragePermissionDialog();
+          }
+          return;
+        }
+      } catch (_) {}
+    }
+
+    // 2. Direct Dart File.delete fallback
+    try {
+      final f = File(path);
+      if (await f.exists()) {
+        await f.delete();
+        fileDeleted = true;
+      }
+    } catch (_) {}
+
+    // Verify if file is gone
+    try {
+      final f = File(path);
+      if (!await f.exists()) {
+        fileDeleted = true;
+      }
+    } catch (_) {}
+
+    if (!fileDeleted) {
+      if (mounted) {
+        if (Platform.isAndroid) {
+          await _showStoragePermissionDialog();
+        } else {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Could not delete file from device storage. Please check storage permissions.'),
+            ),
+          );
+        }
+      }
+      return;
+    }
+
+    // If currently playing, skip to next song or stop
+    if (_current != null && (_current!.id == song.id || _current!.streamUrl == path)) {
+      if (_playlistQueue.length > 1) {
+        _next();
+      } else {
+        await _audio.stop();
+        if (mounted) setState(() => _current = null);
+      }
+    }
+
+    // Remove from in-memory offline songs and queue
+    _removeOfflineSong(song);
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Deleted "${song.title}" from device storage.'),
+          duration: const Duration(seconds: 2),
+        ),
+      );
+    }
+  }
+
+  Future<void> _renameOfflineSongOnStorage(Song song, String newTitle) async {
+    final cleanTitle = newTitle.trim();
+    if (cleanTitle.isEmpty) return;
+
+    final oldPath = song.streamUrl;
+    if (oldPath == null || oldPath.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Cannot locate song file on storage.')),
+        );
+      }
+      return;
+    }
+
+    final oldFile = File(oldPath);
+    if (!await oldFile.exists()) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Original song file not found on storage.')),
+        );
+      }
+      return;
+    }
+
+    String? newPath;
+
+    // 1. Try Android native platform channel
+    if (Platform.isAndroid) {
+      try {
+        const channel = MethodChannel('com.example.song_player_mobile/offline_audio');
+        newPath = await channel.invokeMethod<String>('renameAudioFile', {
+          'path': oldPath,
+          'newName': cleanTitle,
+        });
+      } on PlatformException catch (e) {
+        if (e.code == 'ALL_FILES_ACCESS_REQUIRED') {
+          if (mounted) {
+            await _showStoragePermissionDialog();
+          }
+          return;
+        }
+      } catch (_) {}
+    }
+
+    // 2. Direct Dart File rename fallback
+    if (newPath == null || newPath.isEmpty) {
+      try {
+        final parentDir = oldFile.parent.path;
+        final oldFileName = oldFile.uri.pathSegments.last;
+        final dotIdx = oldFileName.lastIndexOf('.');
+        final ext = dotIdx != -1 ? oldFileName.substring(dotIdx) : '';
+        final candidatePath = '$parentDir/$cleanTitle$ext';
+
+        if (candidatePath != oldPath) {
+          final candidateFile = File(candidatePath);
+          if (await candidateFile.exists()) {
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('A file with that name already exists in this folder.')),
+              );
+            }
+            return;
+          }
+          final renamed = await oldFile.rename(candidatePath);
+          newPath = renamed.path;
+        } else {
+          newPath = oldPath;
+        }
+      } catch (e) {
+        if (mounted) {
+          if (Platform.isAndroid) {
+            await _showStoragePermissionDialog();
+          } else {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text('Failed to rename file: $e')),
+            );
+          }
+        }
+        return;
+      }
+    }
+
+    if (newPath.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Failed to rename file on storage.')),
+        );
+      }
+      return;
+    }
+
+    final updatedSong = Song(
+      id: 'offline_$newPath',
+      title: cleanTitle,
+      artist: song.artist,
+      album: song.album,
+      artwork: song.artwork,
+      duration: song.duration,
+      streamUrl: newPath,
+      downloadUrls: song.downloadUrls,
+    );
+
+    setState(() {
+      final offIdx = _offlineSongs.indexWhere(
+        (s) => s.id == song.id || (s.streamUrl != null && s.streamUrl == oldPath),
+      );
+      if (offIdx != -1) {
+        _offlineSongs[offIdx] = updatedSong;
+      }
+
+      final qIdx = _playlistQueue.indexWhere(
+        (s) => s.id == song.id || (s.streamUrl != null && s.streamUrl == oldPath),
+      );
+      if (qIdx != -1) {
+        _playlistQueue[qIdx] = updatedSong;
+      }
+
+      if (_current != null && (_current!.id == song.id || _current!.streamUrl == oldPath)) {
+        _current = updatedSong;
+      }
+    });
+
+    await _saveOfflineSongs();
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Renamed file to "$cleanTitle"'),
+          duration: const Duration(seconds: 2),
+        ),
+      );
+    }
+  }
+
+  void _showRenameSongDialog(Song song) {
+    final textCtrl = TextEditingController(text: song.title);
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: _sheetBg,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+        actionsOverflowButtonSpacing: 8,
+        title: Text(
+          'Rename Audio File',
+          style: GoogleFonts.manrope(
+            fontWeight: FontWeight.w800,
+            fontSize: 18,
+            color: _textColor,
+          ),
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Changes the file name directly on your device storage:',
+              style: TextStyle(fontSize: 12, color: _subtextColor),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: textCtrl,
+              autofocus: true,
+              style: TextStyle(color: _textColor),
+              decoration: InputDecoration(
+                hintText: 'Enter new song title',
+                hintStyle: TextStyle(color: _subtextColor),
+                filled: true,
+                fillColor: _isLight
+                    ? const Color(0xfff1f5f9)
+                    : Colors.white.withValues(alpha: .06),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                  borderSide: BorderSide(color: _borderColor),
+                ),
+                enabledBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                  borderSide: BorderSide(color: _borderColor),
+                ),
+                focusedBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                  borderSide: const BorderSide(color: Color(0xff3B82F6), width: 1.5),
+                ),
+                suffixText: song.streamUrl != null && song.streamUrl!.contains('.')
+                    ? '.${song.streamUrl!.split('.').last}'
+                    : null,
+                suffixStyle: TextStyle(
+                  color: _subtextColor,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: Text(
+              'Cancel',
+              style: TextStyle(color: _subtextColor, fontWeight: FontWeight.w600),
+            ),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              final newName = textCtrl.text.trim();
+              if (newName.isNotEmpty) {
+                Navigator.pop(ctx);
+                _renameOfflineSongOnStorage(song, newName);
+              }
+            },
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xff3B82F6),
+              foregroundColor: Colors.white,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+            ),
+            child: const Text('Rename', style: TextStyle(fontWeight: FontWeight.w700)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showDeleteFromStorageDialog(Song song) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: _sheetBg,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+        actionsOverflowButtonSpacing: 8,
+        title: Row(
+          children: [
+            const Icon(PhosphorIconsRegular.warning, color: Colors.redAccent, size: 22),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                'Delete from Storage',
+                style: GoogleFonts.manrope(
+                  fontWeight: FontWeight.w800,
+                  fontSize: 18,
+                  color: _textColor,
+                ),
+              ),
+            ),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Are you sure you want to permanently delete "${song.title}" from your device storage?',
+              style: TextStyle(fontSize: 13.5, color: _textColor),
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              'This will erase the audio file from your device and cannot be undone.',
+              style: TextStyle(fontSize: 12, color: Colors.redAccent),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: Text(
+              'Cancel',
+              style: TextStyle(color: _subtextColor, fontWeight: FontWeight.w600),
+            ),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              Navigator.pop(ctx);
+              _deleteOfflineSongFromStorage(song);
+            },
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.redAccent,
+              foregroundColor: Colors.white,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+            ),
+            child: const Text('Delete Permanently', style: TextStyle(fontWeight: FontWeight.w700)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _offlineSongsHeader() => Container(
+    padding: const EdgeInsets.fromLTRB(10, 10, 16, 10),
+    decoration: BoxDecoration(
+      color: _headerBg,
+      border: Border(bottom: BorderSide(color: _borderColor)),
+    ),
+    child: Row(
+      children: [
+        IconButton(
+          icon: Icon(PhosphorIconsRegular.arrowLeft, size: 22, color: _textColor),
+          onPressed: () => setState(() => _viewingOfflineSongs = false),
+        ),
+        const SizedBox(width: 4),
+        Expanded(
+          child: Text(
+            'Offline Songs',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: GoogleFonts.manrope(
+              fontSize: 17,
+              fontWeight: FontWeight.w800,
+              color: _textColor,
+            ),
+          ),
+        ),
+        IconButton(
+          onPressed: _isScanningOffline ? null : () => _scanDeviceForAudio(showFeedback: true),
+          icon: _isScanningOffline
+              ? SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: _textColor,
+                  ),
+                )
+              : Icon(
+                  PhosphorIconsRegular.arrowsClockwise,
+                  size: 20,
+                  color: _textColor,
+                ),
+          tooltip: 'Scan Device',
+        ),
+        IconButton(
+          onPressed: _importOfflineSongs,
+          icon: Icon(
+            PhosphorIconsRegular.folderPlus,
+            size: 20,
+            color: _textColor,
+          ),
+          tooltip: 'Import Audio Files',
+        ),
+      ],
+    ),
+  );
+
+  Widget _offlineSongsView() {
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 16, 16, 120),
+      children: [
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Container(
+              width: 130,
+              height: 130,
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(12),
+                gradient: const LinearGradient(
+                  colors: [Color(0xff2563eb), Color(0xff1d4ed8)],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: const Color(0xff2563eb).withValues(alpha: .35),
+                    blurRadius: 18,
+                    offset: const Offset(0, 6),
+                  ),
+                ],
+              ),
+              child: const Center(
+                child: Icon(
+                  PhosphorIconsFill.musicNotes,
+                  color: Colors.white,
+                  size: 60,
+                ),
+              ),
+            ),
+            const SizedBox(width: 16),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Offline Songs',
+                    style: TextStyle(
+                      fontSize: 22,
+                      fontWeight: FontWeight.w800,
+                      color: _textColor,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    'Device audio playlist',
+                    style: TextStyle(color: _subtextColor, fontSize: 13),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    '${_offlineSongs.length} ${_offlineSongs.length == 1 ? 'song' : 'songs'}',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: _subtextColor,
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  if (_offlineSongs.isNotEmpty)
+                    Row(
+                      children: [
+                        ElevatedButton.icon(
+                          onPressed: () {
+                            _playPlaylistSong(_offlineSongs, 0);
+                          },
+                          icon: Icon(
+                            PhosphorIconsBold.play,
+                            size: 16,
+                            color: _isLight ? Colors.white : Colors.black,
+                          ),
+                          label: Text(
+                            'Play All',
+                            style: TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.w700,
+                              color: _isLight ? Colors.white : Colors.black,
+                            ),
+                          ),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor:
+                                _isLight ? const Color(0xff0f172a) : Colors.white,
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 14,
+                              vertical: 8,
+                            ),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(20),
+                            ),
+                            elevation: 0,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        IconButton(
+                          onPressed: () {
+                            final shuffled = [..._offlineSongs]..shuffle();
+                            _playPlaylist(shuffled);
+                          },
+                          icon: Icon(
+                            PhosphorIconsRegular.shuffle,
+                            size: 20,
+                            color: _textColor,
+                          ),
+                          tooltip: 'Shuffle',
+                          style: IconButton.styleFrom(
+                            backgroundColor: _isLight
+                                ? const Color(0xff0f172a).withValues(alpha: .07)
+                                : Colors.white.withValues(alpha: .1),
+                            shape: const CircleBorder(),
+                          ),
+                        ),
+                      ],
+                    ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 16),
+        // Action buttons row (Import & Scan)
+        Row(
+          children: [
+            Expanded(
+              child: OutlinedButton.icon(
+                onPressed: _importOfflineSongs,
+                icon: Icon(PhosphorIconsRegular.folderPlus, size: 16, color: _textColor),
+                label: Text(
+                  'Import Files',
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    color: _textColor,
+                  ),
+                ),
+                style: OutlinedButton.styleFrom(
+                  side: BorderSide(color: _borderColor),
+                  padding: const EdgeInsets.symmetric(vertical: 10),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: OutlinedButton.icon(
+                onPressed: _isScanningOffline ? null : () => _scanDeviceForAudio(showFeedback: true),
+                icon: _isScanningOffline
+                    ? SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(strokeWidth: 2, color: _textColor),
+                      )
+                    : Icon(PhosphorIconsRegular.arrowsClockwise, size: 16, color: _textColor),
+                label: Text(
+                  _isScanningOffline ? 'Scanning...' : 'Scan Storage',
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    color: _textColor,
+                  ),
+                ),
+                style: OutlinedButton.styleFrom(
+                  side: BorderSide(color: _borderColor),
+                  padding: const EdgeInsets.symmetric(vertical: 10),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 24),
+        if (_offlineSongs.isEmpty)
+          Container(
+            padding: const EdgeInsets.symmetric(vertical: 60),
+            child: Column(
+              children: [
+                Icon(
+                  PhosphorIconsRegular.musicNotes,
+                  size: 56,
+                  color: _isLight
+                      ? const Color(0x30000000)
+                      : Colors.white.withValues(alpha: .2),
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  'No Offline Songs Found',
+                  style: TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.w700,
+                    color: _textColor,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'Import audio files from your device to listen offline without internet.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: _subtextColor, fontSize: 13),
+                ),
+                const SizedBox(height: 20),
+                ElevatedButton.icon(
+                  onPressed: _importOfflineSongs,
+                  icon: const Icon(PhosphorIconsRegular.folderPlus, size: 18),
+                  label: const Text('Import Audio Files'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: _isLight ? const Color(0xff0f172a) : Colors.white,
+                    foregroundColor: _isLight ? Colors.white : Colors.black,
+                    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(24),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          )
+        else ...[
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(
+                'Tracks (${_offlineSongs.length})',
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.w700,
+                  color: _textColor,
+                ),
+              ),
+              Text(
+                'Looping Playlist',
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  color: const Color(0xff3b82f6),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          ..._offlineSongs.asMap().entries.map(
+            (entry) => _offlineSongRow(entry.key, entry.value, _offlineSongs),
+          ),
+        ],
+      ],
+    );
+  }
+
+  Widget _offlineSongRow(int index, Song song, List<Song> offlineList) {
+    final isCurrent = _current?.id == song.id;
+    final extension = song.streamUrl != null && song.streamUrl!.contains('.')
+        ? song.streamUrl!.split('.').last.toUpperCase()
+        : 'AUDIO';
+    return InkWell(
+      onTap: () => _playPlaylistSong(offlineList, index),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 7),
+        child: Row(
+          children: [
+            Container(
+              width: 28,
+              alignment: Alignment.centerLeft,
+              child: isCurrent && _audio.playing
+                  ? Icon(
+                      PhosphorIconsFill.play,
+                      size: 14,
+                      color: _isLight
+                          ? const Color(0xff0f172a)
+                          : Colors.white,
+                    )
+                  : Text(
+                      '${index + 1}',
+                      style: TextStyle(
+                        color: isCurrent ? _textColor : _subtextColor,
+                        fontWeight:
+                            isCurrent ? FontWeight.bold : FontWeight.normal,
+                      ),
+                    ),
+            ),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(
+                AppConstants.songRowThumbnailRadius,
+              ),
+              child: Container(
+                width: 48,
+                height: 48,
+                decoration: BoxDecoration(
+                  color: _isLight
+                      ? const Color(0xfff1f5f9)
+                      : Colors.white.withValues(alpha: .06),
+                  borderRadius: BorderRadius.circular(
+                    AppConstants.songRowThumbnailRadius,
+                  ),
+                  border: Border.all(color: _borderColor),
+                ),
+                child: Icon(
+                  PhosphorIconsRegular.musicNote,
+                  color: isCurrent
+                      ? const Color(0xff3B82F6)
+                      : _textColor.withValues(alpha: .7),
+                  size: 22,
+                ),
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    song.title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: GoogleFonts.manrope(
+                      fontWeight: FontWeight.w800,
+                      fontSize: 14,
+                      color: isCurrent
+                          ? (_isLight ? const Color(0xff2563eb) : const Color(0xff60a5fa))
+                          : _textColor.withValues(alpha: .9),
+                    ),
+                  ),
+                  const SizedBox(height: 3),
+                  Row(
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 5,
+                          vertical: 1.5,
+                        ),
+                        decoration: BoxDecoration(
+                          color: _isLight
+                              ? const Color(0xffe2e8f0)
+                              : Colors.white.withValues(alpha: .08),
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: Text(
+                          extension,
+                          style: TextStyle(
+                            fontSize: 9,
+                            fontWeight: FontWeight.w700,
+                            letterSpacing: .5,
+                            color: _subtextColor,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text(
+                          song.artist,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: _subtextColor,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            IconButton(
+              onPressed: () {
+                showModalBottomSheet(
+                  context: context,
+                  backgroundColor: _sheetBg,
+                  shape: const RoundedRectangleBorder(
+                    borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+                  ),
+                  builder: (ctx) => SafeArea(
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 16),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          ListTile(
+                            leading: Container(
+                              width: 40,
+                              height: 40,
+                              decoration: BoxDecoration(
+                                color: _isLight
+                                    ? const Color(0xfff1f5f9)
+                                    : Colors.white.withValues(alpha: .08),
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                              child: Icon(
+                                PhosphorIconsRegular.play,
+                                color: _textColor,
+                                size: 20,
+                              ),
+                            ),
+                            title: Text(
+                              'Play Now',
+                              style: TextStyle(
+                                color: _textColor,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                            onTap: () {
+                              Navigator.pop(ctx);
+                              _playPlaylistSong(offlineList, index);
+                            },
+                          ),
+                          ListTile(
+                            leading: Container(
+                              width: 40,
+                              height: 40,
+                              decoration: BoxDecoration(
+                                color: _isLight
+                                    ? const Color(0xfff1f5f9)
+                                    : Colors.white.withValues(alpha: .08),
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                              child: Icon(
+                                PhosphorIconsRegular.pencilSimple,
+                                color: const Color(0xff3B82F6),
+                                size: 20,
+                              ),
+                            ),
+                            title: Text(
+                              'Rename File',
+                              style: TextStyle(
+                                color: _textColor,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                            subtitle: Text(
+                              'Rename this audio file on device storage',
+                              style: TextStyle(
+                                color: _subtextColor,
+                                fontSize: 11,
+                              ),
+                            ),
+                            onTap: () {
+                              Navigator.pop(ctx);
+                              _showRenameSongDialog(song);
+                            },
+                          ),
+                          ListTile(
+                            leading: Container(
+                              width: 40,
+                              height: 40,
+                              decoration: BoxDecoration(
+                                color: _isLight
+                                    ? const Color(0xfff1f5f9)
+                                    : Colors.white.withValues(alpha: .08),
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                              child: Icon(
+                                PhosphorIconsRegular.minusCircle,
+                                color: _textColor,
+                                size: 20,
+                              ),
+                            ),
+                            title: Text(
+                              'Remove from Offline Playlist',
+                              style: TextStyle(
+                                color: _textColor,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                            subtitle: Text(
+                              'Keep file on storage, remove from app playlist',
+                              style: TextStyle(
+                                color: _subtextColor,
+                                fontSize: 11,
+                              ),
+                            ),
+                            onTap: () {
+                              Navigator.pop(ctx);
+                              _removeOfflineSong(song);
+                            },
+                          ),
+                          ListTile(
+                            leading: Container(
+                              width: 40,
+                              height: 40,
+                              decoration: BoxDecoration(
+                                color: Colors.redAccent.withValues(alpha: .12),
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                              child: const Icon(
+                                PhosphorIconsRegular.trash,
+                                color: Colors.redAccent,
+                                size: 20,
+                              ),
+                            ),
+                            title: const Text(
+                              'Delete from Device Storage',
+                              style: TextStyle(
+                                color: Colors.redAccent,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                            subtitle: Text(
+                              'Permanently erase file from user device storage',
+                              style: TextStyle(
+                                color: Colors.redAccent.withValues(alpha: .75),
+                                fontSize: 11,
+                              ),
+                            ),
+                            onTap: () {
+                              Navigator.pop(ctx);
+                              _showDeleteFromStorageDialog(song);
+                            },
+                          ),
+                          if (song.streamUrl != null)
+                            ListTile(
+                              leading: Container(
+                                width: 40,
+                                height: 40,
+                                decoration: BoxDecoration(
+                                  color: _isLight
+                                      ? const Color(0xfff1f5f9)
+                                      : Colors.white.withValues(alpha: .08),
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                              child: Icon(
+                                PhosphorIconsRegular.info,
+                                color: _textColor,
+                                size: 20,
+                              ),
+                            ),
+                              title: Text(
+                                'File Location',
+                                style: TextStyle(
+                                  color: _textColor,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                              subtitle: Text(
+                                song.streamUrl!,
+                                style: TextStyle(
+                                  color: _subtextColor,
+                                  fontSize: 11,
+                                ),
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
+                  ),
+                );
+              },
               icon: Icon(
                 PhosphorIconsRegular.dotsThreeVertical,
                 size: 20,
@@ -9251,7 +12118,7 @@ class _EqualizerBottomSheetState extends State<_EqualizerBottomSheet> {
       ),
     );
   }
-}
+} 
 
 
 
